@@ -1,0 +1,16 @@
+.mark {
+  display: block;
+  flex: none;
+  object-fit: contain;
+}
+
+.wordmark {
+  display: block;
+  width: 96px;
+  height: auto;
+  max-width: none;
+  padding-right: 4px;
+  box-sizing: content-box;
+  object-fit: contain;
+  object-position: left center;
+}

@@ -1,0 +1,291 @@
+/** Direct local Antigravity CLI model route for Toranja Harness. */
+
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import {
+  LlmAdapter,
+  type GenerateOptions,
+  type LlmModelInfo,
+  type LlmProviderInfo,
+  type RequestMessage,
+  type StreamChunk,
+} from '@deepseek-ai/dsh-llm'
+import type {} from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-subprocess'
+import type {} from '@deepseek-ai/dsh-toranja-orchestrator'
+import type {} from '@deepseek-ai/dsh-working-directory'
+import { coordinateAntigravityTurn, requestsCodexDelegation } from './protocol.ts'
+import { AgySession, type AgySessionConfig } from './session.ts'
+
+export const name = 'llm-antigravity-cli'
+export const inject = ['agents', 'llm', 'sessions', 'subprocess', 'toranjaOrchestrator', 'workingDirectory']
+
+const PROVIDER = 'antigravity-local'
+const MODEL = 'default'
+const NAMED_MODELS: readonly (readonly [id: string, name: string])[] = [
+  ['gemini-4-argon-medium', 'Gemini 4 Argon (Médio)'],
+  ['gemini-4-argon-high', 'Gemini 4 Argon (Alto)'],
+  ['gemini-4-argon-low', 'Gemini 4 Argon (Baixo)'],
+  ['gemini-3.8-flash-high', 'Gemini 3.8 Flash (Alto)'],
+  ['gemini-3.8-flash-medium', 'Gemini 3.8 Flash (Médio)'],
+  ['gemini-3.8-flash-low', 'Gemini 3.8 Flash (Baixo)'],
+  ['claude-opus-5-5-low', 'Claude Opus 5.5 (Baixo)'],
+  ['claude-opus-5-5-medium', 'Claude Opus 5.5 (Médio)'],
+  ['claude-opus-5-5-high', 'Claude Opus 5.5 (Alto)'],
+  ['claude-sonnet-5-5-low', 'Claude Sonnet 5.5 (Baixo)'],
+  ['claude-sonnet-5-5-medium', 'Claude Sonnet 5.5 (Médio)'],
+  ['claude-sonnet-5-5-high', 'Claude Sonnet 5.5 (Alto)'],
+  ['gpt-oss-120b-medium', 'GPT-OSS 120B (Médio)'],
+]
+const MODELS: readonly LlmModelInfo[] = [
+  {
+    provider: PROVIDER,
+    id: MODEL,
+    name: 'Antigravity — automático',
+    description: 'Usa o modelo padrão selecionado na conta local do Antigravity.',
+    inputModalities: ['text'],
+  },
+  ...NAMED_MODELS.map(([id, name]) => ({
+    provider: PROVIDER,
+    id,
+    name,
+    description: 'Usa este modelo com o login e os créditos da conta local do Antigravity.',
+    inputModalities: ['text'] as const,
+  })),
+]
+// Switching providers needs enough recent context to continue coherently, but
+// replaying an entire long Codex conversation wastes Antigravity credits.
+const MAX_HANDOFF_CHARS = 16_000
+
+/** Configuration for the direct Antigravity CLI LLM adapter. */
+export interface Config {
+  executable?: string
+  timeoutMs?: number
+  sandbox?: boolean
+  autoApproveTools?: boolean
+  mode?: 'accept-edits' | 'auto' | 'plan'
+  model?: string
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  maxCodexDelegationsPerTurn?: number
+  env?: Record<string, string>
+}
+
+/** Schema for {@link Config}. */
+export const Config: z<Config> = z.object({
+  executable: z.string().min(1).default('agy'),
+  timeoutMs: z.number().default(600_000),
+  sandbox: z.boolean().default(true),
+  autoApproveTools: z.boolean().default(false),
+  mode: z.union(['accept-edits', 'auto', 'plan'] as const).default('accept-edits'),
+  model: z.string().min(1),
+  effort: z.union(['low', 'medium', 'high', 'xhigh', 'max'] as const),
+  maxCodexDelegationsPerTurn: z.number().default(3),
+  env: z.dict(z.string()).default({}),
+})
+
+function blockText(message: RequestMessage): string {
+  return message.content.flatMap((block) => {
+    if (block.type === 'text') return [block.text]
+    if (block.type === 'reasoning') return []
+    if (block.type === 'tool-call') return [`[chamada de ferramenta: ${block.name}]`]
+    if (block.type === 'image') return ['[imagem anexada no Toranja Harness]']
+    if (block.type === 'file') return [`[arquivo anexado: ${block.attachment.name}]`]
+    return []
+  }).join('\n').trim()
+}
+
+function collaborationInstructions(ctx: Context): string {
+  const mode = ctx.toranjaOrchestrator.status().mode
+  const routingRule = mode === 'team'
+    ? 'Modo Equipe ativo: quando uma tarefa realmente se beneficiar de um colaborador Codex, use kind "delegate_codex" com project, role, description e task.'
+    : mode === 'antigravity'
+      ? 'Modo Só Antigravity ativo: execute sozinho e nunca use kind "delegate_codex".'
+      : 'Modo Só Codex ativo: não solicite colaboração Codex a partir desta rota Antigravity; responda diretamente.'
+  return [
+    'PROTOCOLO DE COLABORAÇÃO DO TORANJA:',
+    'Sua resposta final deve seguir o esquema JSON configurado pelo aplicativo.',
+    'Use {"kind":"answer","text":"..."} para responder ao usuário.',
+    routingRule,
+    'O Toranja executará o Codex com a conta local, aguardará o resultado e devolverá a evidência nesta mesma conversa.',
+    'Não simule delegações em texto. Não delegue respostas simples. Nunca solicite o próprio Antigravity por esse protocolo.',
+    `Projetos disponíveis: ${JSON.stringify(ctx.toranjaOrchestrator.lanes())}`,
+  ].join('\n')
+}
+
+function recentTranscript(messages: readonly RequestMessage[], cwd: string, ctx: Context): string {
+  const rows = messages.flatMap((message) => {
+    if (message.role === 'system' || message.role === 'developer' || message.role === 'tool') return []
+    const text = blockText(message)
+    if (text.length === 0) return []
+    return [`${message.role === 'user' ? 'USUÁRIO' : 'ASSISTENTE'}:\n${text}`]
+  })
+  const transcript = rows.join('\n\n')
+  const bounded = transcript.length <= MAX_HANDOFF_CHARS
+    ? transcript
+    : `[início anterior omitido]\n${transcript.slice(-MAX_HANDOFF_CHARS)}`
+  return [
+    'Você está respondendo diretamente dentro do Toranja Harness.',
+    `Diretório ativo do projeto: ${cwd}`,
+    'Use suas ferramentas nativas do Antigravity nesse diretório quando a solicitação exigir.',
+    'Responda em português brasileiro, salvo pedido diferente do usuário.',
+    collaborationInstructions(ctx),
+    '',
+    'CONTEXTO RECENTE DA CONVERSA:',
+    bounded,
+  ].join('\n')
+}
+
+function latestUserText(messages: readonly RequestMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.role !== 'user') continue
+    const text = blockText(message)
+    if (text.length > 0) return text
+  }
+  throw new Error('Antigravity direto requer uma mensagem de usuário com texto')
+}
+
+function lastAssistantProvider(messages: readonly RequestMessage[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.role !== 'assistant') continue
+    return message.source.provider
+  }
+  return undefined
+}
+
+class AntigravityCliAdapter extends LlmAdapter {
+  private readonly sessions = new Map<string, AgySession>()
+
+  constructor(
+    private readonly ctx: Context,
+    private readonly config: Required<Omit<Config, 'model' | 'effort'>> & Pick<Config, 'model' | 'effort'>,
+  ) { super() }
+
+  override providerInfo(provider: string): LlmProviderInfo {
+    return { id: provider, name: 'Antigravity local' }
+  }
+
+  override listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return Promise.resolve(MODELS)
+  }
+
+  private agyConfig(model: string): AgySessionConfig {
+    const configuredModel = this.config.model
+    const selectedModel = configuredModel ?? (model === MODEL ? undefined : model)
+    const selectedEffort = configuredModel !== undefined || model === MODEL ? this.config.effort : undefined
+    return {
+      executable: this.config.executable,
+      timeoutMs: this.config.timeoutMs,
+      sandbox: this.config.sandbox,
+      autoApproveTools: this.config.autoApproveTools,
+      mode: this.config.mode,
+      ...selectedModel === undefined ? {} : { model: selectedModel },
+      ...selectedEffort === undefined ? {} : { effort: selectedEffort },
+      env: this.config.env,
+    }
+  }
+
+  private cwd(options: GenerateOptions): string {
+    if (options.sessionId === undefined) return process.cwd()
+    const session = this.ctx.sessions.get(options.sessionId)
+    return session === undefined ? process.cwd() : this.ctx.workingDirectory.get(session)
+  }
+
+  private sessionKey(options: GenerateOptions): string | undefined {
+    return options.purpose === undefined && options.sessionId !== undefined ? String(options.sessionId) : undefined
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const cwd = this.cwd(options)
+    const key = this.sessionKey(options)
+    const priorProvider = lastAssistantProvider(options.messages)
+    const agyConfig = this.agyConfig(options.model)
+    let driver = key === undefined ? undefined : this.sessions.get(key)
+    const needsHandoff = driver === undefined
+      || driver.cwd !== cwd
+      || driver.model !== agyConfig.model
+      || driver.effort !== agyConfig.effort
+      || priorProvider !== PROVIDER
+    if (driver !== undefined && needsHandoff) {
+      driver.close()
+      if (key !== undefined) this.sessions.delete(key)
+      driver = undefined
+    }
+    driver ??= new AgySession(cwd, this.ctx, agyConfig)
+    if (key !== undefined) this.sessions.set(key, driver)
+    const userText = latestUserText(options.messages)
+    const prompt = needsHandoff ? recentTranscript(options.messages, cwd, this.ctx) : userText
+    const requireDelegation = this.ctx.toranjaOrchestrator.status().mode === 'team'
+      && requestsCodexDelegation(userText)
+    try {
+      const coordinated = await coordinateAntigravityTurn({
+        initialPrompt: prompt,
+        maxDelegations: this.config.maxCodexDelegationsPerTurn,
+        requireDelegation,
+        ask: nextPrompt => driver.ask(nextPrompt, options.signal),
+        delegateCodex: async (action) => {
+          if (options.sessionId === undefined) {
+            throw new Error('Antigravity não pode delegar ao Codex fora de uma conversa do Toranja')
+          }
+          const parent = this.ctx.agents.get(options.sessionId)
+          if (parent === undefined) {
+            throw new Error('A conversa do Toranja não possui um agente ativo para receber a delegação')
+          }
+          return this.ctx.toranjaOrchestrator.delegateCodex({
+            project: action.project,
+            role: action.role,
+            description: action.description,
+            task: action.task,
+            parent,
+            signal: options.signal ?? new AbortController().signal,
+          })
+        },
+      })
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text: coordinated.text }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: coordinated.text } }
+      yield { type: 'usage', usage: coordinated.usage }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    } finally {
+      if (key === undefined) driver.close()
+    }
+  }
+
+  dispose(): void {
+    for (const session of this.sessions.values()) session.close()
+    this.sessions.clear()
+  }
+}
+
+export function apply(ctx: Context, config: Config): void {
+  const resolved = {
+    executable: config.executable ?? 'agy',
+    timeoutMs: config.timeoutMs ?? 600_000,
+    sandbox: config.sandbox ?? true,
+    autoApproveTools: config.autoApproveTools ?? false,
+    mode: config.mode ?? 'accept-edits',
+    ...config.model === undefined ? {} : { model: config.model },
+    ...config.effort === undefined ? {} : { effort: config.effort },
+    maxCodexDelegationsPerTurn: config.maxCodexDelegationsPerTurn ?? 3,
+    env: config.env ?? {},
+  }
+  if (!Number.isSafeInteger(resolved.timeoutMs) || resolved.timeoutMs < 1) {
+    throw new Error('llm-antigravity-cli: timeoutMs deve ser um inteiro positivo')
+  }
+  if (resolved.autoApproveTools && !resolved.sandbox) {
+    throw new Error('llm-antigravity-cli: autoApproveTools exige sandbox=true')
+  }
+  if (!Number.isSafeInteger(resolved.maxCodexDelegationsPerTurn) || resolved.maxCodexDelegationsPerTurn < 1) {
+    throw new Error('llm-antigravity-cli: maxCodexDelegationsPerTurn deve ser um inteiro positivo')
+  }
+  const adapter = new AntigravityCliAdapter(ctx, resolved)
+  ctx.effect(() => {
+    const unregister = ctx.llm.registerAdapter([PROVIDER], adapter)
+    return () => {
+      unregister()
+      adapter.dispose()
+    }
+  }, 'llm-antigravity-cli: register direct Antigravity route')
+}

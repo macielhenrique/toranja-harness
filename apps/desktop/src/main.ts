@@ -77,6 +77,8 @@ let windowsLanguage: string | undefined
  * failure while tearing down a ready backend still reads as `running`.
  */
 let backendReady = false
+/** This fork owns local providers directly and never enters DeepSeek account onboarding. */
+const PERSONAL_HARNESS = true
 /** Error-level console output of the primary window, attached to crash reports. */
 const rendererConsole = new RendererConsoleTail()
 
@@ -455,47 +457,49 @@ async function main(): Promise<void> {
         hostUrl = ready.url
         if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
         injections = ready.injections
-        welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
-        analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
-        if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
-        stopAccount?.()
-        const accountBackend = welcomeBackend.account
-        stopAccount = accountBackend.watch((state) => {
-          if (quitting) return
-          if (welcomeWindow !== undefined && !welcomeWindow.isDestroyed()) welcomeWindow.webContents.send(WELCOME_IPC.state, state)
-          const attempt = state.attempt
-          if (attempt?.phase === 'waiting-browser' && attempt.authorizeUrl !== undefined && openedAttempt !== attempt.id) {
-            openedAttempt = attempt.id
-            void shell.openExternal(platformLoginUrl(attempt.authorizeUrl)).catch(() => undefined)
-          }
-          if ((attempt?.phase === 'failed' || attempt?.phase === 'expired') && returnedAttempt !== attempt.id) {
-            returnedAttempt = attempt.id
-            focusPrimaryWindow()
-          }
-          if (state.status === 'credential-stored' && attempt?.phase === 'succeeded' && welcomeWindow !== undefined) void enterWorkspace({ activate: false }).catch(() => undefined)
-          if (previousAccountStatus === 'credential-stored' && state.status === 'signed-out') {
-            void readWelcomeState().then(async (value) => {
-              if (needsWelcome(value) && !quitting) {
-                enteredWorkspace = false
-                await showWelcome()
-                if (welcomeWindow !== undefined && !welcomeWindow.isDestroyed()) welcomeWindow.webContents.send(WELCOME_IPC.state, state)
-              }
-              return undefined
-            }).catch(() => undefined)
-          }
-          previousAccountStatus = state.status
-        }, () => {
-          // The stream reconnects; a transport failure does not change account state.
-        }, () => {
-          void readWelcomeState().then(async (value) => {
-            if (!needsWelcome(value) || quitting) return
-            pendingWelcomeNotice = 'session-expired'
-            enteredWorkspace = false
-            await showWelcome()
-            const state = await accountBackend.state()
+        if (!PERSONAL_HARNESS) {
+          welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
+          analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
+          if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
+          stopAccount?.()
+          const accountBackend = welcomeBackend.account
+          stopAccount = accountBackend.watch((state) => {
+            if (quitting) return
             if (welcomeWindow !== undefined && !welcomeWindow.isDestroyed()) welcomeWindow.webContents.send(WELCOME_IPC.state, state)
-          }).catch(() => undefined)
-        }, (enabled) => { analyticsEnabled = enabled })
+            const attempt = state.attempt
+            if (attempt?.phase === 'waiting-browser' && attempt.authorizeUrl !== undefined && openedAttempt !== attempt.id) {
+              openedAttempt = attempt.id
+              void shell.openExternal(platformLoginUrl(attempt.authorizeUrl)).catch(() => undefined)
+            }
+            if ((attempt?.phase === 'failed' || attempt?.phase === 'expired') && returnedAttempt !== attempt.id) {
+              returnedAttempt = attempt.id
+              focusPrimaryWindow()
+            }
+            if (state.status === 'credential-stored' && attempt?.phase === 'succeeded' && welcomeWindow !== undefined) void enterWorkspace({ activate: false }).catch(() => undefined)
+            if (previousAccountStatus === 'credential-stored' && state.status === 'signed-out') {
+              void readWelcomeState().then(async (value) => {
+                if (needsWelcome(value) && !quitting) {
+                  enteredWorkspace = false
+                  await showWelcome()
+                  if (welcomeWindow !== undefined && !welcomeWindow.isDestroyed()) welcomeWindow.webContents.send(WELCOME_IPC.state, state)
+                }
+                return undefined
+              }).catch(() => undefined)
+            }
+            previousAccountStatus = state.status
+          }, () => {
+          // The stream reconnects; a transport failure does not change account state.
+          }, () => {
+            void readWelcomeState().then(async (value) => {
+              if (!needsWelcome(value) || quitting) return
+              pendingWelcomeNotice = 'session-expired'
+              enteredWorkspace = false
+              await showWelcome()
+              const state = await accountBackend.state()
+              if (welcomeWindow !== undefined && !welcomeWindow.isDestroyed()) welcomeWindow.webContents.send(WELCOME_IPC.state, state)
+            }).catch(() => undefined)
+          }, (enabled) => { analyticsEnabled = enabled })
+        }
       },
       stop: async () => {
         analyticsEnabled = false
@@ -751,6 +755,17 @@ async function main(): Promise<void> {
     if (source === 'light' || source === 'dark' || source === 'system') nativeTheme.themeSource = source
   })
   ipcMain.handle(DESKTOP_IPC.localeBootstrap, async (event) => {
+    // Toranja Harness enters the workspace directly, without creating the vendor welcome
+    // backend. Accept the locale bootstrap from its owned renderer before consulting any
+    // welcome-only state; the sender identity remains constrained to the main window.
+    if (PERSONAL_HARNESS) {
+      if (event.sender !== mainWindow?.webContents) {
+        throw new Error('Toranja Harness: rejected locale request from an unowned renderer')
+      }
+      // `null` means automatic locale selection. The renderer intentionally rejects
+      // `undefined` here because the IPC payload is treated as untrusted input.
+      return { languages: ['pt-BR', ...systemLanguages], preference: 'pt-BR' }
+    }
     if (event.sender !== mainWindow?.webContents || event.senderFrame !== mainWindow.webContents.mainFrame
       || new URL(event.senderFrame.url).origin !== new URL(applicationUrl).origin) {
       throw new Error('desktop welcome: rejected locale request from an unowned frame')
@@ -779,7 +794,7 @@ async function main(): Promise<void> {
   })
   ipcMain.handle(DESKTOP_IPC.onboardingApiKey, async (event) => {
     assertProductSender(event)
-    return (await readWelcomeState()).hasApiKey
+    return PERSONAL_HARNESS ? false : (await readWelcomeState()).hasApiKey
   })
   ipcMain.on(DESKTOP_IPC.onboardingActive, (event, active: unknown) => {
     const window = mainWindow
@@ -932,7 +947,7 @@ async function main(): Promise<void> {
   const applicationIconPath = development ? join(app.getAppPath(), 'resources', 'icon-windows.png')
     : join(process.resourcesPath, 'icon.png')
   app.setAboutPanelOptions({
-    applicationName: 'DeepSeek Harness',
+    applicationName: 'Toranja Harness',
     applicationVersion: app.getVersion(),
     // The release has no separate build number; omit Electron's bundle version.
     version: '',
@@ -1203,6 +1218,10 @@ async function main(): Promise<void> {
   }
   const openInitialWindow = async (): Promise<void> => {
     if (quitting || recovery.active) return
+    if (PERSONAL_HARNESS) {
+      await enterWorkspace()
+      return
+    }
     const state = await readWelcomeState()
     if (isQuitting() || backend.state.phase !== 'ready') return
     locale = resolveDesktopStartupLocale(state.localePreference, systemLanguages)

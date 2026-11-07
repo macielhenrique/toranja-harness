@@ -16,7 +16,7 @@ export interface DesktopPaths {
  */
 export function resolveDesktopPaths(dshHome: string = resolveDshHome()): DesktopPaths {
   return {
-    profile: join(dshHome, 'profiles', 'desktop'),
-    lock: join(dshHome, 'profiles', 'desktop', 'lock'),
+    profile: join(dshHome, 'profiles', 'toranja-harness'),
+    lock: join(dshHome, 'profiles', 'toranja-harness', 'lock'),
   }
 }

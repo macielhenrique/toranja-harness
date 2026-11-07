@@ -1,0 +1,57 @@
+{
+  "name": "@deepseek-ai/dsh-toranja-harness-bundle",
+  "description": "Toranja Harness desktop composition for Codex and Antigravity",
+  "version": "0.2.1-alpha.4",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepseek-ai/deepseek-harness.git",
+    "directory": "packages/bundle/toranja-harness"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "cordis.patch.yml",
+    "lib/types/**/*.d.ts"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-agent-default-model": "workspace:*",
+    "@deepseek-ai/dsh-client-locale-pt-br": "workspace:*",
+    "@deepseek-ai/dsh-client-ui-brand-toranja": "workspace:*",
+    "@deepseek-ai/dsh-client-ui-toranja-control": "workspace:*",
+    "@deepseek-ai/dsh-credentials-codex-import": "workspace:*",
+    "@deepseek-ai/dsh-experimental-agent-team": "workspace:*",
+    "@deepseek-ai/dsh-experimental-client-ui-agent-team": "workspace:*",
+    "@deepseek-ai/dsh-experimental-tool-agent-team": "workspace:*",
+    "@deepseek-ai/dsh-llm-pi-ai": "workspace:*",
+    "@deepseek-ai/dsh-llm-antigravity-cli": "workspace:*",
+    "@deepseek-ai/dsh-toranja-orchestrator": "workspace:*",
+    "@deepseek-ai/dsh-subagent-antigravity": "workspace:*",
+    "@deepseek-ai/dsh-subagent-codex": "workspace:*",
+    "@deepseek-ai/dsh-tool-subagent": "workspace:*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "workspace:~"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "workspace:~"
+  }
+}

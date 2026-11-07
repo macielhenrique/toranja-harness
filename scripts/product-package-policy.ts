@@ -47,4 +47,12 @@ export const PRODUCT_PACKAGE_POLICY: Readonly<Record<string, ProductPackagePolic
   'packages/client/web': { category: 'web-distribution', reason: 'Browser boot kernel bundled into the Web distribution.' },
   'packages/client/ui-dockkit': { category: 'web-distribution', reason: 'Layout library bundled into the Web distribution.' },
   'packages/util/package-manifest': { category: 'declarations', reason: 'Shared package metadata declarations have no runtime mount.' },
+  'packages/bundle/toranja-harness': { category: 'optional', reason: 'Desktop and overlay bundle composing the Toranja Harness multi-agent product.' },
+  'packages/client/locale-pt-br': { category: 'optional', reason: 'Portuguese (Brazil) locale bundle mounted by the Toranja Harness composition.' },
+  'packages/client/ui-brand-toranja': { category: 'optional', reason: 'Toranja Tech brand artwork mounted by the Toranja Harness composition.' },
+  'packages/client/ui-toranja-control': { category: 'optional', reason: 'Conversation-header agent orchestration dashboard mounted by the Toranja Harness composition.' },
+  'packages/credentials/credentials-codex-import': { category: 'optional', reason: 'Local Codex CLI credential importer mounted by the Toranja Harness composition.' },
+  'packages/llm/llm-antigravity-cli': { category: 'optional', reason: 'Local Antigravity CLI model provider mounted by the Toranja Harness composition.' },
+  'packages/orchestration/toranja-orchestrator': { category: 'optional', reason: 'Multi-agent project lane and delegation orchestrator mounted by the Toranja Harness composition.' },
+  'packages/subagent/subagent-antigravity': { category: 'optional', reason: 'Antigravity CLI subagent provider mounted by the Toranja Harness composition.' },
 }

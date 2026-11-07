@@ -1,0 +1,174 @@
+# Toranja Harness: local Codex lead plus the installed Antigravity CLI.
+# This layer is intentionally applied after the stock Web/Desktop bundles.
+
+- id: deepseek-account
+  disabled: true
+
+- id: deepseek-llm-api-extensions
+  disabled: true
+
+- id: session-log-deepseek
+  disabled: true
+
+- id: plugin-package-inventory-deepseek
+  disabled: true
+
+- id: llm-deepseek
+  disabled: true
+
+- id: llm-deepseek-account
+  disabled: true
+
+- id: session-telemetry-otel
+  disabled: true
+
+- id: desktop-product-telemetry
+  disabled: true
+
+- id: product-analytics
+  disabled: true
+
+- id: ui-settings-account
+  disabled: true
+
+- id: ui-brand-official
+  disabled: true
+
+- id: account-controller
+  disabled: true
+
+- id: web
+  name: '@deepseek-ai/dsh-web'
+  config:
+    fetchProvider: http
+
+- id: web-search-deepseek
+  disabled: true
+
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      openai-codex: {}
+
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: openai-codex
+    model: gpt-5.6-luna
+
+- id: system-prompt
+  name: '@deepseek-ai/dsh-system-prompt'
+  config:
+    includeHarnessIdentity: false
+    personaPrefix: >-
+      You are an AI agent powered by Toranja Harness, a local multi-agent
+      orchestrator that coordinates Codex and Antigravity while keeping each
+      provider's native authentication and safety boundaries authoritative.
+
+- id: tool-subagent-control
+  disabled: true
+
+- id: tool-subagent-list-agents
+  disabled: true
+
+- id: tool-subagent
+  disabled: true
+
+- id: tool-subagent-fork
+  disabled: true
+
+- insert:
+    - id: locale-pt-br
+      name: '@deepseek-ai/dsh-client-locale-pt-br'
+
+    - id: credentials-codex-import
+      name: '@deepseek-ai/dsh-credentials-codex-import'
+
+    # Primary-chat route: selecting this provider sends the user's turn
+    # straight to the authenticated local agy process, without a Codex call.
+    - id: llm-antigravity-cli
+      name: '@deepseek-ai/dsh-llm-antigravity-cli'
+      config:
+        executable: agy
+        timeoutMs: 600000
+        sandbox: true
+        autoApproveTools: true
+        mode: accept-edits
+        maxCodexDelegationsPerTurn: 3
+
+    - id: ui-brand-toranja
+      name: '@deepseek-ai/dsh-client-ui-brand-toranja'
+
+    - id: ui-toranja-control
+      name: '@deepseek-ai/dsh-client-ui-toranja-control'
+
+    - id: agent-team
+      name: '@deepseek-ai/dsh-experimental-agent-team'
+      config:
+        maxMembers: 8
+        maxTasks: 256
+        maxMessageBytes: 65536
+        disposalTimeoutMs: 5000
+
+    - id: tool-agent-team
+      name: '@deepseek-ai/dsh-experimental-tool-agent-team'
+      config:
+        freshProvider: spawn
+        forkProvider: fork
+
+    - id: ui-agent-team
+      name: '@deepseek-ai/dsh-experimental-client-ui-agent-team'
+
+    - id: toranja-orchestrator
+      name: '@deepseek-ai/dsh-toranja-orchestrator'
+      config:
+        # Project lanes are populated automatically from the user's registered
+        # Workspaces in the local profile; optional static entries may also be
+        # added under `projects: []`.
+        codexProvider: codex
+        antigravityProvider: antigravity
+        # Credit-aware admission: at most four Toranja-owned runs globally,
+        # two per project, and two per provider. Two implementers never share
+        # one worktree; parallel coding will use separate worktrees in a later slice.
+        maxConcurrentTotal: 4
+        maxConcurrentPerProject: 2
+        maxConcurrentPerProvider: 2
+        maxTaskChars: 12000
+        allowParallelImplementation: false
+        # The Agents panel can switch this at runtime and remembers the choice
+        # in the local desktop profile.
+        defaultMode: team
+
+    - id: subagent-antigravity
+      name: '@deepseek-ai/dsh-subagent-antigravity'
+      config:
+        executable: agy
+        timeoutMs: 600000
+        sandbox: true
+        # Print/headless mode cannot show permission prompts. Auto-approve tools
+        # only inside the Antigravity sandbox and the selected project cwd.
+        autoApproveTools: true
+        mode: accept-edits
+
+    - id: tool-subagent-antigravity
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: antigravity
+        toolName: delegate_antigravity
+        maxDepth: provider-managed
+
+    - id: subagent-codex
+      name: '@deepseek-ai/dsh-subagent-codex'
+      config:
+        # The Windows subprocess sandbox owns a synthetic user profile. Point
+        # native Codex back to the authenticated host profile explicitly.
+        env:
+          CODEX_HOME: !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:os').homedir(), '.codex')
+
+    - id: tool-subagent-codex
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: codex
+        toolName: delegate_codex
+        maxDepth: provider-managed

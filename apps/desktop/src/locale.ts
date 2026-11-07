@@ -31,17 +31,17 @@ export const en = {
   application: 'Application',
   fileMenu: 'File',
   closePage: 'Close Page or Window',
-  aboutMenu: 'About DeepSeek Harness',
-  aboutProduct: 'DeepSeek Harness',
+  aboutMenu: 'About Toranja Harness',
+  aboutProduct: 'Toranja Harness',
   aboutVersion: 'Version V{version}',
-  hideApplication: 'Hide DeepSeek Harness',
+  hideApplication: 'Hide Toranja Harness',
   hideOtherApplications: 'Hide Others',
   showAllApplications: 'Show All',
-  quitApplication: 'Quit DeepSeek Harness',
-  openApplication: 'Open DeepSeek Harness',
+  quitApplication: 'Quit Toranja Harness',
+  openApplication: 'Open Toranja Harness',
   quit: 'Quit',
   cancel: 'Cancel',
-  quitTitle: 'Quit DeepSeek Harness?',
+  quitTitle: 'Quit Toranja Harness?',
   quitActiveTasks: 'Running tasks will be interrupted.',
   quitScheduledTasks: 'Scheduled tasks will not run while the app is closed.',
   quitActiveAndScheduledTasks: 'Running tasks will be interrupted, and scheduled tasks will not run while the app is closed.',
@@ -56,7 +56,7 @@ export const en = {
   copy: 'Copy',
   paste: 'Paste',
   selectAll: 'Select All',
-  startupFailed: 'DeepSeek Harness is unavailable',
+  startupFailed: 'Toranja Harness is unavailable',
   fatalSummary: 'The application could not start or stopped unexpectedly.',
   startupAddressInUse: 'Another DSH instance (such as dsh web or the desktop app) is running. They cannot start at the same time. Quit the other running DSH instance, then restart.',
   diagnosticTruncated: '… Error details shortened.',
@@ -66,10 +66,10 @@ export const en = {
   restartApplication: 'Restart',
   recoveryOperationFailed: 'The recovery operation failed',
   disableThirdPartyPlugins: 'Disable third-party plugins, back up profile patch, and restart',
-  welcomeTitle: 'DeepSeek Harness',
-  welcomeBrand: 'DeepSeek Harness',
+  welcomeTitle: 'Toranja Harness',
+  welcomeBrand: 'Toranja Harness',
   welcomeTaglineBefore: 'Welcome to ',
-  welcomeTaglineBrand: 'DeepSeek Harness',
+  welcomeTaglineBrand: 'Toranja Harness',
   welcomeTaglineAfter: '',
   welcomeDescription: 'Build potential. Explore intelligence.',
   welcomeAuthStarting: 'Opening sign in…',
@@ -130,7 +130,7 @@ export const en = {
   updateTasksUnavailable: 'Task status is unavailable. Try updating again when the workspace is ready.',
   updateStopFailed: 'Could not safely stop the tasks. The update has not been installed. Please try again later.',
   updateTechnicalDetails: 'View technical details',
-  updateTitle: 'DeepSeek Harness Update',
+  updateTitle: 'Toranja Harness Update',
   updateAvailable: 'New version available: {version}',
   updateDetail: 'Once the download is complete, you can install the update and restart the app.',
   installAndRestart: 'Install and Restart',
@@ -171,6 +171,64 @@ export const en = {
 /** Every Desktop locale supplies the complete English key set. */
 export type DesktopMessages = { readonly [Key in keyof typeof en]: string }
 
+/** Toranja Tech desktop copy. Product language defaults to Brazilian Portuguese. */
+export const ptBR = {
+  ...en,
+  application: 'Aplicativo',
+  fileMenu: 'Arquivo',
+  closePage: 'Fechar página ou janela',
+  aboutMenu: 'Sobre o Toranja Harness',
+  aboutVersion: 'Versão V{version}',
+  hideApplication: 'Ocultar Toranja Harness',
+  hideOtherApplications: 'Ocultar outros',
+  showAllApplications: 'Mostrar todos',
+  quitApplication: 'Sair do Toranja Harness',
+  openApplication: 'Abrir Toranja Harness',
+  quit: 'Sair',
+  cancel: 'Cancelar',
+  quitTitle: 'Sair do Toranja Harness?',
+  quitActiveTasks: 'As tarefas em execução serão interrompidas.',
+  quitScheduledTasks: 'As tarefas agendadas não serão executadas enquanto o aplicativo estiver fechado.',
+  quitActiveAndScheduledTasks: 'As tarefas em execução serão interrompidas e as tarefas agendadas não serão executadas enquanto o aplicativo estiver fechado.',
+  backgroundNoticeBody: 'As tarefas em execução continuarão. Você pode reabrir a janela pela bandeja do sistema.',
+  backgroundNoticeConfirm: 'Confirmar',
+  edit: 'Editar',
+  menuBar: 'Menu do aplicativo',
+  delete: 'Excluir',
+  undo: 'Desfazer',
+  redo: 'Refazer',
+  cut: 'Recortar',
+  copy: 'Copiar',
+  paste: 'Colar',
+  selectAll: 'Selecionar tudo',
+  startupFailed: 'Toranja Harness indisponível',
+  fatalSummary: 'O aplicativo não pôde iniciar ou foi encerrado inesperadamente.',
+  diagnosticTruncated: '… Detalhes do erro resumidos.',
+  reportWrittenTo: 'Relatório de diagnóstico: {path}',
+  startupReinstallAdvice: 'Se algum arquivo estiver ausente ou danificado, feche o aplicativo e reinstale. Suas tarefas ficam armazenadas separadamente.',
+  exitApplication: 'Sair',
+  restartApplication: 'Reiniciar',
+  recoveryOperationFailed: 'A recuperação falhou',
+  disableThirdPartyPlugins: 'Desativar plugins de terceiros, salvar uma cópia do perfil e reiniciar',
+  welcomeTaglineBefore: 'Bem-vindo ao ',
+  welcomeDescription: 'Tecnologia brasileira para transformar ideias em entregas.',
+  checkUpdatesMenu: 'Verificar atualizações…',
+  reloadPageMenu: 'Recarregar página',
+  restartAppHostMenu: 'Reiniciar aplicativo e host',
+  updateCheckTitle: 'Verificar atualizações',
+  updateCurrent: 'Você já está na versão mais recente!',
+  updateChecking: 'Verificando atualizações…',
+  updateDownload: 'Baixar atualização',
+  updateClose: 'Fechar',
+  updateLater: 'Atualizar depois',
+  updateTitle: 'Atualização do Toranja Harness',
+  updateAvailable: 'Nova versão disponível: {version}',
+  installAndRestart: 'Instalar e reiniciar',
+  later: 'Depois',
+  updateFailedTitle: 'Falha na atualização',
+  unknownError: 'Erro desconhecido',
+} as const satisfies DesktopMessages
+
 export const zh = {
   cliCommandMenu: '管理 dsh 命令…',
   cliCommandTitle: '管理 dsh 命令',
@@ -202,17 +260,17 @@ export const zh = {
   application: '应用',
   fileMenu: '文件',
   closePage: '关闭页面或窗口',
-  aboutMenu: '关于 DeepSeek Harness',
-  aboutProduct: 'DeepSeek Harness',
+  aboutMenu: '关于 Toranja Harness',
+  aboutProduct: 'Toranja Harness',
   aboutVersion: '版本 V{version}',
-  hideApplication: '隐藏 DeepSeek Harness',
+  hideApplication: '隐藏 Toranja Harness',
   hideOtherApplications: '隐藏其他',
   showAllApplications: '显示全部',
-  quitApplication: '退出 DeepSeek Harness',
-  openApplication: '打开 DeepSeek Harness',
+  quitApplication: '退出 Toranja Harness',
+  openApplication: '打开 Toranja Harness',
   quit: '退出',
   cancel: '取消',
-  quitTitle: '退出 DeepSeek Harness？',
+  quitTitle: '退出 Toranja Harness？',
   quitActiveTasks: '当前正在运行的任务将会中断',
   quitScheduledTasks: '应用关闭期间，定时任务不会运行',
   quitActiveAndScheduledTasks: '当前正在运行的任务将会中断，且应用关闭期间，定时任务不会运行',
@@ -227,7 +285,7 @@ export const zh = {
   copy: '复制',
   paste: '粘贴',
   selectAll: '全选',
-  startupFailed: 'DeepSeek Harness 无法使用',
+  startupFailed: 'Toranja Harness 无法使用',
   fatalSummary: '应用无法启动或已意外停止。',
   startupAddressInUse: '有其他正在运行的 DSH（如其他 dsh web、桌面端），无法同时启动，请退出其他正在运行的 DSH 后重启。',
   diagnosticTruncated: '… 错误详情已截短。',
@@ -237,10 +295,10 @@ export const zh = {
   restartApplication: '重启',
   recoveryOperationFailed: '恢复操作失败',
   disableThirdPartyPlugins: '禁用第三方插件、备份 profile patch 并重启',
-  welcomeTitle: 'DeepSeek Harness',
-  welcomeBrand: 'DeepSeek Harness',
+  welcomeTitle: 'Toranja Harness',
+  welcomeBrand: 'Toranja Harness',
   welcomeTaglineBefore: '欢迎使用 ',
-  welcomeTaglineBrand: 'DeepSeek Harness',
+  welcomeTaglineBrand: 'Toranja Harness',
   welcomeTaglineAfter: '',
   welcomeDescription: '组装无限可能，共探智能上限',
   welcomeAuthStarting: '正在打开登录…',
@@ -301,7 +359,7 @@ export const zh = {
   updateTasksUnavailable: '无法确认任务状态，请在工作区就绪后重试更新。',
   updateStopFailed: '未能安全停止任务，更新尚未安装，请稍后重试。',
   updateTechnicalDetails: '查看技术详情',
-  updateTitle: 'DeepSeek Harness 更新',
+  updateTitle: 'Toranja Harness 更新',
   updateAvailable: '发现新版本 {version}',
   updateDetail: '下载完成后，可安装并重启应用。',
   installAndRestart: '安装并重启',
@@ -341,15 +399,16 @@ export const zh = {
 
 /** Locale payload exposed to the Desktop-owned renderer. */
 export interface DesktopLocale {
-  readonly id: 'en' | 'zh-CN'
+  readonly id: 'en' | 'pt-BR' | 'zh-CN'
   readonly messages: DesktopMessages
 }
 
 /** Resolve Electron's locale to one shipped Desktop dictionary. */
 export function resolveDesktopLocale(locale: string): DesktopLocale {
-  return locale.toLowerCase().startsWith('zh')
-    ? { id: 'zh-CN', messages: zh }
-    : { id: 'en', messages: en }
+  const normalized = locale.toLowerCase()
+  if (normalized.startsWith('pt')) return { id: 'pt-BR', messages: ptBR }
+  if (normalized.startsWith('zh')) return { id: 'zh-CN', messages: zh }
+  return { id: 'en', messages: en }
 }
 
 /**
@@ -360,10 +419,10 @@ export function resolveDesktopLocale(locale: string): DesktopLocale {
  */
 export function resolveDesktopStartupLocale(preference: string | null, languages: readonly string[]): DesktopLocale {
   const selected = preference?.toLowerCase()
-  if (selected === 'zh' || selected === 'en') return resolveDesktopLocale(selected)
+  if (selected === 'zh' || selected === 'en' || selected === 'pt' || selected === 'pt-br') return resolveDesktopLocale(selected)
   for (const language of languages) {
     const primary = language.toLowerCase().split('-')[0]
-    if (primary === 'zh' || primary === 'en') return resolveDesktopLocale(primary)
+    if (primary === 'zh' || primary === 'en' || primary === 'pt') return resolveDesktopLocale(primary)
   }
   return resolveDesktopLocale('en')
 }

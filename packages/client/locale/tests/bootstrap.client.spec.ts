@@ -68,7 +68,8 @@ describe('native locale initialization', () => {
   it('validates the preload response before reading its fields', () => {
     expect(parseLocaleBootstrap({ languages: ['en-US'], preference: null })).toEqual({ languages: ['en-US'], preference: null })
     expect(parseLocaleBootstrap({ languages: [], preference: 'zh' }).preference).toBe('zh')
-    for (const value of [null, {}, { languages: 'en', preference: null }, { languages: [42], preference: null }, { languages: [], preference: 42 }]) {
+    for (const value of [null, {}, { languages: 'en', preference: null }, { languages: [42], preference: null },
+      { languages: [], preference: undefined }, { languages: [], preference: 42 }]) {
       expect(() => parseLocaleBootstrap(value)).toThrow('invalid native initialization data')
     }
   })

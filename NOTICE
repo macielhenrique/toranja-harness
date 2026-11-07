@@ -1,0 +1,19 @@
+Toranja Harness
+Copyright (c) 2026 Toranja Tech
+
+This project is a derivative composition of DeepSeek Harness:
+https://github.com/deepseek-ai/deepseek-harness
+Copyright (c) 2026 DeepSeek
+Licensed under the MIT License included in this repository.
+
+The Toranja Harness product composition, orchestration policy, Brazilian
+Portuguese interface, local provider adapters, and Toranja Tech visual assets
+contain modifications made by Toranja Tech.
+
+OpenClaude (https://github.com/Twigpine/openclaude) was studied as an
+architectural reference for local provider profiles and agent routing. See the
+licenses and notices in the respective upstream projects before redistributing
+third-party material.
+
+Toranja Tech names, logos, and brand elements are not licensed as trademarks
+by the software license unless their owner grants separate permission.

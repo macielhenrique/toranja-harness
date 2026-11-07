@@ -1,0 +1,14 @@
+- insert:
+    - id: subagent-antigravity
+      name: '@deepseek-ai/dsh-subagent-antigravity'
+      config:
+        executable: agy
+        timeoutMs: 600000
+        sandbox: true
+        mode: accept-edits
+    - id: tool-subagent-antigravity
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: antigravity
+        toolName: delegate_antigravity
+        maxDepth: provider-managed

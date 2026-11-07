@@ -47,3 +47,6 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
+
+# Evidências visuais locais de validação do Toranja Harness
+/toranja-*.png

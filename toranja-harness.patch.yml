@@ -1,0 +1,118 @@
+# Personal Toranja Harness composition. Applied after the stock Web/Desktop
+# profile so no DeepSeek account, model route, or telemetry endpoint is needed.
+
+- id: deepseek-account
+  disabled: true
+
+- id: deepseek-llm-api-extensions
+  disabled: true
+
+- id: session-log-deepseek
+  disabled: true
+
+- id: plugin-package-inventory-deepseek
+  disabled: true
+
+- id: llm-deepseek
+  disabled: true
+
+- id: llm-deepseek-account
+  disabled: true
+
+- id: session-telemetry-otel
+  disabled: true
+
+- id: desktop-product-telemetry
+  disabled: true
+
+- id: product-analytics
+  disabled: true
+
+- id: ui-settings-account
+  disabled: true
+
+- id: account-controller
+  disabled: true
+
+- id: web
+  name: '@deepseek-ai/dsh-web'
+  config:
+    fetchProvider: http
+
+- id: web-search-deepseek
+  disabled: true
+
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      openai-codex: {}
+
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: openai-codex
+    model: gpt-5.6-luna
+
+# Replace the stock same-model delegation surface with the Agent Teams roster,
+# messaging, task board, and team tools. The lead remains the Codex-backed
+# Harness agent.
+- id: tool-subagent-control
+  disabled: true
+
+- id: tool-subagent-list-agents
+  disabled: true
+
+- id: tool-subagent
+  disabled: true
+
+- id: tool-subagent-fork
+  disabled: true
+
+- insert:
+    # Direct primary-chat route. This appears in the model picker and calls
+    # Antigravity without spending a Codex turn.
+    - id: llm-antigravity-cli
+      name: './packages/llm/llm-antigravity-cli/src/index.ts'
+      config:
+        executable: agy
+        timeoutMs: 600000
+        sandbox: true
+        autoApproveTools: true
+        mode: accept-edits
+
+    - id: agent-team
+      name: '@deepseek-ai/dsh-experimental-agent-team'
+      config:
+        maxMembers: 8
+        maxTasks: 256
+        maxMessageBytes: 65536
+        disposalTimeoutMs: 5000
+
+    - id: tool-agent-team
+      name: '@deepseek-ai/dsh-experimental-tool-agent-team'
+      config:
+        freshProvider: spawn
+        forkProvider: fork
+
+    - id: ui-agent-team
+      name: '@deepseek-ai/dsh-experimental-client-ui-agent-team'
+
+    # Antigravity remains a distinct external agent with its own local account,
+    # model defaults, limits, and sandbox. Codex decides when to delegate to it.
+    - id: subagent-antigravity
+      # Source-relative while developing this fork. The packaged profile uses
+      # the built private package with the same plugin entry.
+      name: './packages/subagent/subagent-antigravity/src/index.ts'
+      config:
+        executable: agy
+        timeoutMs: 600000
+        sandbox: true
+        mode: accept-edits
+
+    - id: tool-subagent-antigravity
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: antigravity
+        toolName: delegate_antigravity
+        maxDepth: provider-managed

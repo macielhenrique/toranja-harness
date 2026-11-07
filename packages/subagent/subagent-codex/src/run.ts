@@ -8,9 +8,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
@@ -51,6 +51,51 @@ const CODEX_PACKAGE_BIN = resolve(
   dirname(codexPackageJsonPath),
   codexPackageManifest.bin.codex,
 )
+
+const CODEX_NATIVE_TARGETS: Partial<Record<NodeJS.Platform, Partial<Record<string, {
+  readonly packageName: string
+  readonly triple: string
+}>>>> = {
+  win32: {
+    x64: { packageName: '@openai/codex-win32-x64', triple: 'x86_64-pc-windows-msvc' },
+    arm64: { packageName: '@openai/codex-win32-arm64', triple: 'aarch64-pc-windows-msvc' },
+  },
+  darwin: {
+    x64: { packageName: '@openai/codex-darwin-x64', triple: 'x86_64-apple-darwin' },
+    arm64: { packageName: '@openai/codex-darwin-arm64', triple: 'aarch64-apple-darwin' },
+  },
+  linux: {
+    x64: { packageName: '@openai/codex-linux-x64', triple: 'x86_64-unknown-linux-musl' },
+    arm64: { packageName: '@openai/codex-linux-arm64', triple: 'aarch64-unknown-linux-musl' },
+  },
+}
+
+/**
+ * Electron exposes ASAR files to Node's filesystem APIs, but Windows cannot
+ * spawn a PE from that virtual path. Desktop packaging already extracts the
+ * native payload, so select that real path only when this module is in ASAR.
+ */
+function packagedCodexBinary(): string | undefined {
+  const marker = `${sep}app.asar${sep}`
+  if (!codexPackageJsonPath.includes(marker)) return undefined
+  const target = CODEX_NATIVE_TARGETS[process.platform]?.[process.arch]
+  if (target === undefined) return undefined
+  let packageJson: string
+  try {
+    packageJson = createRequire(import.meta.url).resolve(`${target.packageName}/package.json`)
+  } catch {
+    return undefined
+  }
+  const virtual = join(
+    dirname(packageJson),
+    'vendor',
+    target.triple,
+    'bin',
+    process.platform === 'win32' ? 'codex.exe' : 'codex',
+  )
+  const unpacked = virtual.replace(marker, `${sep}app.asar.unpacked${sep}`)
+  return existsSync(unpacked) ? unpacked : undefined
+}
 
 /** Profile-selectable non-interactive Codex permission mode. */
 export type CodexPermissionMode =
@@ -133,6 +178,8 @@ export function codexStartupFailure(cause: unknown): Error {
  * @returns Node, the official wrapper, and the fixed app-server arguments.
  */
 export function codexAppServerArgv(): string[] {
+  const native = packagedCodexBinary()
+  if (native !== undefined) return [native, 'app-server', '--stdio']
   return [process.execPath, CODEX_PACKAGE_BIN, 'app-server', '--stdio']
 }
 
