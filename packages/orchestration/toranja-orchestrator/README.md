@@ -64,6 +64,27 @@ implementers sharing one worktree.
 The plugin never handles provider credentials. Codex and Antigravity keep using
 their independently configured local authentication and safety boundaries.
 
+## Fallback, cross-review, and replanning
+
+A Team-mode delegation that names no provider may move to another connected
+provider, in `fallbackOrder`. It moves when the routed provider refuses to
+start, or when its run fails for a reason of the provider itself: quota or rate
+limit, outage, timeout, or a missing or crashed process. The next provider
+receives the identical task. A run that fails on its own merits stays where it
+ran, and a named provider or a solo mode never falls back. Each provider that
+was left settles as a failed task and is listed under `fallbackFrom`.
+
+With `crossReview` (default `true`), `run_delivery_gate` routes the reviewer to
+a provider other than the one that last completed an implementer task in the
+project, and reports `implementerProvider` and `independentReview`. When no
+other provider is connected the implementing provider reviews its own work and
+`independentReview` is `false`.
+
+With `replanOnGateFailure` (default `true`), a gate with an explicit `FAIL`
+verdict starts a planner that receives the acceptance criteria, the
+implementation summary, and each gate answer, and returns it under `replan`. An
+inconclusive gate does not replan.
+
 `delegate_project_task` starts managed subagents and returns immediately with
 their ids. Standard Harness completion notifications deliver final results to
 the lead conversation. Admission limits cap total, per-project, and per-provider

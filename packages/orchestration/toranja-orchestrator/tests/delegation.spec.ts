@@ -23,6 +23,8 @@ interface Harness {
   readonly repo: string
   readonly agyRuns: string[][]
   readonly started: string[]
+  /** Prompt text of every started run, in start order. */
+  readonly prompts: string[]
   readonly tool: (name: string) => Tool
   readonly status: () => ToranjaOrchestrationStatus
   readonly setMode: (request: Record<string, unknown>) => ToranjaOrchestrationStatus
@@ -32,6 +34,10 @@ interface Harness {
   answer: string
   /** When set, simulated non-Antigravity agents settle only after it resolves. */
   hold: Promise<undefined> | undefined
+  /** Providers whose start is refused, with the error they report. */
+  readonly offline: Map<string, string>
+  /** Providers whose run settles as failed, with the diagnostic they report. */
+  readonly failing: Map<string, string>
 }
 
 const repos: string[] = []
@@ -63,6 +69,7 @@ async function mount(config: orchestrator.Config = {}, registered = ['codex', 'a
     repo,
     agyRuns: [],
     started: [],
+    prompts: [],
     tool: (name) => {
       const tool = tools.get(name)
       if (tool === undefined) throw new Error(`missing tool ${name}`)
@@ -73,6 +80,8 @@ async function mount(config: orchestrator.Config = {}, registered = ['codex', 'a
     agentSideEffect: () => {},
     answer: 'TORANJA_GATE: PASS\nall criteria inspected',
     hold: undefined,
+    offline: new Map(),
+    failing: new Map(),
   }
   ctx.provide('subprocess', {
     spawn: (spec: { argv: readonly string[]; cwd: string }) => {
@@ -99,8 +108,22 @@ async function mount(config: orchestrator.Config = {}, registered = ['codex', 'a
       providers.set(provider.name, provider)
       return () => { providers.delete(provider.name) }
     },
-    startActivation: async (start: { provider: string; request: { cwd: string; signal?: AbortSignal } }) => {
+    startActivation: async (start: {
+      provider: string
+      request: { cwd: string; signal?: AbortSignal; prompt: { text: string }[] }
+    }) => {
+      const family = start.provider.split('~')[0] ?? start.provider
+      const refusal = harness.offline.get(family)
+      if (refusal !== undefined) throw new Error(refusal)
       harness.started.push(start.provider)
+      harness.prompts.push(start.request.prompt.map(block => block.text).join(''))
+      const diagnostic = harness.failing.get(family)
+      if (diagnostic !== undefined) {
+        return {
+          childId: `child-${harness.started.length}`,
+          result: Promise.resolve({ output: [], stopReason: 'error', diagnostic }),
+        }
+      }
       const provider = providers.get(start.provider)
       // Antigravity instances Toranja owns run through the simulated CLI;
       // every other provider settles with the configured answer.
@@ -164,6 +187,22 @@ function delegate(harness: Harness, args: Record<string, unknown>): Promise<Reco
     task: 'do the work',
     ...args,
   }, { agent: {}, signal: new AbortController().signal }).then(text => JSON.parse(text) as Record<string, unknown>)
+}
+
+interface GateOutcome {
+  readonly passed: boolean
+  readonly implementerProvider?: string
+  readonly independentReview?: boolean
+  readonly replan?: Record<string, unknown>
+  readonly results: Record<string, unknown>[]
+}
+
+function runGate(harness: Harness): Promise<GateOutcome> {
+  return harness.tool('run_delivery_gate').execute({
+    project: 'demo',
+    implementationSummary: 'done',
+    acceptanceCriteria: 'tests pass',
+  }, { agent: {}, signal: new AbortController().signal }).then(text => JSON.parse(text) as GateOutcome)
 }
 
 afterEach(async () => {
@@ -316,6 +355,116 @@ describe('Toranja routed delegation', () => {
     expect(harness.status().routes.map(route => route.provider)).toEqual(Array.from({ length: 9 }, () => 'codex'))
     const result = await delegate(harness, { role: 'searcher' })
     expect(result.activations).toEqual([expect.objectContaining({ provider: 'codex', providerName: 'codex~ro~gpt-light~low' })])
+  })
+
+  it('falls back to the next connected provider when the routed one refuses to start', async () => {
+    const harness = await mount({ routing: ROUTING })
+    harness.offline.set('antigravity', 'agy is not installed')
+    const result = await delegate(harness, { role: 'reader' })
+    expect(result.activations).toEqual([expect.objectContaining({
+      provider: 'codex',
+      providerName: 'codex~ro~gpt-light~low',
+      fallbackFrom: [{ provider: 'antigravity', error: 'agy is not installed' }],
+    })])
+    const tasks = await settled(harness)
+    expect(tasks.map(task => [task.provider, task.state])).toEqual([['codex', 'completed'], ['antigravity', 'failed']])
+  })
+
+  it('reruns the task on the next provider when the routed one runs out of quota', async () => {
+    const harness = await mount({ routing: ROUTING })
+    harness.failing.set('antigravity', 'Antigravity status: ERROR' + String.fromCharCode(10) + 'RESOURCE_EXHAUSTED: quota exceeded')
+    await delegate(harness, { role: 'reader' })
+    const tasks = await settled(harness)
+    expect(tasks.map(task => [task.provider, task.state])).toEqual([['codex', 'completed'], ['antigravity', 'failed']])
+    expect(harness.started).toEqual(['antigravity~ro~gemini-flash-low~native', 'codex~ro~gpt-light~low'])
+  })
+
+  it('keeps a task that failed on its own merits on the provider that ran it', async () => {
+    const harness = await mount({ routing: ROUTING })
+    harness.failing.set('antigravity', 'Antigravity status: ERROR' + String.fromCharCode(10) + 'the requested file does not exist')
+    await delegate(harness, { role: 'reader' })
+    const tasks = await settled(harness)
+    expect(tasks.map(task => [task.provider, task.state])).toEqual([['antigravity', 'failed']])
+  })
+
+  it('reruns a gate reviewer on the next provider and reports the provider it left', async () => {
+    const harness = await mount({ routing: ROUTING })
+    harness.failing.set('antigravity', 'Antigravity timed out after 600000 ms')
+    const result = JSON.parse(await harness.tool('run_delivery_gate').execute({
+      project: 'demo',
+      implementationSummary: 'done',
+      acceptanceCriteria: 'tests pass',
+    }, { agent: {}, signal: new AbortController().signal })) as { passed: boolean; results: Record<string, unknown>[] }
+    expect(result.passed).toBe(true)
+    expect(result.results[0]).toMatchObject({
+      role: 'reviewer',
+      provider: 'codex',
+      verdict: 'pass',
+      fallbackFrom: [{ provider: 'antigravity', error: 'Antigravity timed out after 600000 ms' }],
+    })
+  })
+
+  it('reviews an implementation on a different provider than the one that wrote it', async () => {
+    const harness = await mount({ routing: ROUTING, roleProviders: { implementer: 'codex', reviewer: 'codex' } })
+    await delegate(harness, { role: 'implementer' })
+    await settled(harness)
+    const result = await runGate(harness)
+    expect(result).toMatchObject({ passed: true, implementerProvider: 'codex', independentReview: true })
+    expect(result.results[0]).toMatchObject({ role: 'reviewer', provider: 'antigravity' })
+  })
+
+  it('reports a review as not independent when only the implementing provider is connected', async () => {
+    const harness = await mount({ routing: ROUTING }, ['codex'])
+    await delegate(harness, { role: 'implementer' })
+    await settled(harness)
+    const result = await runGate(harness)
+    expect(result).toMatchObject({ implementerProvider: 'codex', independentReview: false })
+    expect(result.results[0]).toMatchObject({ role: 'reviewer', provider: 'codex' })
+  })
+
+  it('keeps the preferred reviewer when cross-review is switched off', async () => {
+    const harness = await mount({
+      routing: ROUTING,
+      crossReview: false,
+      roleProviders: { implementer: 'codex', reviewer: 'codex' },
+    })
+    await delegate(harness, { role: 'implementer' })
+    await settled(harness)
+    const result = await runGate(harness)
+    expect(result).toMatchObject({ implementerProvider: 'codex', independentReview: false })
+    expect(result.results[0]).toMatchObject({ role: 'reviewer', provider: 'codex' })
+  })
+
+  it('sends a failed gate back to a planner with the failure evidence', async () => {
+    const harness = await mount({ routing: ROUTING })
+    harness.answer = 'TORANJA_GATE: FAIL' + String.fromCharCode(10) + '2 assertions failed in checkout.spec.ts'
+    const result = await runGate(harness)
+    expect(result).toMatchObject({ passed: false, replan: { role: 'planner', provider: 'antigravity' } })
+    expect(harness.started.at(-1)).toBe('antigravity~ro~gemini-argon-medium~native')
+    expect(harness.prompts.at(-1)).toContain('Assigned role: planner')
+    expect(harness.prompts.at(-1)).toContain('2 assertions failed in checkout.spec.ts')
+    expect(harness.prompts.at(-1)).toContain('tests pass')
+  })
+
+  it('does not replan a gate that passed, was inconclusive, or has replanning switched off', async () => {
+    const passing = await mount({ routing: ROUTING })
+    expect(await runGate(passing)).not.toHaveProperty('replan')
+    const inconclusive = await mount({ routing: ROUTING })
+    inconclusive.answer = 'I could not decide'
+    expect(await runGate(inconclusive)).not.toHaveProperty('replan')
+    const disabled = await mount({ routing: ROUTING, replanOnGateFailure: false })
+    disabled.answer = 'TORANJA_GATE: FAIL' + String.fromCharCode(10) + 'broken'
+    expect(await runGate(disabled)).not.toHaveProperty('replan')
+  })
+
+  it('does not fall back when the caller named the provider or selected a solo mode', async () => {
+    const harness = await mount({ routing: ROUTING })
+    harness.offline.set('antigravity', 'agy is not installed')
+    await expect(delegate(harness, { role: 'reader', provider: 'antigravity' }))
+      .rejects.toThrow('no project agent started: antigravity: agy is not installed')
+    harness.setMode({ mode: 'antigravity' })
+    await expect(delegate(harness, { role: 'reader' }))
+      .rejects.toThrow('no project agent started: antigravity: agy is not installed')
   })
 
   it('delegates through the unrouted instance when Toranja owns none', async () => {

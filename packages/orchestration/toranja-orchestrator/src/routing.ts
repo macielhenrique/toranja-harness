@@ -179,3 +179,21 @@ export function accessViolation(
   if (access === 'read-only' && before.untracked !== after.untracked) return 'read-only role created, removed, or changed untracked files'
   return undefined
 }
+
+const PROVIDER_FAILURE = new RegExp([
+  String.raw`category: (?:limit|service|transport|process)\b`,
+  'resource_exhausted|quota|rate limit|usage limit|credit limit',
+  String.raw`\b429\b|\b50[234]\b|overloaded|unavailable|timed out`,
+  String.raw`\bENOENT\b|\bECONNRESET\b|\bECONNREFUSED\b|\bENOTFOUND\b`,
+].join('|'), 'i')
+
+/**
+ * Tell a failure of the provider itself (quota, rate limit, outage, missing or
+ * crashed process, timeout) from a task that failed on its own merits. Only the
+ * former justifies rerunning the same task on another provider.
+ * @param diagnostic - Failure diagnostic reported by the provider run.
+ * @returns True when another provider could plausibly complete the task.
+ */
+export function isProviderFailure(diagnostic: string | undefined): boolean {
+  return diagnostic !== undefined && PROVIDER_FAILURE.test(diagnostic)
+}

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   ROLES,
   accessViolation,
+  isProviderFailure,
   modelTier,
   resolveRoute,
   roleAccess,
@@ -75,6 +76,26 @@ describe('Toranja routing policy', () => {
     expect(variantConfig('antigravity', { autoApproveTools: true, mode: 'accept-edits' }, implementer, 'y')).toEqual({
       autoApproveTools: true, mode: 'accept-edits', providerName: 'y',
     })
+  })
+
+  it('tells a provider outage or quota limit from a task that failed on its own merits', () => {
+    for (const diagnostic of [
+      'product: Codex; stage: turn; category: limit',
+      'product: Codex; stage: turn; category: service; http status: 503',
+      'product: Codex; stage: process; category: process',
+      'Antigravity status: ERROR RESOURCE_EXHAUSTED: quota exceeded',
+      'HTTP 429 Too Many Requests',
+      'rate limit reached for this account',
+      'Antigravity timed out after 600000 ms',
+      'spawn agy ENOENT',
+    ]) expect(isProviderFailure(diagnostic), diagnostic).toBe(true)
+    for (const diagnostic of [
+      undefined,
+      'product: Codex; stage: turn; category: access-policy',
+      'product: Codex; stage: turn; category: invalid-result',
+      'the requested file does not exist',
+      'read-only role changed tracked files',
+    ]) expect(isProviderFailure(diagnostic), String(diagnostic)).toBe(false)
   })
 
   it('reports only changes the access level forbids', () => {

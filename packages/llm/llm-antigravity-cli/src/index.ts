@@ -23,6 +23,8 @@ export const inject = ['agents', 'llm', 'sessions', 'subprocess', 'toranjaOrches
 
 const PROVIDER = 'antigravity-local'
 const MODEL = 'default'
+/** Model and effort a Gemini Argon conversation continues on when its quota is exhausted. */
+const QUOTA_FALLBACK = { model: 'gemini-3.8-flash-high', effort: 'high' } as const
 const NAMED_MODELS: readonly (readonly [id: string, name: string])[] = [
   ['gemini-4-argon-medium', 'Gemini 4 Argon (Médio)'],
   ['gemini-4-argon-high', 'Gemini 4 Argon (Alto)'],
@@ -78,6 +80,11 @@ export interface Config {
   maxCodexDelegationsPerTurn?: number
   /** Explicit environment entries layered over the scrubbed parent environment. */
   env?: Record<string, string>
+  /**
+   * How long a conversation stays on the quota fallback model before the
+   * selected model is tried again, in milliseconds.
+   */
+  quotaFallbackRetryMs?: number
 }
 
 /** Schema for {@link Config}. */
@@ -91,6 +98,7 @@ export const Config: z<Config> = z.object({
   effort: z.union(['low', 'medium', 'high', 'xhigh', 'max'] as const),
   maxCodexDelegationsPerTurn: z.number().default(3),
   env: z.dict(z.string()).default({}),
+  quotaFallbackRetryMs: z.number().default(900_000),
 })
 
 function blockText(message: RequestMessage): string {
@@ -185,6 +193,12 @@ export function isQuotaExhaustedError(error: unknown): boolean {
 
 class AntigravityCliAdapter extends LlmAdapter {
   private readonly sessions = new Map<string, AgySession>()
+  /** Selected model a conversation left for quota, and until when it stays away. */
+  private readonly quotaFallbacks = new Map<string, {
+    readonly model: AgySessionConfig['model']
+    readonly effort: AgySessionConfig['effort']
+    readonly until: number
+  }>()
 
   constructor(
     private readonly ctx: Context,
@@ -229,7 +243,18 @@ class AntigravityCliAdapter extends LlmAdapter {
     const cwd = this.cwd(options)
     const key = this.sessionKey(options)
     const priorProvider = lastAssistantProvider(options.messages)
-    const agyConfig = this.agyConfig(options.model)
+    const selectedConfig = this.agyConfig(options.model)
+    // A conversation that fell back for quota stays on the fallback model until
+    // the retry interval passes or the user selects another model.
+    const fallback = key === undefined ? undefined : this.quotaFallbacks.get(key)
+    const onFallback = fallback !== undefined
+      && fallback.model === selectedConfig.model
+      && fallback.effort === selectedConfig.effort
+      && Date.now() < fallback.until
+    if (key !== undefined && fallback !== undefined && !onFallback) this.quotaFallbacks.delete(key)
+    const agyConfig: AgySessionConfig = onFallback
+      ? { ...selectedConfig, ...QUOTA_FALLBACK }
+      : selectedConfig
     let driver = key === undefined ? undefined : this.sessions.get(key)
     const needsHandoff = driver === undefined
       || driver.cwd !== cwd
@@ -256,18 +281,27 @@ class AntigravityCliAdapter extends LlmAdapter {
           try {
             return await activeDriver.ask(nextPrompt, options.signal)
           } catch (error: unknown) {
-            const isArgon = agyConfig.model?.includes('argon') === true || options.model.includes('argon')
+            const isArgon = agyConfig.model?.includes('argon') === true
             if (isArgon && isQuotaExhaustedError(error)) {
+              this.ctx.logger.warn(`llm-antigravity-cli: quota exhausted on ${String(agyConfig.model)}; continuing on ${QUOTA_FALLBACK.model}`)
               activeDriver.close()
-              const fallbackConfig: AgySessionConfig = {
-                ...agyConfig,
-                model: 'gemini-3.8-flash-high',
-                effort: 'high',
+              const fallbackDriver = new AgySession(cwd, this.ctx, { ...agyConfig, ...QUOTA_FALLBACK })
+              if (key !== undefined) {
+                this.sessions.set(key, fallbackDriver)
+                this.quotaFallbacks.set(key, {
+                  model: selectedConfig.model,
+                  effort: selectedConfig.effort,
+                  until: Date.now() + this.config.quotaFallbackRetryMs,
+                })
               }
-              const fallbackDriver = new AgySession(cwd, this.ctx, fallbackConfig)
-              if (key !== undefined) this.sessions.set(key, fallbackDriver)
               activeDriver = fallbackDriver
-              return await fallbackDriver.ask(nextPrompt, options.signal)
+              // The fallback process starts without history, so it receives the
+              // conversation so far; a mid-turn follow-up is appended to it.
+              const transcript = recentTranscript(options.messages, cwd, this.ctx)
+              return await fallbackDriver.ask(
+                nextPrompt === prompt ? transcript : `${transcript}\n\n${nextPrompt}`,
+                options.signal,
+              )
             }
             throw error
           }
@@ -317,6 +351,10 @@ export function apply(ctx: Context, config: Config): void {
     ...config.effort === undefined ? {} : { effort: config.effort },
     maxCodexDelegationsPerTurn: config.maxCodexDelegationsPerTurn ?? 3,
     env: config.env ?? {},
+    quotaFallbackRetryMs: config.quotaFallbackRetryMs ?? 900_000,
+  }
+  if (!Number.isFinite(resolved.quotaFallbackRetryMs) || resolved.quotaFallbackRetryMs < 0) {
+    throw new Error('llm-antigravity-cli: quotaFallbackRetryMs deve ser um número não negativo')
   }
   if (!Number.isSafeInteger(resolved.timeoutMs) || resolved.timeoutMs < 1) {
     throw new Error('llm-antigravity-cli: timeoutMs deve ser um inteiro positivo')

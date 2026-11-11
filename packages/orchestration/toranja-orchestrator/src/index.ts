@@ -29,12 +29,14 @@ import {
   ROLES,
   RUN_PROVIDERS,
   slugifyProjectId,
+  type ReservationLease,
   type Role,
   type RunProvider,
 } from './policy.ts'
 import {
   MODEL_TIERS,
   accessViolation,
+  isProviderFailure,
   resolveRoute,
   variantConfig,
   variantName,
@@ -138,6 +140,16 @@ export interface Config {
   routing?: Record<string, ProviderRoutingConfig>
   /** Preferred provider per role in Team mode, keyed by role. */
   roleProviders?: Record<string, ToranjaProviderId>
+  /**
+   * Route the delivery-gate reviewer to a provider other than the one that
+   * implemented the change whenever another provider is connected.
+   */
+  crossReview?: boolean
+  /**
+   * When a delivery gate returns an explicit `FAIL`, start a planner with the
+   * gate evidence so the change returns to planning.
+   */
+  replanOnGateFailure?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -172,6 +184,8 @@ export const Config: z<Config> = z.object({
     })).default({}),
   })).default({}),
   roleProviders: z.dict(z.union(['codex', 'antigravity', 'claude-code', 'openrouter'] as const)).default({}),
+  crossReview: z.boolean().default(true),
+  replanOnGateFailure: z.boolean().default(true),
 })
 
 interface ResolvedProject extends ProjectConfig {
@@ -318,23 +332,53 @@ function gatePrompt(
   }]
 }
 
-function monitorActivation(
-  activation: SubagentActivation,
-  lease: { settle(success: boolean, error?: string): void },
-  verify: () => Promise<string | undefined>,
-): void {
-  void activation.result.then(
-    async (result) => {
-      const violation = await verify()
-      lease.settle(
-        result.stopReason === 'completed' && violation === undefined,
-        violation ?? result.diagnostic ?? result.stopReason,
-      )
-    },
-    (error: unknown) => {
-      lease.settle(false, error instanceof Error ? error.message : 'subagent result infrastructure failure')
-    },
-  )
+/** One provider that was tried before the provider that ran the task. */
+interface FallbackAttempt {
+  readonly provider: RunProvider
+  readonly error: string
+}
+
+/** A role-scoped task and how its child is started on whichever provider accepts it. */
+interface RoutedRequest {
+  readonly project: ResolvedProject
+  readonly role: Role
+  readonly description: string
+  readonly prompt: (route: ToranjaRoleRoute) => ContentBlock[]
+  readonly label: (provider: RunProvider) => string
+  readonly parent: Agent
+  readonly signal: AbortSignal
+  readonly delivery: 'caller' | 'parent'
+  readonly strict?: boolean
+}
+
+interface StartedRun {
+  readonly activation: SubagentActivation
+  readonly providerName: string
+  readonly verify: () => Promise<string | undefined>
+  readonly route: ToranjaRoleRoute
+  readonly lease: ReservationLease
+  readonly fallbackFrom: readonly FallbackAttempt[]
+  readonly remaining: readonly RunProvider[]
+  readonly request: RoutedRequest
+}
+
+/** Final state of a routed task after any rerun on another provider. */
+interface RoutedOutcome {
+  /** The run that produced the outcome; a rerun replaces the original. */
+  readonly run: StartedRun
+  /** Settled result, or `undefined` when the result itself could not be read. */
+  readonly result?: SubagentResult
+  /** Forbidden working-tree change, when the access check found one. */
+  readonly violation?: string
+  /** Infrastructure failure while reading the result. */
+  readonly error?: string
+}
+
+/** Every candidate provider refused to start the task. */
+class RoutedStartError extends Error {
+  constructor(readonly attempts: readonly FallbackAttempt[]) {
+    super(attempts.map(attempt => `${attempt.provider}: ${attempt.error}`).join('; '))
+  }
 }
 
 interface ProviderRouting {
@@ -377,19 +421,12 @@ function parseRoleProviders(config: Config): Map<Role, RunProvider> {
   return roleProviders
 }
 
-interface GateRun {
+interface GateResult {
   readonly role: 'reviewer' | 'tester'
   readonly provider: RunProvider
   readonly providerName: string
-  readonly activation: SubagentActivation
-  readonly verify: () => Promise<string | undefined>
-}
-
-interface GateResult {
-  readonly role: GateRun['role']
-  readonly provider: RunProvider
-  readonly providerName: string
   readonly subagentId: string
+  readonly fallbackFrom?: readonly FallbackAttempt[]
   readonly stopReason: SubagentResult['stopReason'] | 'startup-error' | 'infrastructure-error'
   readonly verdict: ReturnType<typeof parseGateVerdict>
   readonly output: string
@@ -419,6 +456,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     allowParallelImplementation: config.allowParallelImplementation ?? false,
   }
   const ledger = new OrchestrationLedger(limits)
+  const crossReview = config.crossReview ?? true
+  const replanOnGateFailure = config.replanOnGateFailure ?? true
   let mode: ToranjaAgentMode = config.defaultMode ?? 'team'
   let profile: ToranjaExecutionProfile = config.defaultProfile ?? 'equilibrado'
   let fallbackOrder: readonly ToranjaProviderId[] = config.fallbackOrder ?? RUN_PROVIDERS
@@ -581,6 +620,99 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     effort: route.effort,
     access: route.access,
   })
+
+  /**
+   * Providers to try for a role, in order. Only a Team-mode delegation that
+   * named no provider may move to another connected provider.
+   */
+  const candidatesFor = (first: RunProvider, allowFallback: boolean): readonly RunProvider[] => {
+    if (!allowFallback || mode !== 'team') return [first]
+    const available = availableRunProviders()
+    return [first, ...fallbackOrder.filter(provider => provider !== first && available.has(provider))]
+  }
+  /**
+   * Start a role on the first candidate provider that accepts it. Each refused
+   * candidate settles its own ledger task as failed and is reported in
+   * `fallbackFrom`; when every candidate refuses, the rejection carries them all.
+   */
+  const startRouted = async (
+    request: RoutedRequest,
+    providers: readonly RunProvider[],
+    firstLease?: ReservationLease,
+    attempted: readonly FallbackAttempt[] = [],
+  ): Promise<StartedRun> => {
+    const fallbackFrom = [...attempted]
+    let lease = firstLease
+    for (const [index, provider] of providers.entries()) {
+      const route = routeFor(request.role, provider)
+      try {
+        lease ??= requiredAt(
+          ledger.reserveBatch([reservation(request.project, route, request.description)]),
+          0,
+          'delegation reservation',
+        )
+        const launched = await launch({
+          project: request.project,
+          route,
+          prompt: request.prompt(route),
+          label: request.label(provider),
+          parent: request.parent,
+          signal: request.signal,
+          delivery: request.delivery,
+          ...request.strict === undefined ? {} : { strict: request.strict },
+        })
+        return { ...launched, route, lease, fallbackFrom, remaining: providers.slice(index + 1), request }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'unknown provider startup failure'
+        lease?.settle(false, message)
+        lease = undefined
+        fallbackFrom.push({ provider, error: message.slice(0, 4096) })
+      }
+    }
+    throw new RoutedStartError(fallbackFrom)
+  }
+
+  /**
+   * Await a routed run. When the provider itself failed and another candidate
+   * remains, settle that task as failed and rerun the identical request on the
+   * next candidate. The caller settles the lease of the returned run.
+   */
+  const awaitRouted = async (run: StartedRun): Promise<RoutedOutcome> => {
+    let result: SubagentResult
+    try {
+      result = await run.activation.result
+    } catch (error: unknown) {
+      return { run, error: error instanceof Error ? error.message : 'subagent result infrastructure failure' }
+    }
+    const violation = await run.verify()
+    if (
+      result.stopReason !== 'completed'
+      && violation === undefined
+      && run.remaining.length > 0
+      && isProviderFailure(result.diagnostic)
+    ) {
+      const error = (result.diagnostic ?? result.stopReason).slice(0, 4096)
+      run.lease.settle(false, error)
+      const attempted = [...run.fallbackFrom, { provider: run.route.provider, error }]
+      try {
+        return await awaitRouted(await startRouted(run.request, run.remaining, undefined, attempted))
+      } catch (failure: unknown) {
+        if (!(failure instanceof RoutedStartError)) throw failure
+        return { run: { ...run, fallbackFrom: failure.attempts }, result }
+      }
+    }
+    return { run, result, ...violation === undefined ? {} : { violation } }
+  }
+
+  /** Settle the ledger task of a run whose result is delivered to the parent agent. */
+  const settleInBackground = (started: StartedRun): void => {
+    void awaitRouted(started).then(({ run, result, violation, error }) => {
+      run.lease.settle(
+        result?.stopReason === 'completed' && violation === undefined,
+        violation ?? error ?? result?.diagnostic ?? result?.stopReason,
+      )
+    })
+  }
 
   const availableRunProviders = (): ReadonlySet<RunProvider> => {
     const registered = new Set(ctx.subagents.list())
@@ -788,41 +920,46 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const selected: readonly RunProvider[] = providerChoice === 'both' ? ['codex', 'antigravity'] : [providerChoice]
       assertProvidersAllowed(mode, selected)
       const { project, description, task } = validateAssignment(args)
-      const routes = selected.map(provider => routeFor(role, provider))
-      const leases = ledger.reserveBatch(routes.map(route => reservation(project, route, description)))
-      const results = await Promise.all(routes.map(async (route, index) => {
-        const provider = route.provider
-        const lease = requiredAt(leases, index, 'delegation reservation')
+      const leases = ledger.reserveBatch(selected.map(provider => reservation(project, routeFor(role, provider), description)))
+      const request: RoutedRequest = {
+        project,
+        role,
+        description,
+        prompt: route => rolePrompt(project, route, task, profile),
+        label: provider => `${project.title}: ${description} (${provider})`,
+        parent,
+        signal: exec.signal,
+        delivery: 'parent',
+      }
+      const results = await Promise.all(selected.map(async (first, index) => {
         try {
-          const { activation, providerName: registryName, verify } = await launch({
-            project,
-            route,
-            prompt: rolePrompt(project, route, task, profile),
-            label: `${project.title}: ${description} (${provider})`,
-            parent,
-            signal: exec.signal,
-            delivery: 'parent',
-          })
-          monitorActivation(activation, lease, verify)
+          const started = await startRouted(
+            request,
+            candidatesFor(first, args.provider === undefined),
+            requiredAt(leases, index, 'delegation reservation'),
+          )
+          const { route } = started
+          settleInBackground(started)
           return {
             ok: true as const,
-            provider,
-            providerName: registryName,
+            provider: route.provider,
+            providerName: started.providerName,
             tier: route.tier,
             access: route.access,
             ...route.model === undefined ? {} : { model: route.model },
             ...route.effort === undefined ? {} : { effort: route.effort },
-            taskId: lease.taskId,
-            subagentId: activation.childId,
+            ...started.fallbackFrom.length === 0 ? {} : { fallbackFrom: started.fallbackFrom },
+            taskId: started.lease.taskId,
+            subagentId: started.activation.childId,
           }
         } catch (error: unknown) {
-          const message = error instanceof Error ? error.message : 'unknown provider startup failure'
-          lease.settle(false, message)
-          return { ok: false as const, provider, providerName: providerName(provider), error: message.slice(0, 4096) }
+          if (!(error instanceof RoutedStartError)) throw error
+          return { ok: false as const, attempts: error.attempts }
         }
       }))
       const activations = results.filter(result => result.ok)
-      const failures = results.filter(result => !result.ok)
+      const failures = results.flatMap(result => result.ok ? [] : result.attempts)
+        .map(attempt => ({ ...attempt, providerName: providerName(attempt.provider) }))
       if (activations.length === 0) {
         throw new Error(`no project agent started: ${failures.map(failure => `${failure.provider}: ${failure.error}`).join('; ')}`)
       }
@@ -859,78 +996,128 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (ledger.hasActiveWriter(project.id)) {
         throw new Error(`run_delivery_gate: an implementer is still active in project ${project.id}; run the gate after it settles`)
       }
-      const routes = (['reviewer', 'tester'] as const).map(role => ({ role, route: routeFor(role, providerFor(role)) }))
-      const leases = ledger.reserveBatch(routes.map(({ route }) => reservation(project, route, `Portão de entrega: ${route.role}`)))
-      const starts = await Promise.all(routes.map(async ({ role, route }, index): Promise<GateRun | GateResult> => {
-        const provider = route.provider
+      const roles = ['reviewer', 'tester'] as const
+      const implementerProvider = ledger.tasks().find(task =>
+        task.projectId === project.id && task.role === 'implementer' && task.state === 'completed')?.provider
+      // Cross-review moves the implementing provider to the end of the
+      // reviewer's candidates, so it reviews its own work only as a last resort.
+      const gateCandidates = (role: typeof roles[number]): readonly RunProvider[] => {
+        const candidates = candidatesFor(providerFor(role), true)
+        if (role !== 'reviewer' || !crossReview || implementerProvider === undefined) return candidates
+        return [
+          ...candidates.filter(provider => provider !== implementerProvider),
+          ...candidates.filter(provider => provider === implementerProvider),
+        ]
+      }
+      const candidates = { reviewer: gateCandidates('reviewer'), tester: gateCandidates('tester') }
+      const leases = ledger.reserveBatch(roles.map(role => reservation(
+        project,
+        routeFor(role, requiredAt(candidates[role], 0, 'gate provider')),
+        `Portão de entrega: ${role}`,
+      )))
+      const results = await Promise.all(roles.map(async (role, index): Promise<GateResult> => {
+        let started: StartedRun
         try {
-          const { activation, providerName: registryName, verify } = await launch({
+          started = await startRouted({
             project,
-            route,
-            prompt: gatePrompt(project, role, implementationSummary, acceptanceCriteria),
-            label: `${project.title}: delivery ${role} (${provider})`,
+            role,
+            description: `Portão de entrega: ${role}`,
+            prompt: () => gatePrompt(project, role, implementationSummary, acceptanceCriteria),
+            label: provider => `${project.title}: delivery ${role} (${provider})`,
             parent,
             signal: exec.signal,
             delivery: 'caller',
             strict: true,
-          })
-          return { role, provider, providerName: registryName, activation, verify }
+          }, candidates[role], requiredAt(leases, index, 'delivery gate reservation'))
         } catch (error: unknown) {
-          const diagnostic = error instanceof Error ? error.message : 'unknown provider startup failure'
-          requiredAt(leases, index, 'delivery gate reservation').settle(false, diagnostic)
+          if (!(error instanceof RoutedStartError)) throw error
+          const last = requiredAt(error.attempts, error.attempts.length - 1, 'gate start attempt')
           return {
             role,
-            provider,
-            providerName: providerName(provider),
+            provider: last.provider,
+            providerName: providerName(last.provider),
             subagentId: '',
             stopReason: 'startup-error',
             verdict: 'invalid',
             output: '',
-            diagnostic: diagnostic.slice(0, 4096),
+            diagnostic: error.message.slice(0, 4096),
           }
         }
-      }))
-      const results = await Promise.all(starts.map(async (start, index): Promise<GateResult> => {
-        if ('stopReason' in start) return start
-        try {
-          const result = await start.activation.result
-          const output = contentText(result.output).slice(0, 20_000)
-          const violation = await start.verify()
-          const verdict = violation === undefined ? parseGateVerdict(output) : 'invalid'
-          const successful = result.stopReason === 'completed' && verdict === 'pass'
-          const diagnostic = violation ?? result.diagnostic
-          requiredAt(leases, index, 'delivery gate reservation')
-            .settle(successful, diagnostic ?? (successful ? undefined : `${result.stopReason}/${verdict}`))
-          return {
-            role: start.role,
-            provider: start.provider,
-            providerName: start.providerName,
-            subagentId: start.activation.childId,
-            stopReason: result.stopReason,
-            verdict,
-            output,
-            ...(diagnostic === undefined ? {} : { diagnostic }),
-          }
-        } catch (error: unknown) {
-          const diagnostic = error instanceof Error ? error.message : 'subagent result infrastructure failure'
-          requiredAt(leases, index, 'delivery gate reservation').settle(false, diagnostic)
-          return {
-            role: start.role,
-            provider: start.provider,
-            providerName: start.providerName,
-            subagentId: start.activation.childId,
-            stopReason: 'infrastructure-error',
-            verdict: 'invalid',
-            output: '',
-            diagnostic: diagnostic.slice(0, 4096),
-          }
+        const { run, result, violation, error } = await awaitRouted(started)
+        const base = {
+          role,
+          provider: run.route.provider,
+          providerName: run.providerName,
+          subagentId: run.activation.childId,
+          ...run.fallbackFrom.length === 0 ? {} : { fallbackFrom: run.fallbackFrom },
+        }
+        if (result === undefined) {
+          const diagnostic = error ?? 'subagent result infrastructure failure'
+          run.lease.settle(false, diagnostic)
+          return { ...base, stopReason: 'infrastructure-error', verdict: 'invalid', output: '', diagnostic: diagnostic.slice(0, 4096) }
+        }
+        const output = contentText(result.output).slice(0, 20_000)
+        const verdict = violation === undefined ? parseGateVerdict(output) : 'invalid'
+        const successful = result.stopReason === 'completed' && verdict === 'pass'
+        const diagnostic = violation ?? result.diagnostic
+        run.lease.settle(successful, diagnostic ?? (successful ? undefined : `${result.stopReason}/${verdict}`))
+        return {
+          ...base,
+          stopReason: result.stopReason,
+          verdict,
+          output,
+          ...(diagnostic === undefined ? {} : { diagnostic }),
         }
       }))
       const passed = results.every(result => result.stopReason === 'completed' && result.verdict === 'pass')
+      let replan: Record<string, unknown> | undefined
+      if (replanOnGateFailure && results.some(result => result.verdict === 'fail')) {
+        const task = [
+          'The delivery gate rejected this change. Diagnose the failures below and return a corrected plan: steps, affected files, risks, and the checks that will satisfy the acceptance criteria.',
+          '',
+          'Acceptance criteria:',
+          acceptanceCriteria,
+          '',
+          'Implementation summary:',
+          implementationSummary,
+          '',
+          'Gate evidence:',
+          ...results.map(result => `[${result.role} on ${result.provider}: ${result.verdict}]\n${result.output}`),
+        ].join('\n').slice(0, maxTaskChars)
+        try {
+          const started = await startRouted({
+            project,
+            role: 'planner',
+            description: 'Replanejar após portão',
+            prompt: route => rolePrompt(project, route, task, profile),
+            label: provider => `${project.title}: replan after gate (${provider})`,
+            parent,
+            signal: exec.signal,
+            delivery: 'parent',
+          }, candidatesFor(providerFor('planner'), true))
+          settleInBackground(started)
+          replan = {
+            role: 'planner',
+            provider: started.route.provider,
+            taskId: started.lease.taskId,
+            subagentId: started.activation.childId,
+          }
+        } catch (error: unknown) {
+          if (!(error instanceof RoutedStartError)) throw error
+          replan = { role: 'planner', error: error.message.slice(0, 4096) }
+        }
+      }
       return JSON.stringify({
         project: project.id,
         passed,
         decision: passed ? 'ready' : 'not-ready',
+        ...implementerProvider === undefined
+          ? {}
+          : {
+            implementerProvider,
+            independentReview: results.some(result => result.role === 'reviewer' && result.provider !== implementerProvider),
+          },
+        ...replan === undefined ? {} : { replan },
         results,
       })
     },

@@ -38,3 +38,7 @@ limites.
 O modo selecionado no painel **Agentes** é uma trava de execução. Em **Só
 Antigravity**, o adaptador nunca inicia Codex. Em **Equipe**, o Antigravity pode
 liderar e delegar ao Codex; o resultado volta para ele revisar e consolidar.
+
+## Esgotamento de cota
+
+Quando um modelo Gemini Argon responde com esgotamento de cota, a conversa continua no `gemini-3.8-flash-high` com effort `high`. O novo processo recebe o histórico recente da conversa, porque começa sem contexto. A conversa permanece no modelo alternativo por `quotaFallbackRetryMs` (padrão de 15 minutos) ou até outro modelo ser selecionado; depois disso o modelo selecionado é tentado de novo.

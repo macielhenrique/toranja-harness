@@ -43,6 +43,7 @@ function fixture(): { adapter: LlmAdapter; specs: SubprocessSpawnSpec[] } {
         return () => undefined
       },
     },
+    logger: { warn: () => undefined },
     sessions: { get: () => undefined },
     subprocess,
     toranjaOrchestrator: {
@@ -155,6 +156,7 @@ describe('AntigravityCliAdapter', () => {
           return () => undefined
         },
       },
+      logger: { warn: () => undefined },
       sessions: { get: () => undefined },
       subprocess,
       toranjaOrchestrator: {

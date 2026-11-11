@@ -1747,7 +1747,7 @@ export interface Config {
 ## `@deepseek-ai/dsh-llm-antigravity-cli`
 
 - `inject`: `agents` · `llm` · `sessions` · `subprocess` · `toranjaOrchestrator` · `workingDirectory`
-- `source`: [`packages/llm/llm-antigravity-cli/src/index.ts:62`](../packages/llm/llm-antigravity-cli/src/index.ts)
+- `source`: [`packages/llm/llm-antigravity-cli/src/index.ts:64`](../packages/llm/llm-antigravity-cli/src/index.ts)
 
 ```ts config-catalog
 /** Configuration for the direct Antigravity CLI LLM adapter. */
@@ -1770,6 +1770,11 @@ export interface Config {
   maxCodexDelegationsPerTurn?: number
   /** Explicit environment entries layered over the scrubbed parent environment. */
   env?: Record<string, string>
+  /**
+   * How long a conversation stays on the quota fallback model before the
+   * selected model is tried again, in milliseconds.
+   */
+  quotaFallbackRetryMs?: number
 }
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-llm-antigravity-cli -->
@@ -4354,7 +4359,7 @@ export type ToolPresentationMode = 'native' | 'ptc'
 ## `@deepseek-ai/dsh-toranja-orchestrator`
 
 - `inject`: `subagents` · `subprocess` · `systemPrompt` · `tools` · `workspaceRegistry`
-- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:110`](../packages/orchestration/toranja-orchestrator/src/index.ts)
+- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:112`](../packages/orchestration/toranja-orchestrator/src/index.ts)
 
 ```ts config-catalog
 /** Product-owned orchestration settings. */
@@ -4389,6 +4394,16 @@ export interface Config {
   routing?: Record<string, ProviderRoutingConfig>
   /** Preferred provider per role in Team mode, keyed by role. */
   roleProviders?: Record<string, ToranjaProviderId>
+  /**
+   * Route the delivery-gate reviewer to a provider other than the one that
+   * implemented the change whenever another provider is connected.
+   */
+  crossReview?: boolean
+  /**
+   * When a delivery gate returns an explicit `FAIL`, start a planner with the
+   * gate evidence so the change returns to planning.
+   */
+  replanOnGateFailure?: boolean
 }
 
 /** One stable product lane backed by a local project directory. */
