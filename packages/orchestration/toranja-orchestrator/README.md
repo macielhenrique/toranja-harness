@@ -71,19 +71,27 @@ provider, in `fallbackOrder`. It moves when the routed provider refuses to
 start, or when its run fails for a reason of the provider itself: quota or rate
 limit, outage, timeout, or a missing or crashed process. The next provider
 receives the identical task. A run that fails on its own merits stays where it
-ran, and a named provider or a solo mode never falls back. Each provider that
+ran, and a named provider or a solo mode never falls back. An `implementer`
+moves only when its provider refuses to start: once it has run it may have
+written files, so a provider failure midway settles the task as failed instead
+of rerunning it over a partly changed working tree. Each provider that
 was left settles as a failed task and is listed under `fallbackFrom`.
 
-With `crossReview` (default `true`), `run_delivery_gate` routes the reviewer to
-a provider other than the one that last completed an implementer task in the
-project, and reports `implementerProvider` and `independentReview`. When no
-other provider is connected the implementing provider reviews its own work and
-`independentReview` is `false`.
+`run_delivery_gate` accepts `implementationTaskId`, the `taskId` of the
+delegated implementer run under review; it must be a completed implementer task
+of the project. With `crossReview` (default `true`) the gate then routes the
+reviewer to a provider other than that task's and reports `implementerProvider`
+and `independentReview`. When no other provider is connected the implementing
+provider reviews its own work and `independentReview` is `false`. Without the
+task id the gate does not guess the implementer from project history: the
+reviewer follows the normal route and neither field is reported.
 
 With `replanOnGateFailure` (default `true`), a gate with an explicit `FAIL`
-verdict starts a planner that receives the acceptance criteria, the
-implementation summary, and each gate answer, and returns it under `replan`. An
-inconclusive gate does not replan.
+verdict starts a planner that receives each gate answer, the acceptance
+criteria, and the implementation summary, each within its own share of
+`maxTaskChars`. The gate returns immediately with the planner's `taskId` and
+`subagentId` under `replan`; the plan itself arrives as that subtask's result.
+An inconclusive gate does not replan.
 
 `delegate_project_task` starts managed subagents and returns immediately with
 their ids. Standard Harness completion notifications deliver final results to

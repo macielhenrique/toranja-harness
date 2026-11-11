@@ -119,6 +119,7 @@ async function mount(config: orchestrator.Config = {}, registered = ['codex', 'a
       harness.prompts.push(start.request.prompt.map(block => block.text).join(''))
       const diagnostic = harness.failing.get(family)
       if (diagnostic !== undefined) {
+        harness.agentSideEffect(start.request.cwd)
         return {
           childId: `child-${harness.started.length}`,
           result: Promise.resolve({ output: [], stopReason: 'error', diagnostic }),
@@ -180,6 +181,12 @@ async function settled(harness: Harness): Promise<ToranjaOrchestrationStatus['ta
   return harness.status().tasks
 }
 
+async function implement(harness: Harness): Promise<string> {
+  const result = await delegate(harness, { role: 'implementer' })
+  await settled(harness)
+  return (result.activations as { taskId: string }[])[0]?.taskId ?? ''
+}
+
 function delegate(harness: Harness, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   return harness.tool('delegate_project_task').execute({
     project: 'demo',
@@ -197,11 +204,12 @@ interface GateOutcome {
   readonly results: Record<string, unknown>[]
 }
 
-function runGate(harness: Harness): Promise<GateOutcome> {
+function runGate(harness: Harness, args: Record<string, unknown> = {}): Promise<GateOutcome> {
   return harness.tool('run_delivery_gate').execute({
     project: 'demo',
     implementationSummary: 'done',
     acceptanceCriteria: 'tests pass',
+    ...args,
   }, { agent: {}, signal: new AbortController().signal }).then(text => JSON.parse(text) as GateOutcome)
 }
 
@@ -406,18 +414,14 @@ describe('Toranja routed delegation', () => {
 
   it('reviews an implementation on a different provider than the one that wrote it', async () => {
     const harness = await mount({ routing: ROUTING, roleProviders: { implementer: 'codex', reviewer: 'codex' } })
-    await delegate(harness, { role: 'implementer' })
-    await settled(harness)
-    const result = await runGate(harness)
+    const result = await runGate(harness, { implementationTaskId: await implement(harness) })
     expect(result).toMatchObject({ passed: true, implementerProvider: 'codex', independentReview: true })
     expect(result.results[0]).toMatchObject({ role: 'reviewer', provider: 'antigravity' })
   })
 
   it('reports a review as not independent when only the implementing provider is connected', async () => {
     const harness = await mount({ routing: ROUTING }, ['codex'])
-    await delegate(harness, { role: 'implementer' })
-    await settled(harness)
-    const result = await runGate(harness)
+    const result = await runGate(harness, { implementationTaskId: await implement(harness) })
     expect(result).toMatchObject({ implementerProvider: 'codex', independentReview: false })
     expect(result.results[0]).toMatchObject({ role: 'reviewer', provider: 'codex' })
   })
@@ -428,9 +432,7 @@ describe('Toranja routed delegation', () => {
       crossReview: false,
       roleProviders: { implementer: 'codex', reviewer: 'codex' },
     })
-    await delegate(harness, { role: 'implementer' })
-    await settled(harness)
-    const result = await runGate(harness)
+    const result = await runGate(harness, { implementationTaskId: await implement(harness) })
     expect(result).toMatchObject({ implementerProvider: 'codex', independentReview: false })
     expect(result.results[0]).toMatchObject({ role: 'reviewer', provider: 'codex' })
   })
@@ -455,6 +457,47 @@ describe('Toranja routed delegation', () => {
     const disabled = await mount({ routing: ROUTING, replanOnGateFailure: false })
     disabled.answer = 'TORANJA_GATE: FAIL' + String.fromCharCode(10) + 'broken'
     expect(await runGate(disabled)).not.toHaveProperty('replan')
+  })
+
+  it('does not rerun an implementer whose provider failed after it may have written', async () => {
+    const harness = await mount({ routing: ROUTING })
+    harness.failing.set('codex', 'product: Codex; stage: turn; category: limit')
+    harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), 'half written') }
+    await delegate(harness, { role: 'implementer' })
+    const tasks = await settled(harness)
+    expect(tasks.map(task => [task.provider, task.state])).toEqual([['codex', 'failed']])
+    expect(harness.started).toEqual(['codex~rw~gpt-strong~medium'])
+  })
+
+  it('does not infer the implementer of a gate from earlier work in the project', async () => {
+    const harness = await mount({ routing: ROUTING, roleProviders: { implementer: 'antigravity' } })
+    await implement(harness)
+    const result = await runGate(harness)
+    expect(result).not.toHaveProperty('implementerProvider')
+    expect(result).not.toHaveProperty('independentReview')
+    expect(result.results[0]).toMatchObject({ role: 'reviewer', provider: 'antigravity' })
+  })
+
+  it('rejects a gate bound to a task that is not a completed implementation of the project', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await expect(runGate(harness, { implementationTaskId: 'toranja-missing' }))
+      .rejects.toThrow('implementationTaskId toranja-missing is not a completed implementer task of project demo')
+    const reader = await delegate(harness, { role: 'reader' })
+    await settled(harness)
+    const readerTask = (reader.activations as { taskId: string }[])[0]?.taskId
+    await expect(runGate(harness, { implementationTaskId: readerTask }))
+      .rejects.toThrow('is not a completed implementer task of project demo')
+  })
+
+  it('keeps the gate evidence in the replan task when summary and criteria fill the task budget', async () => {
+    const harness = await mount({ routing: ROUTING, maxTaskChars: 600 })
+    harness.answer = 'TORANJA_GATE: FAIL' + String.fromCharCode(10) + '2 assertions failed in checkout.spec.ts'
+    await runGate(harness, {
+      implementationSummary: 'S'.repeat(300),
+      acceptanceCriteria: 'C'.repeat(300),
+    })
+    expect(harness.prompts.at(-1)).toContain('Assigned role: planner')
+    expect(harness.prompts.at(-1)).toContain('2 assertions failed in checkout.spec.ts')
   })
 
   it('does not fall back when the caller named the provider or selected a solo mode', async () => {

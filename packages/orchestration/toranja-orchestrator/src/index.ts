@@ -685,9 +685,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       return { run, error: error instanceof Error ? error.message : 'subagent result infrastructure failure' }
     }
     const violation = await run.verify()
+    // A write-capable run that failed midway leaves the working tree in an
+    // unknown state, so only non-writing roles are rerun on another provider.
     if (
       result.stopReason !== 'completed'
       && violation === undefined
+      && run.route.access !== 'write'
       && run.remaining.length > 0
       && isProviderFailure(result.diagnostic)
     ) {
@@ -974,6 +977,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       project: { type: 'string', required: true, description: 'Project lane id from list_project_lanes.' },
       implementationSummary: { type: 'string', required: true, description: 'What changed, including relevant files and claimed validation.' },
       acceptanceCriteria: { type: 'string', required: true, description: 'Concrete conditions that must all hold before delivery.' },
+      implementationTaskId: { type: 'string', description: 'taskId returned by the delegate_project_task implementer run under review. Supply it so the reviewer runs on a different provider; omit it only when no delegated implementer wrote the change.' },
     },
     output: {
       schema: { type: 'string' },
@@ -997,8 +1001,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         throw new Error(`run_delivery_gate: an implementer is still active in project ${project.id}; run the gate after it settles`)
       }
       const roles = ['reviewer', 'tester'] as const
-      const implementerProvider = ledger.tasks().find(task =>
-        task.projectId === project.id && task.role === 'implementer' && task.state === 'completed')?.provider
+      // The implementer is taken only from the task the caller names; inferring
+      // it from project history could bind the review to an unrelated change.
+      const implementationTaskId = args.implementationTaskId?.trim()
+      const implementation = implementationTaskId === undefined || implementationTaskId.length === 0
+        ? undefined
+        : ledger.tasks().find(task => task.id === implementationTaskId)
+      if (
+        implementationTaskId !== undefined && implementationTaskId.length > 0
+        && (implementation?.projectId !== project.id || implementation.role !== 'implementer' || implementation.state !== 'completed')
+      ) {
+        throw new Error(`run_delivery_gate: implementationTaskId ${implementationTaskId} is not a completed implementer task of project ${project.id}`)
+      }
+      const implementerProvider = implementation?.provider
       // Cross-review moves the implementing provider to the end of the
       // reviewer's candidates, so it reviews its own work only as a last resort.
       const gateCandidates = (role: typeof roles[number]): readonly RunProvider[] => {
@@ -1072,17 +1087,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const passed = results.every(result => result.stopReason === 'completed' && result.verdict === 'pass')
       let replan: Record<string, unknown> | undefined
       if (replanOnGateFailure && results.some(result => result.verdict === 'fail')) {
+        // Evidence comes first and each part has its own budget, so a long
+        // summary or criteria can never push the gate answers out of the task.
+        const evidenceBudget = Math.floor(maxTaskChars / 2 / results.length)
+        const contextBudget = Math.floor(maxTaskChars / 5)
         const task = [
-          'The delivery gate rejected this change. Diagnose the failures below and return a corrected plan: steps, affected files, risks, and the checks that will satisfy the acceptance criteria.',
-          '',
-          'Acceptance criteria:',
-          acceptanceCriteria,
-          '',
-          'Implementation summary:',
-          implementationSummary,
+          'The delivery gate rejected this change. Diagnose the failures and return a corrected plan.',
           '',
           'Gate evidence:',
-          ...results.map(result => `[${result.role} on ${result.provider}: ${result.verdict}]\n${result.output}`),
+          ...results.map(result =>
+            `[${result.role} on ${result.provider}: ${result.verdict}]\n${(result.output || result.diagnostic || '').slice(0, evidenceBudget)}`),
+          '',
+          'Acceptance criteria:',
+          acceptanceCriteria.slice(0, contextBudget),
+          '',
+          'Implementation summary:',
+          implementationSummary.slice(0, contextBudget),
         ].join('\n').slice(0, maxTaskChars)
         try {
           const started = await startRouted({
