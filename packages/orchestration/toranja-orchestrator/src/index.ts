@@ -858,7 +858,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     readStatus,
     startCodexAndWait,
   )
-  const controller = new ToranjaOrchestrationController(ctx, readStatus, async (request) => {
+  // Each change reads the stored overrides, merges, stores, and applies as one
+  // step. Running the steps one after another keeps overlapping changes from
+  // starting at the same stored value and overwriting each other.
+  let settingsQueue: Promise<unknown> = Promise.resolve()
+  const applySettings = async (request: ToranjaAgentModeRequest): Promise<ToranjaOrchestrationStatus> => {
     // Only the fields this request names join the stored overrides, so a field
     // the user never changed keeps following the deployment configuration.
     const next: ToranjaOrchestrationState = {
@@ -883,6 +887,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (nextRoleProviders !== undefined) roleProviders = nextRoleProviders
     if (next.crossReview !== undefined) crossReview = next.crossReview
     return readStatus()
+  }
+  const controller = new ToranjaOrchestrationController(ctx, readStatus, (request) => {
+    const result = settingsQueue.then(() => applySettings(request))
+    // A rejected change must not block the changes queued after it.
+    settingsQueue = result.catch(() => undefined)
+    return result
   })
 
   for (const project of configuredProjects) {

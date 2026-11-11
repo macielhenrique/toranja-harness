@@ -597,6 +597,20 @@ describe('Toranja routed delegation', () => {
     expect(restarted.status()).toMatchObject({ mode: 'team', profile: 'economico', crossReview: false })
   })
 
+  it('keeps both changes when two settings are changed at the same time', async () => {
+    const disk = new MemoryMediaPool()
+    const first = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    await Promise.all([
+      first.setMode({ mode: 'team', profile: 'economico' }),
+      first.setMode({ mode: 'team', crossReview: false }),
+      first.setMode({ mode: 'team', roleProviders: { planner: 'codex' } }),
+    ])
+    const expected = { profile: 'economico', crossReview: false, roleProviders: { planner: 'codex' } }
+    expect(first.status()).toMatchObject(expected)
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(restarted.status()).toMatchObject(expected)
+  })
+
   it('starts from the deployment defaults when nothing was stored', async () => {
     const harness = await mount({ routing: ROUTING, defaultMode: 'antigravity', defaultProfile: 'economico' })
     expect(harness.status()).toMatchObject({ mode: 'antigravity', profile: 'economico', crossReview: true, roleProviders: {} })
