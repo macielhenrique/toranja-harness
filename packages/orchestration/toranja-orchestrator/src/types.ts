@@ -1,17 +1,30 @@
 /** Browser-safe Toranja orchestration dashboard contracts. */
 
 /** Identifier for a supported Toranja agent provider. */
-export type ToranjaProviderId = 'codex' | 'antigravity'
-/** Active agent routing mode (`codex` solo, `antigravity` solo, or `team`). */
-export type ToranjaAgentMode = 'codex' | 'antigravity' | 'team'
-/** Role assigned to a delegated project task. */
-export type ToranjaTaskRole = 'planner' | 'implementer' | 'reviewer' | 'tester' | 'release'
+export type ToranjaProviderId = 'codex' | 'antigravity' | 'claude-code' | 'openrouter'
+/** Active agent routing mode (solo provider or `team`). */
+export type ToranjaAgentMode = ToranjaProviderId | 'team'
+/** Dynamic cost/quality execution profile from the Toranja architecture blueprint. */
+export type ToranjaExecutionProfile = 'economico' | 'equilibrado' | 'qualidade'
+/** Role assigned to a delegated project task across Phases A (investigation), B (reasoning), and C (delivery). */
+export type ToranjaTaskRole =
+  | 'reader'
+  | 'searcher'
+  | 'inspector'
+  | 'planner'
+  | 'architect'
+  | 'implementer'
+  | 'reviewer'
+  | 'tester'
+  | 'release'
 /** Lifecycle state of a delegated project task. */
 export type ToranjaTaskState = 'active' | 'completed' | 'failed'
 
-/** Request payload to change the active Toranja agent routing mode. */
+/** Request payload to change the active Toranja agent routing mode or execution profile. */
 export interface ToranjaAgentModeRequest {
   readonly mode: ToranjaAgentMode
+  readonly profile?: ToranjaExecutionProfile
+  readonly fallbackOrder?: readonly ToranjaProviderId[]
 }
 
 /** Counters and timestamps for a project lane or provider. */
@@ -58,6 +71,10 @@ export interface ToranjaOrchestrationStatus {
   readonly generatedAt: string
   /** Routing used whenever a delegation omits an explicit provider. */
   readonly mode: ToranjaAgentMode
+  /** Active cost/quality execution profile. */
+  readonly profile: ToranjaExecutionProfile
+  /** Ordered provider fallback chain when the preferred provider is unavailable or exhausted. */
+  readonly fallbackOrder: readonly ToranjaProviderId[]
   readonly active: number
   readonly limits: {
     readonly maxConcurrentTotal: number

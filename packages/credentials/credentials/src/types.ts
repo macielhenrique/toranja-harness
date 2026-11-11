@@ -99,3 +99,15 @@ declare module '@deepseek-ai/cordis' {
     'credentials/record-updated'(key: CredentialKey): void
   }
 }
+
+export type {
+  AuthAttemptId,
+  AuthAttemptSnapshot,
+  AuthErrorCode,
+  AuthPhase,
+  AuthProviderId,
+  ProviderAuthStatus,
+  StartBrowserLoginRequest,
+  SubmitApiKeyRequest,
+  UnifiedAuthService,
+} from './auth-providers.ts'

@@ -3,22 +3,37 @@
 import type {
   MetricSnapshot,
   ToranjaAgentMode,
+  ToranjaExecutionProfile,
   ToranjaTaskRole,
   ToranjaTaskState,
   ToranjaTaskStatus,
 } from './types.ts'
 export type { MetricSnapshot } from './types.ts'
 
-/** Supported task roles in Toranja orchestration. */
-export const ROLES = ['planner', 'implementer', 'reviewer', 'tester', 'release'] as const
+/** Supported task roles in Toranja orchestration across Phases A, B, and C. */
+export const ROLES = [
+  'reader',
+  'searcher',
+  'inspector',
+  'planner',
+  'architect',
+  'implementer',
+  'reviewer',
+  'tester',
+  'release',
+] as const
+/** Read-only Phase A investigation roles that run on lightweight models. */
+export const INVESTIGATION_ROLES = ['reader', 'searcher', 'inspector'] as const
 /** Supported provider selection values, including dual-provider execution. */
-export const PROVIDERS = ['codex', 'antigravity', 'both'] as const
+export const PROVIDERS = ['codex', 'antigravity', 'claude-code', 'openrouter', 'both'] as const
 /** Concrete runtime providers that execute tasks. */
-export const RUN_PROVIDERS = ['codex', 'antigravity'] as const
+export const RUN_PROVIDERS = ['codex', 'antigravity', 'claude-code', 'openrouter'] as const
+/** Supported dynamic execution profiles. */
+export const EXECUTION_PROFILES = ['economico', 'equilibrado', 'qualidade'] as const
 
 /** Task role assigned to a delegated worker. */
 export type Role = ToranjaTaskRole
-/** Caller-selectable provider option (`codex`, `antigravity`, or `both`). */
+/** Caller-selectable provider option (`codex`, `antigravity`, `claude-code`, `openrouter`, or `both`). */
 export type ProviderChoice = typeof PROVIDERS[number]
 /** Concrete provider identifier used for execution and accounting. */
 export type RunProvider = typeof RUN_PROVIDERS[number]
@@ -30,9 +45,52 @@ export type RunProvider = typeof RUN_PROVIDERS[number]
  * @returns Concrete provider selected for the task.
  */
 export function defaultProvider(role: Role, mode: ToranjaAgentMode = 'team'): Exclude<ProviderChoice, 'both'> {
-  if (mode === 'codex') return 'codex'
-  if (mode === 'antigravity') return 'antigravity'
-  return role === 'planner' || role === 'reviewer' ? 'antigravity' : 'codex'
+  if (mode !== 'team') return mode
+  return role === 'reader'
+    || role === 'searcher'
+    || role === 'inspector'
+    || role === 'planner'
+    || role === 'architect'
+    || role === 'reviewer'
+    ? 'antigravity'
+    : 'codex'
+}
+
+/**
+ * Select the first available provider from the configured fallback order when
+ * the preferred provider is unavailable or exhausted.
+ * @param preferred - Primary provider chosen for the task.
+ * @param available - Set of currently reachable runtime providers.
+ * @param fallbackOrder - Ordered fallback sequence across ecosystems.
+ * @returns Concrete provider to execute the task.
+ */
+export function resolveFallbackProvider(
+  preferred: RunProvider,
+  available: ReadonlySet<RunProvider>,
+  fallbackOrder: readonly RunProvider[] = RUN_PROVIDERS,
+): RunProvider {
+  if (available.has(preferred)) return preferred
+  for (const candidate of fallbackOrder) {
+    if (available.has(candidate)) return candidate
+  }
+  return preferred
+}
+
+/**
+ * Determine whether a role should run on a lightweight investigation model
+ * (`Haiku`, `Gemini 3.8 Flash`, `GPT-5.6 Luna/Terra`) or an advanced reasoning
+ * model (`Gemini 4 Argon`, `Claude Opus/Sonnet`, `GPT-6.1 Sol`).
+ * @param role - Assigned task role.
+ * @param profile - Active execution profile (`economico`, `equilibrado`, `qualidade`).
+ * @returns Model tier (`'light'` or `'advanced'`).
+ */
+export function recommendedModelTier(
+  role: Role,
+  profile: ToranjaExecutionProfile = 'equilibrado',
+): 'light' | 'advanced' {
+  if (role === 'reader' || role === 'searcher' || role === 'inspector') return 'light'
+  if (profile === 'economico' && (role === 'tester' || role === 'release')) return 'light'
+  return 'advanced'
 }
 
 /**

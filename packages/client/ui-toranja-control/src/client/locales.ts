@@ -2,6 +2,7 @@
 
 import type {
   ToranjaAgentMode,
+  ToranjaProviderId,
   ToranjaTaskRole,
   ToranjaTaskState,
 } from '@deepseek-ai/dsh-toranja-orchestrator/types'
@@ -23,6 +24,8 @@ export const COPY = {
   providerEyebrow: 'PROVEDOR',
   providerCodex: 'Codex',
   providerAntigravity: 'Antigravity',
+  providerClaudeCode: 'Claude Code',
+  providerOpenRouter: 'OpenRouter',
   providerHint: 'Pode ser o agente principal ou receber tarefas delegadas.',
   activeCapacity: 'Capacidade ativa',
   agentStateHeading: 'Estado dos agentes',
@@ -36,7 +39,11 @@ export const COPY = {
 
 /** Localized labels for task roles. */
 export const ROLE_LABELS: Readonly<Record<ToranjaTaskRole, string>> = {
+  reader: 'Leitura',
+  searcher: 'Busca',
+  inspector: 'Inspeção',
   planner: 'Planejamento',
+  architect: 'Arquitetura',
   implementer: 'Implementação',
   reviewer: 'Revisão',
   tester: 'Testes',
@@ -56,9 +63,11 @@ export const MODE_OPTIONS: ReadonlyArray<{
   label: string
   description: string
 }> = [
-  { mode: 'team', label: 'Equipe', description: 'O agente principal pode delegar ao outro e consolida a resposta.' },
+  { mode: 'team', label: 'Equipe', description: 'O agente principal pode delegar ao outro e consolida a resposta com fallback automático.' },
   { mode: 'codex', label: 'Só Codex', description: 'Executa e delega exclusivamente com Codex.' },
   { mode: 'antigravity', label: 'Só Antigravity', description: 'Executa exclusivamente com Antigravity, sem consumir Codex.' },
+  { mode: 'claude-code', label: 'Só Claude Code', description: 'Executa e delega exclusivamente com Claude Code.' },
+  { mode: 'openrouter', label: 'Só OpenRouter', description: 'Executa e delega exclusivamente via gateway OpenRouter.' },
 ]
 
 /**
@@ -67,16 +76,36 @@ export const MODE_OPTIONS: ReadonlyArray<{
  * @returns Localized mode summary label.
  */
 export function formatModeSummary(mode: ToranjaAgentMode): string {
-  return mode === 'team' ? 'Equipe automática' : mode === 'codex' ? 'Delegar ao Codex' : 'Delegar ao Antigravity'
+  switch (mode) {
+    case 'team':
+      return 'Equipe automática'
+    case 'codex':
+      return 'Delegar ao Codex'
+    case 'antigravity':
+      return 'Delegar ao Antigravity'
+    case 'claude-code':
+      return 'Delegar ao Claude Code'
+    case 'openrouter':
+      return 'Delegar ao OpenRouter'
+  }
 }
 
 /**
  * Format a provider identifier for display.
- * @param id - Provider identifier (`codex` or `antigravity`).
+ * @param id - Provider identifier (`codex`, `antigravity`, `claude-code`, or `openrouter`).
  * @returns Display name of the provider.
  */
-export function formatProviderName(id: 'codex' | 'antigravity'): string {
-  return id === 'codex' ? COPY.providerCodex : COPY.providerAntigravity
+export function formatProviderName(id: ToranjaProviderId): string {
+  switch (id) {
+    case 'codex':
+      return COPY.providerCodex
+    case 'antigravity':
+      return COPY.providerAntigravity
+    case 'claude-code':
+      return COPY.providerClaudeCode
+    case 'openrouter':
+      return COPY.providerOpenRouter
+  }
 }
 
 /**

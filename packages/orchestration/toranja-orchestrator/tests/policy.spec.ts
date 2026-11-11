@@ -4,6 +4,8 @@ import {
   assertProvidersAllowed,
   defaultProvider,
   parseGateVerdict,
+  recommendedModelTier,
+  resolveFallbackProvider,
   slugifyProjectId,
   type OrchestrationLimits,
 } from '../src/policy.ts'
@@ -111,10 +113,16 @@ describe('provider routing mode', () => {
   it('routes every omitted delegation to the selected solo provider', () => {
     expect(defaultProvider('reviewer', 'codex')).toBe('codex')
     expect(defaultProvider('implementer', 'antigravity')).toBe('antigravity')
+    expect(defaultProvider('planner', 'claude-code')).toBe('claude-code')
+    expect(defaultProvider('reader', 'openrouter')).toBe('openrouter')
   })
 
-  it('uses role-aware routing in team mode', () => {
+  it('uses role-aware routing in team mode across Phase A, B, and C roles', () => {
+    expect(defaultProvider('reader', 'team')).toBe('antigravity')
+    expect(defaultProvider('searcher', 'team')).toBe('antigravity')
+    expect(defaultProvider('inspector', 'team')).toBe('antigravity')
     expect(defaultProvider('planner', 'team')).toBe('antigravity')
+    expect(defaultProvider('architect', 'team')).toBe('antigravity')
     expect(defaultProvider('reviewer', 'team')).toBe('antigravity')
     expect(defaultProvider('implementer', 'team')).toBe('codex')
     expect(defaultProvider('tester', 'team')).toBe('codex')
@@ -123,7 +131,31 @@ describe('provider routing mode', () => {
   it('keeps solo modes exclusive and permits cross-provider work only in team mode', () => {
     expect(() => assertProvidersAllowed('antigravity', ['codex'])).toThrow(/select Team/u)
     expect(() => assertProvidersAllowed('codex', ['antigravity'])).toThrow(/select Team/u)
+    expect(() => assertProvidersAllowed('claude-code', ['openrouter'])).toThrow(/select Team/u)
     expect(() => assertProvidersAllowed('antigravity', ['antigravity'])).not.toThrow()
-    expect(() => assertProvidersAllowed('team', ['codex', 'antigravity'])).not.toThrow()
+    expect(() => assertProvidersAllowed('openrouter', ['openrouter'])).not.toThrow()
+    expect(() => assertProvidersAllowed('team', ['codex', 'antigravity', 'claude-code', 'openrouter'])).not.toThrow()
+  })
+
+  it('resolves dynamic fallback provider when preferred provider is exhausted or unavailable', () => {
+    expect(
+      resolveFallbackProvider('codex', new Set(['antigravity', 'openrouter']), ['codex', 'antigravity', 'claude-code', 'openrouter']),
+    ).toBe('antigravity')
+    expect(
+      resolveFallbackProvider('codex', new Set(['openrouter']), ['codex', 'antigravity', 'claude-code', 'openrouter']),
+    ).toBe('openrouter')
+    expect(
+      resolveFallbackProvider('antigravity', new Set(['antigravity', 'openrouter']), ['codex', 'antigravity', 'openrouter']),
+    ).toBe('antigravity')
+  })
+
+  it('assigns model tiers according to role phase and execution profile', () => {
+    expect(recommendedModelTier('reader', 'qualidade')).toBe('light')
+    expect(recommendedModelTier('searcher', 'equilibrado')).toBe('light')
+    expect(recommendedModelTier('inspector', 'economico')).toBe('light')
+    expect(recommendedModelTier('tester', 'economico')).toBe('light')
+    expect(recommendedModelTier('tester', 'equilibrado')).toBe('advanced')
+    expect(recommendedModelTier('planner', 'economico')).toBe('advanced')
+    expect(recommendedModelTier('implementer', 'equilibrado')).toBe('advanced')
   })
 })

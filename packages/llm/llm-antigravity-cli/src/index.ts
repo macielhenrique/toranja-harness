@@ -155,6 +155,25 @@ function lastAssistantProvider(messages: readonly RequestMessage[]): string | un
   return undefined
 }
 
+/**
+ * Detects whether an execution error is due to exhausted quota, rate limits, or capacity deficits.
+ * @param error - raw error encountered during turn execution.
+ * @returns true if the error represents quota or capacity exhaustion.
+ */
+export function isQuotaExhaustedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const msg = error.message.toLowerCase()
+  return msg.includes('quota')
+    || msg.includes('exhausted')
+    || msg.includes('rate limit')
+    || msg.includes('429')
+    || msg.includes('resource_exhausted')
+    || msg.includes('capacity')
+    || msg.includes('credit')
+    || msg.includes('insufficient')
+}
+
+
 class AntigravityCliAdapter extends LlmAdapter {
   private readonly sessions = new Map<string, AgySession>()
 
@@ -213,8 +232,8 @@ class AntigravityCliAdapter extends LlmAdapter {
       if (key !== undefined) this.sessions.delete(key)
       driver = undefined
     }
-    driver ??= new AgySession(cwd, this.ctx, agyConfig)
-    if (key !== undefined) this.sessions.set(key, driver)
+    let activeDriver = driver ?? new AgySession(cwd, this.ctx, agyConfig)
+    if (key !== undefined) this.sessions.set(key, activeDriver)
     const userText = latestUserText(options.messages)
     const prompt = needsHandoff ? recentTranscript(options.messages, cwd, this.ctx) : userText
     const requireDelegation = this.ctx.toranjaOrchestrator.status().mode === 'team'
@@ -224,7 +243,26 @@ class AntigravityCliAdapter extends LlmAdapter {
         initialPrompt: prompt,
         maxDelegations: this.config.maxCodexDelegationsPerTurn,
         requireDelegation,
-        ask: nextPrompt => driver.ask(nextPrompt, options.signal),
+        ask: async (nextPrompt) => {
+          try {
+            return await activeDriver.ask(nextPrompt, options.signal)
+          } catch (error: unknown) {
+            const isArgon = agyConfig.model?.includes('argon') === true || options.model.includes('argon')
+            if (isArgon && isQuotaExhaustedError(error)) {
+              activeDriver.close()
+              const fallbackConfig: AgySessionConfig = {
+                ...agyConfig,
+                model: 'gemini-3.8-flash-high',
+                effort: 'high',
+              }
+              const fallbackDriver = new AgySession(cwd, this.ctx, fallbackConfig)
+              if (key !== undefined) this.sessions.set(key, fallbackDriver)
+              activeDriver = fallbackDriver
+              return await fallbackDriver.ask(nextPrompt, options.signal)
+            }
+            throw error
+          }
+        },
         delegateCodex: async (action) => {
           if (options.sessionId === undefined) {
             throw new Error('Antigravity não pode delegar ao Codex fora de uma conversa do Toranja')
@@ -249,7 +287,7 @@ class AntigravityCliAdapter extends LlmAdapter {
       yield { type: 'usage', usage: coordinated.usage }
       yield { type: 'finish', reason: { kind: 'stop' } }
     } finally {
-      if (key === undefined) driver.close()
+      if (key === undefined) activeDriver.close()
     }
   }
 

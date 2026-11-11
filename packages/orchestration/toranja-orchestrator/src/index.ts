@@ -18,14 +18,21 @@ import {
   assertProvidersAllowed,
   defaultProvider,
   parseGateVerdict,
+  recommendedModelTier,
+  resolveFallbackProvider,
   PROVIDERS,
   ROLES,
+  RUN_PROVIDERS,
   slugifyProjectId,
   type Role,
   type RunProvider,
 } from './policy.ts'
 import type {
-  ToranjaAgentMode, ToranjaAgentModeRequest, ToranjaOrchestrationStatus,
+  ToranjaAgentMode,
+  ToranjaAgentModeRequest,
+  ToranjaExecutionProfile,
+  ToranjaOrchestrationStatus,
+  ToranjaProviderId,
 } from './types.ts'
 import {
   ToranjaOrchestrator,
@@ -55,12 +62,16 @@ export interface Config {
   projects?: ProjectConfig[]
   codexProvider?: string
   antigravityProvider?: string
+  claudeCodeProvider?: string
+  openrouterProvider?: string
   maxConcurrentTotal?: number
   maxConcurrentPerProject?: number
   maxConcurrentPerProvider?: number
   maxTaskChars?: number
   allowParallelImplementation?: boolean
   defaultMode?: ToranjaAgentMode
+  defaultProfile?: ToranjaExecutionProfile
+  fallbackOrder?: ToranjaProviderId[]
 }
 
 export const Config: z<Config> = z.object({
@@ -71,12 +82,21 @@ export const Config: z<Config> = z.object({
   })).default([]),
   codexProvider: z.string().min(1).default('codex'),
   antigravityProvider: z.string().min(1).default('antigravity'),
+  claudeCodeProvider: z.string().min(1).default('claude-code'),
+  openrouterProvider: z.string().min(1).default('openrouter'),
   maxConcurrentTotal: z.number().default(4),
   maxConcurrentPerProject: z.number().default(2),
   maxConcurrentPerProvider: z.number().default(2),
   maxTaskChars: z.number().default(DEFAULT_MAX_TASK_CHARS),
   allowParallelImplementation: z.boolean().default(false),
-  defaultMode: z.union(['codex', 'antigravity', 'team'] as const).default('team'),
+  defaultMode: z.union(['codex', 'antigravity', 'claude-code', 'openrouter', 'team'] as const).default('team'),
+  defaultProfile: z.union(['economico', 'equilibrado', 'qualidade'] as const).default('equilibrado'),
+  fallbackOrder: z.array(z.union(['codex', 'antigravity', 'claude-code', 'openrouter'] as const)).default([
+    'codex',
+    'antigravity',
+    'claude-code',
+    'openrouter',
+  ]),
 })
 
 interface ResolvedProject extends ProjectConfig {
@@ -90,7 +110,7 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
   constructor(
     ctx: Context,
     private readonly read: () => ToranjaOrchestrationStatus,
-    private readonly writeMode: (mode: ToranjaAgentMode) => ToranjaOrchestrationStatus,
+    private readonly writeMode: (request: ToranjaAgentModeRequest) => ToranjaOrchestrationStatus,
   ) {
     super(ctx, 'toranjaOrchestrationController', { namespace: 'toranja' })
   }
@@ -105,22 +125,26 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
   }
 
   /**
-   * Change the provider routing used by delegations that omit a provider.
-   * @param request - Target routing mode.
+   * Change the provider routing, execution profile, or fallback order used by delegations.
+   * @param request - Target routing mode and optional profile/fallback settings.
    * @returns Updated orchestration snapshot.
    */
   @Remote
   setMode(request: ToranjaAgentModeRequest): ToranjaOrchestrationStatus {
-    return this.writeMode(request.mode)
+    return this.writeMode(request)
   }
 }
 
 const ROLE_GUIDANCE: Record<Role, string> = {
-  planner: 'Analyze the request and repository state. Return an actionable plan with risks, dependencies, and acceptance checks. Do not edit files unless the task explicitly requests implementation.',
-  implementer: 'Implement the scoped change in this project. Preserve unrelated work, run focused validation, and report changed files plus test evidence.',
-  reviewer: 'Independently review the requested outcome and current project state. Prioritize correctness, security, regressions, and missing acceptance evidence. Do not edit files unless explicitly asked.',
-  tester: 'Run the relevant tests and inspect failures. Report exact commands, outcomes, and diagnosis. Do not modify product code unless explicitly asked to repair a failure.',
-  release: 'Verify the delivery gate: requirements, diff, tests, build or package checks, and remaining risks. Report a clear ready/not-ready decision with evidence.',
+  reader: 'Phase A (Investigation - Reader): Read the target files and documentation using read-only tools. Return exact paths, key excerpts, and a concise summary in Portuguese without polluting the leader context. Never edit files.',
+  searcher: 'Phase A (Investigation - Searcher): Locate relevant files and symbols using Glob and Grep. Return exact file paths, line references, and a one-line summary per file. Never edit files.',
+  inspector: 'Phase A (Investigation - Inspector): Inspect logs, diagnostics, and code structure. Return the top recurring errors, exact error lines, and root-cause evidence concisely. Never edit files.',
+  planner: 'Phase B (Reasoning - Planner): Analyze the request and repository state. Return an actionable plan with steps, affected files, risks, dependencies, and acceptance checks. Do not edit files unless explicitly requested.',
+  architect: 'Phase B (Reasoning - Architect): Evaluate system-wide architectural impacts, boundaries, and trade-offs. Propose the cleanest minimal design following the project conventions. Do not edit files.',
+  implementer: 'Phase B/C (Execution - Implementer): Implement the scoped change in this project. Preserve unrelated work, run focused validation, and report changed files plus test evidence.',
+  reviewer: 'Phase C (Cross-Review - Reviewer): Independently review the requested outcome and current project state. Prioritize correctness, security, regressions, and missing acceptance evidence. Do not edit files unless explicitly asked.',
+  tester: 'Phase C (Verification - Tester): Run the relevant tests and inspect failures. Report exact commands, outcomes, and diagnosis. If tests fail, provide actionable evidence for replanning.',
+  release: 'Phase C (Delivery Gate - Release): Verify the delivery gate: requirements, diff, tests, build or package checks, and remaining risks. Report a clear ready/not-ready decision with evidence.',
 }
 
 function normalizePathKey(path: string): string {
@@ -146,13 +170,23 @@ function resolveProjects(projects: readonly ProjectConfig[]): ResolvedProject[] 
   })
 }
 
-function rolePrompt(project: ResolvedProject, role: Role, task: string): ContentBlock[] {
+function rolePrompt(
+  project: ResolvedProject,
+  role: Role,
+  task: string,
+  profile: ToranjaExecutionProfile = 'equilibrado',
+): ContentBlock[] {
+  const tier = recommendedModelTier(role, profile)
+  const tierLabel = tier === 'light'
+    ? 'LIGHTWEIGHT INVESTIGATION (Haiku 5.5 / Gemini 3.8 Flash / GPT-5.6 Luna-Terra — Read-only & Concise Summary)'
+    : 'ADVANCED REASONING (Gemini 4 Argon / Claude Opus-Sonnet / GPT-6.1 Sol)'
   return [{
     type: 'text',
     text: [
       `Toranja Harness project lane: ${project.title} (${project.id}).`,
       `Working directory boundary: ${project.path}.`,
-      `Assigned role: ${role}.`,
+      `Assigned role: ${role} [${tierLabel}].`,
+      `Execution profile: ${profile}.`,
       ROLE_GUIDANCE[role],
       '',
       'Task:',
@@ -254,8 +288,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const configuredProjects = resolveProjects(config.projects ?? [])
   const codexProvider = config.codexProvider ?? 'codex'
   const antigravityProvider = config.antigravityProvider ?? 'antigravity'
-  if (codexProvider === antigravityProvider) {
-    throw new Error('toranja-orchestrator: Codex and Antigravity provider names must be distinct')
+  const claudeCodeProvider = config.claudeCodeProvider ?? 'claude-code'
+  const openrouterProvider = config.openrouterProvider ?? 'openrouter'
+  const distinctProviders = new Set([codexProvider, antigravityProvider, claudeCodeProvider, openrouterProvider])
+  if (distinctProviders.size !== 4) {
+    throw new Error('toranja-orchestrator: Codex, Antigravity, Claude Code, and OpenRouter provider names must be distinct')
   }
   const maxTaskChars = positiveInteger('maxTaskChars', config.maxTaskChars ?? DEFAULT_MAX_TASK_CHARS)
   const limits = {
@@ -266,7 +303,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
   const ledger = new OrchestrationLedger(limits)
   let mode: ToranjaAgentMode = config.defaultMode ?? 'team'
-  const providerName = (provider: RunProvider): string => provider === 'codex' ? codexProvider : antigravityProvider
+  let profile: ToranjaExecutionProfile = config.defaultProfile ?? 'equilibrado'
+  let fallbackOrder: readonly ToranjaProviderId[] = config.fallbackOrder ?? RUN_PROVIDERS
+  const providerName = (provider: RunProvider): string => {
+    switch (provider) {
+      case 'codex':
+        return codexProvider
+      case 'antigravity':
+        return antigravityProvider
+      case 'claude-code':
+        return claudeCodeProvider
+      case 'openrouter':
+        return openrouterProvider
+    }
+  }
+
+  const availableRunProviders = (): ReadonlySet<RunProvider> => {
+    const registered = new Set(ctx.subagents.list())
+    const available = new Set<RunProvider>()
+    for (const provider of RUN_PROVIDERS) {
+      if (registered.has(providerName(provider))) {
+        available.add(provider)
+      }
+    }
+    return available
+  }
 
   const currentProjects = (): ResolvedProject[] => {
     const merged: ResolvedProject[] = [...configuredProjects]
@@ -300,10 +361,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return {
       generatedAt: new Date().toISOString(),
       mode,
+      profile,
+      fallbackOrder,
       active: ledger.activeCount,
       limits,
       projects: lanes.map(project => ({ ...project, metrics: ledger.project(project.id) })),
-      providers: (['codex', 'antigravity'] as const).map(provider => ({
+      providers: RUN_PROVIDERS.map(provider => ({
         id: provider,
         registryName: providerName(provider),
         available: registered.has(providerName(provider)),
@@ -346,7 +409,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         label: `${project.title}: ${description} (codex)`,
         request: {
           cwd: project.path,
-          prompt: rolePrompt(project, request.role, task),
+          prompt: rolePrompt(project, request.role, task, profile),
           parent: request.parent,
         },
         signal: request.signal,
@@ -377,8 +440,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     readStatus,
     startCodexAndWait,
   )
-  const controller = new ToranjaOrchestrationController(ctx, readStatus, (nextMode) => {
-    mode = nextMode
+  const controller = new ToranjaOrchestrationController(ctx, readStatus, (request) => {
+    mode = request.mode
+    if (request.profile !== undefined) profile = request.profile
+    if (request.fallbackOrder !== undefined && request.fallbackOrder.length > 0) {
+      fallbackOrder = request.fallbackOrder
+    }
     return readStatus()
   })
 
@@ -405,6 +472,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         roles: ROLES,
         providers: PROVIDERS,
         mode,
+        profile,
+        fallbackOrder,
         defaults: Object.fromEntries(ROLES.map(role => [role, defaultProvider(role, mode)])),
         limits,
       }))
@@ -426,11 +495,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   ctx.tools.register(defineTool({
     name: 'delegate_project_task',
-    description: 'Start a managed role-scoped task in one configured Toranja project. Select codex, antigravity, or both; both starts the two providers concurrently in the same project lane. The tool returns immediately and normal subtask updates deliver results.',
+    description: 'Start a managed role-scoped task in one configured Toranja project. Select codex, antigravity, claude-code, openrouter, or both; both starts the two primary providers concurrently in the same project lane. The tool returns immediately and normal subtask updates deliver results.',
     parameters: {
       project: { type: 'string', required: true, description: 'Project lane id from list_project_lanes.' },
       role: { type: 'string', required: true, enum: [...ROLES], description: 'Responsibility and output contract for the delegated agent.' },
-      provider: { type: 'string', enum: [...PROVIDERS], description: 'Provider choice. Omit to use the role default.' },
+      provider: { type: 'string', enum: [...PROVIDERS], description: 'Provider choice. Omit to use the role default with automatic fallback.' },
       description: { type: 'string', required: true, description: 'Short 3-5 word label shown in the subtask UI.' },
       task: { type: 'string', required: true, description: 'Complete self-contained task and acceptance criteria.' },
     },
@@ -443,11 +512,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const parent = exec.agent
       if (parent === undefined) throw new Error('delegate_project_task requires a calling agent')
       const role = args.role
-      const providerChoice = args.provider ?? defaultProvider(role, mode)
+      const available = availableRunProviders()
+      const providerChoice = args.provider ?? (
+        mode === 'team'
+          ? resolveFallbackProvider(defaultProvider(role, mode), available, fallbackOrder)
+          : defaultProvider(role, mode)
+      )
       const selected: readonly RunProvider[] = providerChoice === 'both' ? ['codex', 'antigravity'] : [providerChoice]
       assertProvidersAllowed(mode, selected)
       const { project, description, task } = validateAssignment(args)
-      const prompt = rolePrompt(project, role, task)
+      const prompt = rolePrompt(project, role, task, profile)
       const leases = ledger.reserveBatch(selected.map(provider => ({
         project: project.id,
         provider,

@@ -21,7 +21,13 @@ export async function apply(ctx: Context): Promise<void> {
   if (toranja === undefined) throw new Error('Toranja Remote namespace did not mount')
   const modeKey = 'toranja-harness.agent-mode'
   const storedMode = localStorage.getItem(modeKey)
-  if (storedMode === 'codex' || storedMode === 'antigravity' || storedMode === 'team') {
+  if (
+    storedMode === 'codex'
+    || storedMode === 'antigravity'
+    || storedMode === 'claude-code'
+    || storedMode === 'openrouter'
+    || storedMode === 'team'
+  ) {
     const restored = await toranja.setMode({ mode: storedMode })
     if (!restored.ok) console.warn('Toranja agent mode could not be restored')
   }
