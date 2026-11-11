@@ -50,6 +50,11 @@ export interface ToranjaAgentModeRequest {
   readonly crossReview?: boolean
 }
 
+/** Routing mode an earlier client version kept in browser storage. */
+export interface ToranjaLegacyModeRequest {
+  readonly mode: ToranjaAgentMode
+}
+
 /** Counters and timestamps for a project lane or provider. */
 export interface MetricSnapshot {
   readonly active: number

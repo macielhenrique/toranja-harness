@@ -47,6 +47,7 @@ import {
 import type {
   ToranjaAgentMode,
   ToranjaAgentModeRequest,
+  ToranjaLegacyModeRequest,
   ToranjaExecutionProfile,
   ToranjaOrchestrationStatus,
   ToranjaProviderId,
@@ -203,6 +204,7 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
     ctx: Context,
     private readonly read: () => ToranjaOrchestrationStatus,
     private readonly writeMode: (request: ToranjaAgentModeRequest) => Promise<ToranjaOrchestrationStatus>,
+    private readonly adoptMode: (mode: ToranjaAgentMode) => Promise<ToranjaOrchestrationStatus>,
   ) {
     super(ctx, 'toranjaOrchestrationController', { namespace: 'toranja' })
   }
@@ -225,6 +227,18 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
   @Remote
   setMode(request: ToranjaAgentModeRequest): Promise<ToranjaOrchestrationStatus> {
     return this.writeMode(request)
+  }
+
+  /**
+   * Store the routing mode that an earlier client version kept in browser
+   * storage. It applies only while no mode is stored, so repeating the call or
+   * calling it after the user chose a mode changes nothing.
+   * @param request - Mode read from the earlier client's browser storage.
+   * @returns Orchestration snapshot after the mode was adopted or ignored.
+   */
+  @Remote
+  adoptLegacyMode(request: ToranjaLegacyModeRequest): Promise<ToranjaOrchestrationStatus> {
+    return this.adoptMode(request.mode)
   }
 }
 
@@ -910,12 +924,20 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     await domain.global.set(next)
     return readStatus()
   }
-  const controller = new ToranjaOrchestrationController(ctx, readStatus, (request) => {
-    const result = settingsQueue.then(() => applySettings(request))
+  const enqueueSettings = (change: () => Promise<ToranjaOrchestrationStatus>): Promise<ToranjaOrchestrationStatus> => {
+    const result = settingsQueue.then(change)
     // A rejected change must not block the changes queued after it.
     settingsQueue = result.catch(() => undefined)
     return result
-  })
+  }
+  const controller = new ToranjaOrchestrationController(
+    ctx,
+    readStatus,
+    request => enqueueSettings(() => applySettings(request)),
+    // Checked inside the queue, so a mode the user stores meanwhile wins.
+    legacyMode => enqueueSettings(() =>
+      domain.global.get().mode === undefined ? applySettings({ mode: legacyMode }) : Promise.resolve(readStatus())),
+  )
 
   for (const project of configuredProjects) {
     if (!existsSync(project.path)) {

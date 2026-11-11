@@ -4360,8 +4360,8 @@ export type ToolPresentationMode = 'native' | 'ptc'
 
 ## `@deepseek-ai/dsh-toranja-orchestrator`
 
-- `inject`: `subagents` · `subprocess` · `systemPrompt` · `tools` · `workspaceRegistry`
-- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:112`](../packages/orchestration/toranja-orchestrator/src/index.ts)
+- `inject`: `storageDomain` · `subagents` · `subprocess` · `systemPrompt` · `tools` · `workspaceRegistry`
+- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:116`](../packages/orchestration/toranja-orchestrator/src/index.ts)
 
 ```ts config-catalog
 /** Product-owned orchestration settings. */

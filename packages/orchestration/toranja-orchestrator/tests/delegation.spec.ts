@@ -31,6 +31,7 @@ interface Harness {
   readonly tool: (name: string) => Tool
   readonly status: () => ToranjaOrchestrationStatus
   readonly setMode: (request: Record<string, unknown>) => Promise<ToranjaOrchestrationStatus>
+  readonly adoptLegacyMode: (mode: string) => Promise<ToranjaOrchestrationStatus>
   /** Side effect each simulated agent performs in the project directory. */
   agentSideEffect: (cwd: string) => void
   /** Text every simulated agent answers with. */
@@ -93,6 +94,7 @@ async function mount(
     },
     status: () => ctx.toranjaOrchestrator.status(),
     setMode: () => { throw new Error('controller not mounted') },
+    adoptLegacyMode: () => { throw new Error('controller not mounted') },
     agentSideEffect: () => {},
     answer: 'TORANJA_GATE: PASS\nall criteria inspected',
     hold: undefined,
@@ -173,6 +175,7 @@ async function mount(
     .toranjaOrchestrationController
   return Object.assign(harness, {
     setMode: (request: Record<string, unknown>) => Promise.resolve(controller.setMode(request as never)),
+    adoptLegacyMode: (mode: string) => controller.adoptLegacyMode({ mode: mode as never }),
   })
 }
 
@@ -620,6 +623,20 @@ describe('Toranja routed delegation', () => {
     })
     await harness.setMode({ mode: 'codex', profile: 'qualidade' })
     expect(seen).toEqual([['codex', 'qualidade', 'codex']])
+  })
+
+  it('adopts the mode an earlier version kept in the browser when none is stored yet', async () => {
+    const disk = new MemoryMediaPool()
+    const first = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(await first.adoptLegacyMode('codex')).toMatchObject({ mode: 'codex' })
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(restarted.status()).toMatchObject({ mode: 'codex', profile: 'equilibrado' })
+  })
+
+  it('keeps the stored mode over one an earlier version kept in the browser', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await harness.setMode({ mode: 'antigravity' })
+    expect(await harness.adoptLegacyMode('codex')).toMatchObject({ mode: 'antigravity' })
   })
 
   it('starts from the deployment defaults when nothing was stored', async () => {
