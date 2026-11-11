@@ -31,7 +31,7 @@ export type ReadOnlyEnforcement = 'sandbox' | 'permission-mode' | 'advisory' | '
 export const READ_ONLY_ENFORCEMENT: Readonly<Record<RunProvider, ReadOnlyEnforcement>> = {
   codex: 'sandbox',
   antigravity: 'advisory',
-  'claude-code': 'none',
+  'claude-code': 'permission-mode',
   openrouter: 'none',
 }
 
@@ -133,7 +133,7 @@ export function variantName(baseName: string, route: ToranjaRoleRoute): string {
  * @returns Configuration accepted by the provider plugin's `Config` schema.
  */
 export function variantConfig(
-  provider: 'codex' | 'antigravity',
+  provider: 'codex' | 'antigravity' | 'claude-code',
   base: Readonly<Record<string, unknown>>,
   route: ToranjaRoleRoute,
   providerName: string,
@@ -150,6 +150,9 @@ export function variantConfig(
       config.mode = 'plan'
       config.disableSlashCommands = false
       config.autoApproveTools = false
+      return config
+    case 'claude-code':
+      config.permissionMode = 'plan'
       return config
   }
 }

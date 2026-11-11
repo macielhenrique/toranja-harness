@@ -14,6 +14,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SubagentActivation, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import * as antigravityPlugin from '@deepseek-ai/dsh-subagent-antigravity'
+import * as claudeCodePlugin from '@deepseek-ai/dsh-subagent-claude-code'
 import * as codexPlugin from '@deepseek-ai/dsh-subagent-codex'
 import type {} from '@deepseek-ai/dsh-storage-domain'
 import type {} from '@deepseek-ai/dsh-subprocess'
@@ -34,6 +35,14 @@ import {
   type Role,
   type RunProvider,
 } from './policy.ts'
+import {
+  CLI_PROVIDERS,
+  DEFAULT_EXECUTABLES,
+  STATUS_COMMANDS,
+  commandArgv,
+  findExecutable,
+  type ProviderConnection,
+} from './connection.ts'
 import {
   MODEL_TIERS,
   accessViolation,
@@ -61,6 +70,7 @@ import {
   type ToranjaCodexDelegationResult,
 } from './service.ts'
 
+export * from './connection.ts'
 export * from './policy.ts'
 export * from './routing.ts'
 export * from './service.ts'
@@ -75,7 +85,11 @@ const DEFAULT_MAX_TASK_CHARS = 12_000
 const GIT_GRACE_MS = 3_000
 
 /** Provider plugins Toranja can instantiate per route to fix model, effort, and access. */
-const VARIANT_PLUGINS = { codex: codexPlugin, antigravity: antigravityPlugin } as const
+const VARIANT_PLUGINS = {
+  codex: codexPlugin,
+  antigravity: antigravityPlugin,
+  'claude-code': claudeCodePlugin,
+} as const
 type VariantProvider = keyof typeof VARIANT_PLUGINS
 
 function isVariantProvider(provider: RunProvider): provider is VariantProvider {
@@ -154,6 +168,15 @@ export interface Config {
    * gate evidence so the change returns to planning.
    */
   replanOnGateFailure?: boolean
+  /**
+   * Executable of each CLI provider (`codex`, `antigravity`, `claude-code`),
+   * as a command name searched in `PATH` or an absolute path.
+   */
+  executables?: Record<string, string>
+  /** Probe the provider CLIs once when the plugin starts. */
+  probeOnStart?: boolean
+  /** Time limit of one provider status command, in milliseconds. */
+  probeTimeoutMs?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -190,6 +213,9 @@ export const Config: z<Config> = z.object({
   roleProviders: z.dict(z.union(['codex', 'antigravity', 'claude-code', 'openrouter'] as const)).default({}),
   crossReview: z.boolean().default(true),
   replanOnGateFailure: z.boolean().default(true),
+  executables: z.dict(z.string().min(1)).default({}),
+  probeOnStart: z.boolean().default(false),
+  probeTimeoutMs: z.number().default(20_000),
 })
 
 interface ResolvedProject extends ProjectConfig {
@@ -205,6 +231,7 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
     private readonly read: () => ToranjaOrchestrationStatus,
     private readonly writeMode: (request: ToranjaAgentModeRequest) => Promise<ToranjaOrchestrationStatus>,
     private readonly adoptMode: (mode: ToranjaAgentMode) => Promise<ToranjaOrchestrationStatus>,
+    private readonly probe: () => Promise<ToranjaOrchestrationStatus>,
   ) {
     super(ctx, 'toranjaOrchestrationController', { namespace: 'toranja' })
   }
@@ -227,6 +254,16 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
   @Remote
   setMode(request: ToranjaAgentModeRequest): Promise<ToranjaOrchestrationStatus> {
     return this.writeMode(request)
+  }
+
+  /**
+   * Look for each provider CLI and run its official status command, then
+   * route around providers that are not installed or signed out.
+   * @returns Orchestration snapshot with the refreshed connection states.
+   */
+  @Remote
+  probeProviders(): Promise<ToranjaOrchestrationStatus> {
+    return this.probe()
   }
 
   /**
@@ -406,6 +443,7 @@ interface LiveSettings {
   readonly fallbackOrder: readonly ToranjaProviderId[]
   readonly roleProviders: ReadonlyMap<Role, RunProvider>
   readonly crossReview: boolean
+  readonly teamSize: number
 }
 
 interface ProviderRouting {
@@ -476,13 +514,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     throw new Error('toranja-orchestrator: Codex, Antigravity, Claude Code, and OpenRouter provider names must be distinct')
   }
   const maxTaskChars = positiveInteger('maxTaskChars', config.maxTaskChars ?? DEFAULT_MAX_TASK_CHARS)
-  const limits = {
+  const configuredLimits = {
     maxConcurrentTotal: positiveInteger('maxConcurrentTotal', config.maxConcurrentTotal ?? 4),
     maxConcurrentPerProject: positiveInteger('maxConcurrentPerProject', config.maxConcurrentPerProject ?? 2),
     maxConcurrentPerProvider: positiveInteger('maxConcurrentPerProvider', config.maxConcurrentPerProvider ?? 2),
     allowParallelImplementation: config.allowParallelImplementation ?? false,
   }
-  const ledger = new OrchestrationLedger(limits)
+  // The team size is the number of agents working in one project at once. The
+  // total and per-provider limits never fall below it, so a team the user
+  // sized can actually run, even on a single connected provider.
+  const limitsFor = (teamSize: number): typeof configuredLimits => ({
+    maxConcurrentTotal: Math.max(configuredLimits.maxConcurrentTotal, teamSize),
+    maxConcurrentPerProject: teamSize,
+    maxConcurrentPerProvider: Math.max(configuredLimits.maxConcurrentPerProvider, teamSize),
+    allowParallelImplementation: configuredLimits.allowParallelImplementation,
+  })
+  const ledger = new OrchestrationLedger(() => limitsFor(live().teamSize))
   const domain = await ctx.storageDomain.open(toranjaOrchestrationDomain)
   ctx.effect(() => () => domain.close(), 'toranja-orchestrator.domainClose')
   const defaults = {
@@ -491,6 +538,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     fallbackOrder: config.fallbackOrder ?? RUN_PROVIDERS,
     roleProviders: parseRoleProviders(config),
     crossReview: config.crossReview ?? true,
+    teamSize: configuredLimits.maxConcurrentPerProject,
   } satisfies LiveSettings
   // The stored global is the only source of the live routing: every reader
   // resolves it over the deployment defaults, so a change is visible to
@@ -509,6 +557,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           ? defaults.roleProviders
           : parseRoleProviders({ roleProviders: stored.roleProviders }),
         crossReview: stored.crossReview ?? defaults.crossReview,
+        teamSize: stored.teamSize ?? defaults.teamSize,
       }
     }
     return resolved
@@ -769,11 +818,54 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     })
   }
 
+  const executables: Record<string, string> = { ...DEFAULT_EXECUTABLES, ...config.executables }
+  for (const key of Object.keys(config.executables ?? {})) {
+    if (!CLI_PROVIDERS.some(provider => provider === key)) {
+      throw new Error(`toranja-orchestrator: executables names unknown CLI provider ${JSON.stringify(key)}`)
+    }
+  }
+  const probeTimeoutMs = positiveInteger('probeTimeoutMs', config.probeTimeoutMs ?? 20_000)
+  const connections = new Map<RunProvider, ProviderConnection>()
+  const connectionOf = (provider: RunProvider): ProviderConnection =>
+    connections.get(provider) ?? { connection: 'unknown' }
+  /** A provider is usable unless a probe found its CLI missing or signed out. */
+  const usable = (provider: RunProvider): boolean => {
+    const { connection } = connectionOf(provider)
+    return connection === 'connected' || connection === 'unknown'
+  }
+  const probeProvider = async (provider: typeof CLI_PROVIDERS[number]): Promise<ProviderConnection> => {
+    const executable = findExecutable(executables[provider] ?? DEFAULT_EXECUTABLES[provider])
+    if (executable === undefined) return { connection: 'not-installed' }
+    const command = STATUS_COMMANDS[provider]
+    try {
+      const child = ctx.subprocess.spawn({
+        argv: commandArgv(executable, command.args),
+        cwd: process.cwd(),
+        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+        graceMs: GIT_GRACE_MS,
+        signal: AbortSignal.timeout(probeTimeoutMs),
+      })
+      child.stderr?.resume()
+      const chunks: Buffer[] = []
+      for await (const chunk of child.stdout as NonNullable<typeof child.stdout>) chunks.push(chunk as Buffer)
+      const outcome = await child.done
+      const connected = command.connected(outcome.exitCode, Buffer.concat(chunks).toString('utf8'))
+      return { connection: connected ? 'connected' : 'signed-out', executable }
+    } catch (error: unknown) {
+      ctx.logger.warn(`toranja-orchestrator: ${provider} status command failed: ${String(error)}`)
+      return { connection: 'unknown', executable }
+    }
+  }
+  const probeProviders = async (): Promise<void> => {
+    const probed = await Promise.all(CLI_PROVIDERS.map(async provider => [provider, await probeProvider(provider)] as const))
+    for (const [provider, connection] of probed) connections.set(provider, connection)
+  }
+
   const availableRunProviders = (): ReadonlySet<RunProvider> => {
     const registered = new Set(ctx.subagents.list())
     const available = new Set<RunProvider>()
     for (const provider of RUN_PROVIDERS) {
-      if (registered.has(providerName(provider))) {
+      if (registered.has(providerName(provider)) && usable(provider)) {
         available.add(provider)
       }
     }
@@ -827,13 +919,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       fallbackOrder: live().fallbackOrder,
       roleProviders: Object.fromEntries(live().roleProviders),
       crossReview: live().crossReview,
+      teamSize: live().teamSize,
       active: ledger.activeCount,
-      limits,
+      limits: limitsFor(live().teamSize),
       projects: lanes.map(project => ({ ...project, metrics: ledger.project(project.id) })),
       providers: RUN_PROVIDERS.map(provider => ({
         id: provider,
         registryName: providerName(provider),
-        available: registered.has(providerName(provider)),
+        available: registered.has(providerName(provider)) && usable(provider),
+        ...connectionOf(provider),
         metrics: ledger.provider(provider),
       })),
       routes: ROLES.map(role => routeFor(role, providerFor(role))),
@@ -917,6 +1011,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         : { fallbackOrder: [...request.fallbackOrder] },
       ...request.roleProviders === undefined ? {} : { roleProviders: { ...request.roleProviders } },
       ...request.crossReview === undefined ? {} : { crossReview: request.crossReview },
+      ...request.teamSize === undefined ? {} : { teamSize: positiveInteger('teamSize', request.teamSize) },
     }
     // Validate before storing. The live routing derives from the stored
     // value, so a failed write leaves the routing in force untouched.
@@ -937,7 +1032,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // Checked inside the queue, so a mode the user stores meanwhile wins.
     legacyMode => enqueueSettings(() =>
       domain.global.get().mode === undefined ? applySettings({ mode: legacyMode }) : Promise.resolve(readStatus())),
+    async () => {
+      await probeProviders()
+      return readStatus()
+    },
   )
+  if (config.probeOnStart === true) {
+    // Not awaited: slow CLIs must not delay startup; routing treats an
+    // unprobed provider as usable until the probe settles.
+    void probeProviders()
+  }
 
   for (const project of configuredProjects) {
     if (!existsSync(project.path)) {
@@ -966,7 +1070,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         fallbackOrder: live().fallbackOrder,
         defaults: Object.fromEntries(ROLES.map(role => [role, providerFor(role)])),
         routes: ROLES.map(role => routeFor(role, providerFor(role))),
-        limits,
+        teamSize: live().teamSize,
+        limits: limitsFor(live().teamSize),
       }))
     },
   }))
@@ -986,7 +1091,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   ctx.tools.register(defineTool({
     name: 'delegate_project_task',
-    description: 'Start a managed role-scoped task in one configured Toranja project. Select codex, antigravity, claude-code, openrouter, or both; both starts the two primary providers concurrently in the same project lane. The tool returns immediately and normal subtask updates deliver results.',
+    description: 'Start a managed role-scoped task in one configured Toranja project. Select codex, antigravity, claude-code, openrouter, both, or all; both starts the first two connected providers and all starts every connected provider up to the team size, concurrently in the same project lane. Fan out only when independent answers materially improve confidence, because each provider spends its own credits. The tool returns immediately and normal subtask updates deliver results.',
     parameters: {
       project: { type: 'string', required: true, description: 'Project lane id from list_project_lanes.' },
       role: { type: 'string', required: true, enum: [...ROLES], description: 'Responsibility and output contract for the delegated agent.' },
@@ -1004,7 +1109,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (parent === undefined) throw new Error('delegate_project_task requires a calling agent')
       const role = args.role
       const providerChoice = args.provider ?? providerFor(role)
-      const selected: readonly RunProvider[] = providerChoice === 'both' ? ['codex', 'antigravity'] : [providerChoice]
+      // `both` and `all` fan the task out over connected providers in fallback
+      // order: two for `both`, and as many as the team size allows for `all`.
+      const connected = live().fallbackOrder.filter(provider => availableRunProviders().has(provider))
+      const selected: readonly RunProvider[] = providerChoice === 'both'
+        ? connected.slice(0, 2)
+        : providerChoice === 'all'
+          ? connected.slice(0, live().teamSize)
+          : [providerChoice]
+      if (selected.length === 0) throw new Error('delegate_project_task: no connected provider is available')
       assertProvidersAllowed(live().mode, selected)
       const { project, description, task } = validateAssignment(args)
       const leases = ledger.reserveBatch(selected.map(provider => reservation(project, routeFor(role, provider), description)))

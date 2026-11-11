@@ -41,6 +41,7 @@ The layer inserts Host rows only, so any profile can select it, including the sh
 |---|---|---|
 | `providerName` | `claude-code` | Non-empty registry name on `ctx.subagents`; each mounted instance needs a unique value |
 | `model` | native Claude settings | Optional non-empty model name fixed for every run from this provider instance; omission sends no SDK override |
+| `effort` | native Claude settings | Optional reasoning effort (`low`, `medium`, `high`, `xhigh`, `max`) fixed for every query from this provider instance; omission sends no override |
 | `env` | `{}` | Explicit SDK/CLI environment layered over the credential-scrubbed parent environment |
 | `permissionMode` | `dontAsk` | Native non-interactive permission policy fixed for every run from this provider instance |
 | `disposeGraceMs` | `3000` | Grace between the shared managed-range owner's termination tiers |

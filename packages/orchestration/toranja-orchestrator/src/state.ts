@@ -26,6 +26,7 @@ export const toranjaOrchestrationState = z.object({
   fallbackOrder: z.array(provider).min(1).optional(),
   roleProviders: z.partialRecord(role, provider).optional(),
   crossReview: z.boolean().optional(),
+  teamSize: z.number().int().positive().optional(),
 })
 
 /** Stored orchestration state inferred from {@link toranjaOrchestrationState}. */

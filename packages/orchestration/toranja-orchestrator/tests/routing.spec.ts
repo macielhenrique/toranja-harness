@@ -71,6 +71,9 @@ describe('Toranja routing policy', () => {
     expect(variantConfig('antigravity', { autoApproveTools: true, mode: 'accept-edits' }, { ...reader, provider: 'antigravity' }, 'x')).toEqual({
       providerName: 'x', model: 'luna', effort: 'low', mode: 'plan', disableSlashCommands: false, autoApproveTools: false,
     })
+    expect(variantConfig('claude-code', { permissionMode: 'acceptEdits', env: { A: 'b' } }, { ...reader, provider: 'claude-code' }, 'z')).toEqual({
+      env: { A: 'b' }, providerName: 'z', model: 'luna', effort: 'low', permissionMode: 'plan',
+    })
     const implementer = resolveRoute('implementer', 'equilibrado', 'antigravity', {})
     expect(variantName('antigravity', implementer)).toBe('antigravity~rw~native~native')
     expect(variantConfig('antigravity', { autoApproveTools: true, mode: 'accept-edits' }, implementer, 'y')).toEqual({

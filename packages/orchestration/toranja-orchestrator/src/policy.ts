@@ -24,8 +24,11 @@ export const ROLES = [
 ] as const
 /** Read-only Phase A investigation roles that run on lightweight models. */
 export const INVESTIGATION_ROLES = ['reader', 'searcher', 'inspector'] as const
-/** Supported provider selection values, including dual-provider execution. */
-export const PROVIDERS = ['codex', 'antigravity', 'claude-code', 'openrouter', 'both'] as const
+/**
+ * Supported provider selection values. `both` runs the task on the first two
+ * connected providers and `all` on every connected provider up to the team size.
+ */
+export const PROVIDERS = ['codex', 'antigravity', 'claude-code', 'openrouter', 'both', 'all'] as const
 /** Concrete runtime providers that execute tasks. */
 export const RUN_PROVIDERS = ['codex', 'antigravity', 'claude-code', 'openrouter'] as const
 /** Supported dynamic execution profiles. */
@@ -44,7 +47,7 @@ export type RunProvider = typeof RUN_PROVIDERS[number]
  * @param mode - Active Toranja agent mode.
  * @returns Concrete provider selected for the task.
  */
-export function defaultProvider(role: Role, mode: ToranjaAgentMode = 'team'): Exclude<ProviderChoice, 'both'> {
+export function defaultProvider(role: Role, mode: ToranjaAgentMode = 'team'): RunProvider {
   if (mode !== 'team') return mode
   return role === 'reader'
     || role === 'searcher'
@@ -195,11 +198,20 @@ export class OrchestrationLedger {
   private readonly taskHistory: MutableTask[] = []
   private taskSequence = 0
 
+  private readonly readLimits: () => OrchestrationLimits
+
   /**
    * Create a ledger enforcing the given concurrency limits.
-   * @param limits - Concurrency and write-isolation limits.
+   * @param limits - Concurrency and write-isolation limits, or a function
+   * returning the limits in force so they can change while the ledger lives.
    */
-  constructor(private readonly limits: OrchestrationLimits) {}
+  constructor(limits: OrchestrationLimits | (() => OrchestrationLimits)) {
+    this.readLimits = typeof limits === 'function' ? limits : () => limits
+  }
+
+  private get limits(): OrchestrationLimits {
+    return this.readLimits()
+  }
 
   /**
    * Atomically reserve capacity for one or more delegated tasks.

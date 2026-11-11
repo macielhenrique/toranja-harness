@@ -139,6 +139,9 @@
         # Default until the user changes it; the orchestrator then stores the
         # choice in its storage domain and restores it on restart.
         defaultMode: team
+        # Check once at startup which provider CLIs are installed and signed
+        # in, so routing skips the ones the user has not connected.
+        probeOnStart: true
         # Each delegation runs on a Toranja-owned provider instance that fixes
         # the model, reasoning effort, and filesystem access of its role.
         # Read-only roles use the Codex read-only sandbox and Antigravity plan
@@ -163,6 +166,15 @@
               light: { model: gemini-3.8-flash-low }
               advanced: { model: gemini-4-argon-medium }
               max: { model: gemini-4-argon-high }
+          claude-code:
+            # `auto` lets write and execute roles work unattended under Claude
+            # Code's own classifier; read-only roles run in `plan` mode.
+            base:
+              permissionMode: auto
+            models:
+              light: { model: haiku, effort: low }
+              advanced: { model: sonnet, effort: medium }
+              max: { model: opus, effort: high }
 
     - id: subagent-antigravity
       name: '@deepseek-ai/dsh-subagent-antigravity'
@@ -181,6 +193,13 @@
         provider: antigravity
         toolName: delegate_antigravity
         maxDepth: provider-managed
+
+    # Claude Code uses the login of the installed `claude` CLI. Toranja routes
+    # roles to it only when the user selects it or another provider fails.
+    - id: subagent-claude-code
+      name: '@deepseek-ai/dsh-subagent-claude-code'
+      config:
+        permissionMode: auto
 
     - id: subagent-codex
       name: '@deepseek-ai/dsh-subagent-codex'

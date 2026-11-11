@@ -54,6 +54,7 @@
   "dependencies": {
     "@deepseek-ai/dsh-llm": "workspace:*",
     "@deepseek-ai/dsh-subagent-antigravity": "workspace:*",
+    "@deepseek-ai/dsh-subagent-claude-code": "workspace:*",
     "@deepseek-ai/dsh-subagent-codex": "workspace:*",
     "@deepseek-ai/dsh-typert-protocol": "workspace:*",
     "@deepseek-ai/schemastery": "workspace:~",

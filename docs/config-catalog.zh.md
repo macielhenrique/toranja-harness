@@ -3491,7 +3491,7 @@ type AntigravityEffort = typeof EFFORTS[number]
 ## `@deepseek-ai/dsh-subagent-claude-code`
 
 - `inject`: `subagents` · `subprocess`
-- `source`: [`packages/subagent/subagent-claude-code/src/index.ts:38`](../packages/subagent/subagent-claude-code/src/index.ts)
+- `source`: [`packages/subagent/subagent-claude-code/src/index.ts:40`](../packages/subagent/subagent-claude-code/src/index.ts)
 
 ```ts config-catalog
 /** Deployment-owned model, permission, environment, and process-release settings. */
@@ -3500,6 +3500,8 @@ export interface Config {
   providerName?: string
   /** Native Claude model fixed for this instance; omitted to inherit Claude settings. */
   model?: string
+  /** Reasoning effort fixed for this instance; omitted to inherit Claude settings. */
+  effort?: ClaudeCodeEffort
   /**
    * Explicit environment entries layered over the subprocess seam's
    * credential-scrubbed parent environment.
@@ -3515,6 +3517,9 @@ export interface Config {
   /** Grace in milliseconds between Claude Code managed-range termination tiers. */
   disposeGraceMs?: number
 }
+
+/** Profile-selectable Claude Code reasoning effort. */
+export type ClaudeCodeEffort = typeof CLAUDE_CODE_EFFORTS[number]
 
 /** Profile-selectable non-interactive Claude Code permission mode. */
 export type ClaudeCodePermissionMode = typeof CLAUDE_CODE_PERMISSION_MODES[number]
@@ -4361,7 +4366,7 @@ export type ToolPresentationMode = 'native' | 'ptc'
 ## `@deepseek-ai/dsh-toranja-orchestrator`
 
 - `inject`: `storageDomain` · `subagents` · `subprocess` · `systemPrompt` · `tools` · `workspaceRegistry`
-- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:116`](../packages/orchestration/toranja-orchestrator/src/index.ts)
+- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:130`](../packages/orchestration/toranja-orchestrator/src/index.ts)
 
 ```ts config-catalog
 /** Product-owned orchestration settings. */
@@ -4406,6 +4411,15 @@ export interface Config {
    * gate evidence so the change returns to planning.
    */
   replanOnGateFailure?: boolean
+  /**
+   * Executable of each CLI provider (`codex`, `antigravity`, `claude-code`),
+   * as a command name searched in `PATH` or an absolute path.
+   */
+  executables?: Record<string, string>
+  /** Probe the provider CLIs once when the plugin starts. */
+  probeOnStart?: boolean
+  /** Time limit of one provider status command, in milliseconds. */
+  probeTimeoutMs?: number
 }
 
 /** One stable product lane backed by a local project directory. */

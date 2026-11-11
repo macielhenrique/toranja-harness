@@ -2718,6 +2718,9 @@ importers:
       '@deepseek-ai/dsh-subagent-antigravity':
         specifier: workspace:*
         version: link:../../subagent/subagent-antigravity
+      '@deepseek-ai/dsh-subagent-claude-code':
+        specifier: workspace:*
+        version: link:../../subagent/subagent-claude-code
       '@deepseek-ai/dsh-subagent-codex':
         specifier: workspace:*
         version: link:../../subagent/subagent-codex
@@ -11657,6 +11660,9 @@ importers:
       '@deepseek-ai/dsh-subagent-antigravity':
         specifier: workspace:*
         version: link:../../subagent/subagent-antigravity
+      '@deepseek-ai/dsh-subagent-claude-code':
+        specifier: workspace:*
+        version: link:../../subagent/subagent-claude-code
       '@deepseek-ai/dsh-subagent-codex':
         specifier: workspace:*
         version: link:../../subagent/subagent-codex

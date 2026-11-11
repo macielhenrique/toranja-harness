@@ -25,6 +25,8 @@ interface Harness {
   readonly ctx: Context
   readonly repo: string
   readonly agyRuns: string[][]
+  /** Status commands sent to the simulated provider CLIs. */
+  readonly cliRuns: string[][]
   readonly started: string[]
   /** Prompt text of every started run, in start order. */
   readonly prompts: string[]
@@ -42,6 +44,9 @@ interface Harness {
   readonly offline: Map<string, string>
   /** Providers whose run settles as failed, with the diagnostic they report. */
   readonly failing: Map<string, string>
+  /** Answers of the simulated provider CLIs to status commands, keyed by executable path. */
+  readonly cli: Map<string, { exitCode: number; stdout: string }>
+  readonly probe: () => Promise<ToranjaOrchestrationStatus>
 }
 
 const repos: string[] = []
@@ -85,6 +90,7 @@ async function mount(
     ctx,
     repo,
     agyRuns: [],
+    cliRuns: [],
     started: [],
     prompts: [],
     tool: (name) => {
@@ -100,6 +106,8 @@ async function mount(
     hold: undefined,
     offline: new Map(),
     failing: new Map(),
+    cli: new Map(),
+    probe: () => { throw new Error('controller not mounted') },
   }
   ctx.provide('subprocess', {
     spawn: (spec: { argv: readonly string[]; cwd: string }) => {
@@ -109,6 +117,16 @@ async function mount(
           child.on('close', (exitCode) => { resolve({ exitCode }) })
         })
         return { stdout: child.stdout, stderr: child.stderr, done, terminate: () => {}, waitForExit: () => done }
+      }
+      const scripted = harness.cli.get(spec.argv[0] ?? '')
+      if (scripted !== undefined && !spec.argv.includes('-p')) {
+        harness.cliRuns.push([...spec.argv])
+        const stdout = new PassThrough()
+        const stderr = new PassThrough()
+        stdout.end(scripted.stdout)
+        stderr.end()
+        const done = Promise.resolve({ exitCode: scripted.exitCode })
+        return { stdout, stderr, done, terminate: () => {}, waitForExit: () => done }
       }
       harness.agyRuns.push([...spec.argv])
       harness.agentSideEffect(spec.cwd)
@@ -176,7 +194,20 @@ async function mount(
   return Object.assign(harness, {
     setMode: (request: Record<string, unknown>) => Promise.resolve(controller.setMode(request as never)),
     adoptLegacyMode: (mode: string) => controller.adoptLegacyMode({ mode: mode as never }),
+    probe: () => controller.probeProviders(),
   })
+}
+
+/** Create empty files standing in for installed provider CLIs and return their absolute paths. */
+function installed<Name extends string>(...names: Name[]): Record<Name, string> {
+  const bin = mkdtempSync(join(tmpdir(), 'toranja-bin-'))
+  repos.push(bin)
+  const paths = {} as Record<Name, string>
+  for (const name of names) {
+    paths[name] = join(bin, name)
+    writeFileSync(paths[name], '')
+  }
+  return paths
 }
 
 const ROUTING = {
@@ -654,6 +685,105 @@ describe('Toranja routed delegation', () => {
       .rejects.toThrow('no project agent started: antigravity: agy is not installed')
   })
 
+  it('routes a role to Claude Code in plan mode on the configured model and effort', async () => {
+    const harness = await mount({
+      routing: {
+        ...ROUTING,
+        'claude-code': {
+          base: { permissionMode: 'acceptEdits' },
+          models: { light: { model: 'haiku', effort: 'low' }, advanced: { model: 'sonnet', effort: 'medium' } },
+        },
+      },
+      roleProviders: { reader: 'claude-code', implementer: 'claude-code' },
+    }, ['codex', 'antigravity', 'claude-code'])
+    const reader = await delegate(harness, { role: 'reader' })
+    expect(reader.activations).toEqual([expect.objectContaining({
+      provider: 'claude-code',
+      providerName: 'claude-code~ro~haiku~low',
+      access: 'read-only',
+      model: 'haiku',
+      effort: 'low',
+    })])
+    await settled(harness)
+    await delegate(harness, { role: 'implementer' })
+    expect(harness.started.at(-1)).toBe('claude-code~rw~sonnet~medium')
+  })
+
+  it('reports which provider CLIs are installed and signed in', async () => {
+    const bin = installed('codex', 'claude')
+    const harness = await mount({
+      routing: ROUTING,
+      executables: { codex: bin.codex, 'claude-code': bin.claude, antigravity: join(tmpdir(), 'no-such-agy') },
+    }, ['codex', 'antigravity', 'claude-code'])
+    harness.cli.set(bin.codex, { exitCode: 0, stdout: 'Logged in using ChatGPT' })
+    harness.cli.set(bin.claude, { exitCode: 0, stdout: JSON.stringify({ loggedIn: false }) })
+    const status = await harness.probe()
+    expect(Object.fromEntries(status.providers.map(provider => [provider.id, provider.connection]))).toEqual({
+      codex: 'connected',
+      antigravity: 'not-installed',
+      'claude-code': 'signed-out',
+      openrouter: 'unknown',
+    })
+    expect(harness.cliRuns).toEqual(expect.arrayContaining([
+      [bin.codex, 'login', 'status'],
+      [bin.claude, 'auth', 'status'],
+    ]))
+  })
+
+  it('routes around providers that are not installed or signed out', async () => {
+    const bin = installed('codex', 'claude')
+    const harness = await mount({
+      routing: ROUTING,
+      executables: { codex: bin.codex, 'claude-code': bin.claude, antigravity: join(tmpdir(), 'no-such-agy') },
+    }, ['codex', 'antigravity', 'claude-code'])
+    harness.cli.set(bin.codex, { exitCode: 0, stdout: 'Logged in using ChatGPT' })
+    harness.cli.set(bin.claude, { exitCode: 1, stdout: '' })
+    expect(harness.status().routes.find(route => route.role === 'reader')?.provider).toBe('antigravity')
+    await harness.probe()
+    expect(harness.status().routes.map(route => route.provider)).toEqual(Array.from({ length: 9 }, () => 'codex'))
+    const result = await delegate(harness, { role: 'reader' })
+    expect(result.activations).toEqual([expect.objectContaining({ provider: 'codex' })])
+    expect(result.activations).toEqual([expect.not.objectContaining({ fallbackFrom: expect.anything() })])
+  })
+
+  it('lets the user set how many agents work at once, and keeps it after a restart', async () => {
+    const disk = new MemoryMediaPool()
+    const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity', 'claude-code'], disk)
+    expect(harness.status().teamSize).toBe(2)
+    await harness.setMode({ mode: 'team', teamSize: 3 })
+    expect(harness.status()).toMatchObject({ teamSize: 3, limits: { maxConcurrentPerProject: 3 } })
+
+    const release = Promise.withResolvers<undefined>()
+    harness.hold = release.promise
+    await delegate(harness, { role: 'reader', provider: 'codex' })
+    await delegate(harness, { role: 'searcher', provider: 'codex' })
+    await delegate(harness, { role: 'inspector', provider: 'codex' })
+    expect(harness.status().active).toBe(3)
+    await expect(delegate(harness, { role: 'reader', provider: 'codex' })).rejects.toThrow('limit reached')
+    release.resolve(undefined)
+
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity', 'claude-code'], disk)
+    expect(restarted.status().teamSize).toBe(3)
+  })
+
+  it('rejects a team size that is not a positive whole number', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await expect(harness.setMode({ mode: 'team', teamSize: 0 })).rejects.toThrow('teamSize must be a positive safe integer')
+    await expect(harness.setMode({ mode: 'team', teamSize: 2.5 })).rejects.toThrow('teamSize must be a positive safe integer')
+    expect(harness.status().teamSize).toBe(2)
+  })
+
+  it('starts one agent on every connected provider, up to the team size', async () => {
+    const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity', 'claude-code'])
+    await harness.setMode({ mode: 'team', teamSize: 3 })
+    const all = await delegate(harness, { role: 'reviewer', provider: 'all' })
+    expect((all.activations as { provider: string }[]).map(run => run.provider)).toEqual(['codex', 'antigravity', 'claude-code'])
+    await settled(harness)
+    await harness.setMode({ mode: 'team', teamSize: 2 })
+    const two = await delegate(harness, { role: 'reviewer', provider: 'all' })
+    expect((two.activations as { provider: string }[]).map(run => run.provider)).toEqual(['codex', 'antigravity'])
+  })
+
   it('delegates through the unrouted instance when Toranja owns none', async () => {
     const harness = await mount({})
     const result = await delegate(harness, { role: 'reader', provider: 'codex' })
@@ -664,7 +794,7 @@ describe('Toranja routed delegation', () => {
   it('rejects routing that names unknown providers, tiers, roles, or invalid provider settings', async () => {
     await expect(mount({ routing: { gemini: {} } })).rejects.toThrow('routing names unknown provider "gemini"')
     await expect(mount({ routing: { codex: { models: { turbo: { model: 'x' } } } } })).rejects.toThrow('unknown tier "turbo"')
-    await expect(mount({ routing: { 'claude-code': { base: {} } } })).rejects.toThrow('routing.claude-code.base is not supported')
+    await expect(mount({ routing: { openrouter: { base: {} } } })).rejects.toThrow('routing.openrouter.base is not supported')
     await expect(mount({ routing: { codex: { models: { light: { model: 'gpt-light' } } } } }))
       .rejects.toThrow('routing.codex.models requires routing.codex.base')
     await expect(mount({ roleProviders: { janitor: 'codex' } })).rejects.toThrow('unknown role "janitor"')

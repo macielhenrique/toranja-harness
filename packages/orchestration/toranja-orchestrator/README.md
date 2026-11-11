@@ -19,13 +19,31 @@ delegations that omit an explicit provider:
 ## Stored choices
 
 The controller's `setMode` changes the mode, execution profile, fallback order,
-provider per role, and cross-review setting. It stores the fields the request
+provider per role, cross-review setting, and team size. It stores the fields the request
 names in the `toranja_orchestration` storage domain and changes the live routing
 only after that write succeeds; a failed write rejects and leaves the routing in
 force. On restart each stored field replaces the matching `Config` default; a
 field the user never changed is not stored and keeps following the
 configuration. Model routing (`routing`) and concurrency
 limits stay configuration-only.
+
+## Connected providers and team size
+
+`probeProviders` on the controller looks for each provider CLI (`executables`,
+by default `codex`, `agy`, and `claude` in `PATH`) and runs its official status
+command: `codex login status`, `claude auth status`, and `agy models`, which
+succeeds only for a signed-in account. Each provider then reports `connected`,
+`signed-out`, `not-installed`, or `unknown` under `providers[].connection`.
+Routing skips a provider that is signed out or not installed and keeps one that
+is `unknown`, which is every provider before the first probe and OpenRouter
+always. `probeOnStart` runs one probe when the plugin starts.
+
+The team size is how many agents may work in one project at the same time. It
+defaults to `maxConcurrentPerProject`, the user changes it with `teamSize` on
+`setMode`, and it is stored like the other choices. The total and per-provider
+limits never fall below it. In `delegate_project_task`, provider `both` runs a
+task on the first two connected providers in `fallbackOrder` and `all` on every
+connected provider up to the team size.
 
 ## Routing by role
 
@@ -46,12 +64,13 @@ own default. `routing.<provider>.base` is the configuration of that provider's
 plugin. With a `base`, Toranja starts its own provider instance per distinct
 route and applies the route to it; without one, delegations use the
 deployment's unrouted instance and no model is applied, so `models` without
-`base` is rejected at load. `base` is supported for `codex` and `antigravity`.
+`base` is rejected at load. `base` is supported for `codex`, `antigravity`, and `claude-code`.
 
 | Provider | `read-only` enforcement |
 |---|---|
 | `codex` | Native `read-only` sandbox: writes are denied outside the model. |
 | `antigravity` | `plan` mode without tool auto-approval. The CLI applies it as a directive to the model, so it is advisory. |
+| `claude-code` | Native `plan` permission mode: Claude Code refuses edits and file creation. |
 
 For `read-only` and `execute` roles Toranja also fingerprints the Git working
 tree before and after the run: the diff against `HEAD`, plus the path, size, and

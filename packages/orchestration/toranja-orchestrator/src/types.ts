@@ -48,6 +48,8 @@ export interface ToranjaAgentModeRequest {
   readonly roleProviders?: ToranjaRoleProviders
   /** Whether the delivery-gate reviewer avoids the implementing provider. */
   readonly crossReview?: boolean
+  /** How many agents may work in one project at the same time. */
+  readonly teamSize?: number
 }
 
 /** Routing mode an earlier client version kept in browser storage. */
@@ -65,11 +67,23 @@ export interface MetricSnapshot {
   readonly lastError?: string
 }
 
+/**
+ * Sign-in state of a provider: `connected` and `signed-out` come from its
+ * official status command, `not-installed` means its CLI was not found, and
+ * `unknown` means it was not probed or has no local state to read.
+ */
+export type ToranjaProviderConnection = 'connected' | 'signed-out' | 'not-installed' | 'unknown'
+
 /** Runtime status and counters for one agent provider. */
 export interface ToranjaProviderStatus {
   readonly id: ToranjaProviderId
   readonly registryName: string
+  /** Registered and not known to be missing or signed out. */
   readonly available: boolean
+  /** Sign-in state from the last probe. */
+  readonly connection: ToranjaProviderConnection
+  /** Executable the sign-in state was read from, when one is installed. */
+  readonly executable?: string
   readonly metrics: MetricSnapshot
 }
 
@@ -113,6 +127,8 @@ export interface ToranjaOrchestrationStatus {
   readonly roleProviders: ToranjaRoleProviders
   /** Whether the delivery-gate reviewer avoids the implementing provider. */
   readonly crossReview: boolean
+  /** How many agents may work in one project at the same time. */
+  readonly teamSize: number
   readonly active: number
   readonly limits: {
     readonly maxConcurrentTotal: number

@@ -33,6 +33,9 @@
       "path": "../../subagent/subagent-antigravity"
     },
     {
+      "path": "../../subagent/subagent-claude-code"
+    },
+    {
       "path": "../../subagent/subagent-codex"
     },
     {
