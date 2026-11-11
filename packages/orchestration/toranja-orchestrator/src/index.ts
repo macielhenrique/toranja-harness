@@ -15,6 +15,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SubagentActivation, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import * as antigravityPlugin from '@deepseek-ai/dsh-subagent-antigravity'
 import * as codexPlugin from '@deepseek-ai/dsh-subagent-codex'
+import type {} from '@deepseek-ai/dsh-storage-domain'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
@@ -52,6 +53,7 @@ import type {
   ToranjaRoleAccess,
   ToranjaRoleRoute,
 } from './types.ts'
+import { toranjaOrchestrationDomain } from './state.ts'
 import {
   ToranjaOrchestrator,
   type ToranjaCodexDelegationRequest,
@@ -61,10 +63,11 @@ import {
 export * from './policy.ts'
 export * from './routing.ts'
 export * from './service.ts'
+export * from './state.ts'
 export * from './types.ts'
 
 export const name = 'toranja-orchestrator'
-export const inject = ['subagents', 'subprocess', 'systemPrompt', 'tools', 'workspaceRegistry']
+export const inject = ['storageDomain', 'subagents', 'subprocess', 'systemPrompt', 'tools', 'workspaceRegistry']
 
 const PROJECT_ID = /^[a-z][a-z0-9-]{1,31}$/
 const DEFAULT_MAX_TASK_CHARS = 12_000
@@ -199,7 +202,7 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
   constructor(
     ctx: Context,
     private readonly read: () => ToranjaOrchestrationStatus,
-    private readonly writeMode: (request: ToranjaAgentModeRequest) => ToranjaOrchestrationStatus,
+    private readonly writeMode: (request: ToranjaAgentModeRequest) => Promise<ToranjaOrchestrationStatus>,
   ) {
     super(ctx, 'toranjaOrchestrationController', { namespace: 'toranja' })
   }
@@ -214,12 +217,13 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
   }
 
   /**
-   * Change the provider routing, execution profile, or fallback order used by delegations.
-   * @param request - Target routing mode and optional profile/fallback settings.
-   * @returns Updated orchestration snapshot.
+   * Change the routing mode, execution profile, fallback order, provider per
+   * role, or cross-review setting, and store the result durably.
+   * @param request - Target routing mode and the optional settings to replace.
+   * @returns Updated orchestration snapshot, after the change is durable.
    */
   @Remote
-  setMode(request: ToranjaAgentModeRequest): ToranjaOrchestrationStatus {
+  setMode(request: ToranjaAgentModeRequest): Promise<ToranjaOrchestrationStatus> {
     return this.writeMode(request)
   }
 }
@@ -456,11 +460,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     allowParallelImplementation: config.allowParallelImplementation ?? false,
   }
   const ledger = new OrchestrationLedger(limits)
-  const crossReview = config.crossReview ?? true
+  const domain = await ctx.storageDomain.open(toranjaOrchestrationDomain)
+  ctx.effect(() => () => domain.close(), 'toranja-orchestrator.domainClose')
+  // Stored choices win over deployment defaults field by field.
+  const stored = domain.global.get()
+  let crossReview = stored.crossReview ?? config.crossReview ?? true
   const replanOnGateFailure = config.replanOnGateFailure ?? true
-  let mode: ToranjaAgentMode = config.defaultMode ?? 'team'
-  let profile: ToranjaExecutionProfile = config.defaultProfile ?? 'equilibrado'
-  let fallbackOrder: readonly ToranjaProviderId[] = config.fallbackOrder ?? RUN_PROVIDERS
+  let mode: ToranjaAgentMode = stored.mode ?? config.defaultMode ?? 'team'
+  let profile: ToranjaExecutionProfile = stored.profile ?? config.defaultProfile ?? 'equilibrado'
+  let fallbackOrder: readonly ToranjaProviderId[] = stored.fallbackOrder ?? config.fallbackOrder ?? RUN_PROVIDERS
   const providerName = (provider: RunProvider): string => {
     switch (provider) {
       case 'codex':
@@ -475,7 +483,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
 
   const routing = parseRouting(config)
-  const roleProviders = parseRoleProviders(config)
+  let roleProviders = stored.roleProviders === undefined
+    ? parseRoleProviders(config)
+    : parseRoleProviders({ roleProviders: stored.roleProviders })
   const routeFor = (role: Role, provider: RunProvider): ToranjaRoleRoute => {
     const entry = routing.get(provider)
     return resolveRoute(role, profile, provider, entry?.base === undefined ? {} : entry.models)
@@ -772,6 +782,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       mode,
       profile,
       fallbackOrder,
+      roleProviders: Object.fromEntries(roleProviders),
+      crossReview,
       active: ledger.activeCount,
       limits,
       projects: lanes.map(project => ({ ...project, metrics: ledger.project(project.id) })),
@@ -846,12 +858,21 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     readStatus,
     startCodexAndWait,
   )
-  const controller = new ToranjaOrchestrationController(ctx, readStatus, (request) => {
+  const controller = new ToranjaOrchestrationController(ctx, readStatus, async (request) => {
     mode = request.mode
     if (request.profile !== undefined) profile = request.profile
     if (request.fallbackOrder !== undefined && request.fallbackOrder.length > 0) {
       fallbackOrder = request.fallbackOrder
     }
+    if (request.roleProviders !== undefined) roleProviders = parseRoleProviders({ roleProviders: { ...request.roleProviders } })
+    if (request.crossReview !== undefined) crossReview = request.crossReview
+    await domain.global.set({
+      mode,
+      profile,
+      fallbackOrder: [...fallbackOrder],
+      roleProviders: Object.fromEntries(roleProviders),
+      crossReview,
+    })
     return readStatus()
   })
 

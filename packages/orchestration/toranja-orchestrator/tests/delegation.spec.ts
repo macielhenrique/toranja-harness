@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
+import Storage from '@deepseek-ai/dsh-storage'
+import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import { afterEach, describe, expect, it } from 'vitest'
+import { MemoryMediaPool, MemoryStorageBackend } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
 import * as orchestrator from '../src/index.ts'
 import type { ToranjaOrchestrationStatus } from '../src/index.ts'
 
@@ -27,7 +30,7 @@ interface Harness {
   readonly prompts: string[]
   readonly tool: (name: string) => Tool
   readonly status: () => ToranjaOrchestrationStatus
-  readonly setMode: (request: Record<string, unknown>) => ToranjaOrchestrationStatus
+  readonly setMode: (request: Record<string, unknown>) => Promise<ToranjaOrchestrationStatus>
   /** Side effect each simulated agent performs in the project directory. */
   agentSideEffect: (cwd: string) => void
   /** Text every simulated agent answers with. */
@@ -58,9 +61,22 @@ function gitRepo(): string {
   return repo
 }
 
-async function mount(config: orchestrator.Config = {}, registered = ['codex', 'antigravity']): Promise<Harness> {
+/**
+ * Mount the orchestrator over simulated providers. Passing the `disk` of an
+ * earlier mount simulates an application restart over the same stored state.
+ */
+async function mount(
+  config: orchestrator.Config = {},
+  registered = ['codex', 'antigravity'],
+  disk = new MemoryMediaPool(),
+): Promise<Harness> {
   const ctx = new Context()
   contexts.push(ctx)
+  await ctx.plugin(Storage)
+  ctx.storage.backend.register('memory', new MemoryStorageBackend(disk))
+  const facility = new DomainFacility(ctx, { backend: 'memory', routes: {} })
+  ctx.storage.mount('domain', facility)
+  ctx.provide('storageDomain', facility)
   const repo = gitRepo()
   const providers = new Map<string, RegisteredProvider>()
   const tools = new Map<string, Tool>()
@@ -155,7 +171,9 @@ async function mount(config: orchestrator.Config = {}, registered = ['codex', 'a
   mounted.push(ctx)
   const controller = (ctx as Context & { toranjaOrchestrationController: orchestrator.ToranjaOrchestrationController })
     .toranjaOrchestrationController
-  return Object.assign(harness, { setMode: (request: Record<string, unknown>) => controller.setMode(request as never) })
+  return Object.assign(harness, {
+    setMode: (request: Record<string, unknown>) => Promise.resolve(controller.setMode(request as never)),
+  })
 }
 
 const ROUTING = {
@@ -252,9 +270,9 @@ describe('Toranja routed delegation', () => {
     const harness = await mount({ routing: ROUTING })
     const route = (role: string) => harness.status().routes.find(candidate => candidate.role === role)
     expect(route('tester')).toMatchObject({ provider: 'codex', tier: 'advanced', model: 'gpt-strong', effort: 'medium', access: 'execute' })
-    harness.setMode({ mode: 'team', profile: 'economico' })
+    await harness.setMode({ mode: 'team', profile: 'economico' })
     expect(route('tester')).toMatchObject({ tier: 'light', model: 'gpt-light', effort: 'low' })
-    harness.setMode({ mode: 'codex', profile: 'qualidade' })
+    await harness.setMode({ mode: 'codex', profile: 'qualidade' })
     expect(route('reviewer')).toMatchObject({ provider: 'codex', tier: 'max', model: 'gpt-strong', effort: 'high', access: 'read-only' })
     await delegate(harness, { role: 'reviewer' })
     expect(harness.started).toEqual(['codex~ro~gpt-strong~high'])
@@ -304,7 +322,7 @@ describe('Toranja routed delegation', () => {
 
   it('invalidates a gate verdict when an implementer starts during the gate', async () => {
     const harness = await mount({ routing: ROUTING, maxConcurrentPerProject: 3, maxConcurrentPerProvider: 3 })
-    harness.setMode({ mode: 'codex' })
+    await harness.setMode({ mode: 'codex' })
     const release = Promise.withResolvers<undefined>()
     harness.hold = release.promise
     const gate = harness.tool('run_delivery_gate').execute({
@@ -342,7 +360,7 @@ describe('Toranja routed delegation', () => {
 
   it('routes the delivery gate through the selected mode and rejects a gate run that edits files', async () => {
     const harness = await mount({ routing: ROUTING })
-    harness.setMode({ mode: 'codex' })
+    await harness.setMode({ mode: 'codex' })
     const gate = (): Promise<Record<string, unknown>> => harness.tool('run_delivery_gate').execute({
       project: 'demo',
       implementationSummary: 'changed tracked.txt',
@@ -500,12 +518,45 @@ describe('Toranja routed delegation', () => {
     expect(harness.prompts.at(-1)).toContain('2 assertions failed in checkout.spec.ts')
   })
 
+  it('restores mode, profile, and fallback order after a restart', async () => {
+    const disk = new MemoryMediaPool()
+    const first = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    await first.setMode({ mode: 'codex', profile: 'qualidade', fallbackOrder: ['antigravity', 'codex'] })
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(restarted.status()).toMatchObject({
+      mode: 'codex',
+      profile: 'qualidade',
+      fallbackOrder: ['antigravity', 'codex'],
+    })
+  })
+
+  it('applies a changed provider per role and cross-review setting at once and after a restart', async () => {
+    const disk = new MemoryMediaPool()
+    const first = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    const route = (harness: Harness, role: string) => harness.status().routes.find(candidate => candidate.role === role)?.provider
+    expect(route(first, 'planner')).toBe('antigravity')
+    await first.setMode({ mode: 'team', roleProviders: { planner: 'codex', reviewer: 'codex' }, crossReview: false })
+    expect(route(first, 'planner')).toBe('codex')
+    expect(first.status()).toMatchObject({ crossReview: false, roleProviders: { planner: 'codex', reviewer: 'codex' } })
+
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(route(restarted, 'planner')).toBe('codex')
+    expect(restarted.status()).toMatchObject({ crossReview: false, roleProviders: { planner: 'codex', reviewer: 'codex' } })
+    const result = await runGate(restarted, { implementationTaskId: await implement(restarted) })
+    expect(result.results[0]).toMatchObject({ role: 'reviewer', provider: 'codex' })
+  })
+
+  it('starts from the deployment defaults when nothing was stored', async () => {
+    const harness = await mount({ routing: ROUTING, defaultMode: 'antigravity', defaultProfile: 'economico' })
+    expect(harness.status()).toMatchObject({ mode: 'antigravity', profile: 'economico', crossReview: true, roleProviders: {} })
+  })
+
   it('does not fall back when the caller named the provider or selected a solo mode', async () => {
     const harness = await mount({ routing: ROUTING })
     harness.offline.set('antigravity', 'agy is not installed')
     await expect(delegate(harness, { role: 'reader', provider: 'antigravity' }))
       .rejects.toThrow('no project agent started: antigravity: agy is not installed')
-    harness.setMode({ mode: 'antigravity' })
+    await harness.setMode({ mode: 'antigravity' })
     await expect(delegate(harness, { role: 'reader' }))
       .rejects.toThrow('no project agent started: antigravity: agy is not installed')
   })

@@ -136,8 +136,8 @@
         maxConcurrentPerProvider: 2
         maxTaskChars: 12000
         allowParallelImplementation: false
-        # The Agents panel can switch this at runtime and remembers the choice
-        # in the local desktop profile.
+        # Default until the user changes it; the orchestrator then stores the
+        # choice in its storage domain and restores it on restart.
         defaultMode: team
         # Each delegation runs on a Toranja-owned provider instance that fixes
         # the model, reasoning effort, and filesystem access of its role.

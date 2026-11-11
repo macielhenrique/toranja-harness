@@ -34,6 +34,8 @@ export interface ToranjaRoleRoute {
   readonly effort?: string
 }
 
+/** Preferred provider per role; a role without an entry uses the built-in default. */
+export type ToranjaRoleProviders = Readonly<Partial<Record<ToranjaTaskRole, ToranjaProviderId>>>
 /** Lifecycle state of a delegated project task. */
 export type ToranjaTaskState = 'active' | 'completed' | 'failed'
 
@@ -42,6 +44,10 @@ export interface ToranjaAgentModeRequest {
   readonly mode: ToranjaAgentMode
   readonly profile?: ToranjaExecutionProfile
   readonly fallbackOrder?: readonly ToranjaProviderId[]
+  /** Replaces the preferred provider per role used in Team mode. */
+  readonly roleProviders?: ToranjaRoleProviders
+  /** Whether the delivery-gate reviewer avoids the implementing provider. */
+  readonly crossReview?: boolean
 }
 
 /** Counters and timestamps for a project lane or provider. */
@@ -98,6 +104,10 @@ export interface ToranjaOrchestrationStatus {
   readonly profile: ToranjaExecutionProfile
   /** Ordered provider fallback chain when the preferred provider is unavailable or exhausted. */
   readonly fallbackOrder: readonly ToranjaProviderId[]
+  /** Preferred provider per role in Team mode. */
+  readonly roleProviders: ToranjaRoleProviders
+  /** Whether the delivery-gate reviewer avoids the implementing provider. */
+  readonly crossReview: boolean
   readonly active: number
   readonly limits: {
     readonly maxConcurrentTotal: number

@@ -24,6 +24,9 @@
       "path": "../../llm/llm"
     },
     {
+      "path": "../../storage/storage-domain"
+    },
+    {
       "path": "../../subagent/subagent"
     },
     {

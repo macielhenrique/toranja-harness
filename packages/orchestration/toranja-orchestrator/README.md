@@ -16,6 +16,15 @@ delegations that omit an explicit provider:
   `fallbackOrder`, so a deployment with one connected provider routes every
   role to it.
 
+## Stored choices
+
+The controller's `setMode` changes the mode, execution profile, fallback order,
+provider per role, and cross-review setting, and stores them in the
+`toranja_orchestration` storage domain before it returns. On restart each stored
+field replaces the matching `Config` default; a field the user never changed
+keeps following the configuration. Model routing (`routing`) and concurrency
+limits stay configuration-only.
+
 ## Routing by role
 
 Every delegation resolves a route: provider, model tier, concrete model and

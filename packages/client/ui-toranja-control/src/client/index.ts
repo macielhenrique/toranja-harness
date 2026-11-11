@@ -19,18 +19,7 @@ export async function apply(ctx: Context): Promise<void> {
   await ctx.remote.$mount(TYPERT_REMOTE)
   const toranja = ctx.get('remote.toranja')
   if (toranja === undefined) throw new Error('Toranja Remote namespace did not mount')
-  const modeKey = 'toranja-harness.agent-mode'
-  const storedMode = localStorage.getItem(modeKey)
-  if (
-    storedMode === 'codex'
-    || storedMode === 'antigravity'
-    || storedMode === 'claude-code'
-    || storedMode === 'openrouter'
-    || storedMode === 'team'
-  ) {
-    const restored = await toranja.setMode({ mode: storedMode })
-    if (!restored.ok) console.warn('Toranja agent mode could not be restored')
-  }
+  // The Host stores the routing mode durably; the client only reads and changes it.
   const actions: ToranjaControlInjected = {
     async readStatus() {
       const result = await toranja.status()
@@ -40,7 +29,6 @@ export async function apply(ctx: Context): Promise<void> {
     async setMode(mode: ToranjaAgentMode) {
       const result = await toranja.setMode({ mode })
       if (!result.ok) throw new Error(COPY.setModeFailed)
-      localStorage.setItem(modeKey, mode)
       return result.value
     },
   }
