@@ -611,6 +611,17 @@ describe('Toranja routed delegation', () => {
     expect(restarted.status()).toMatchObject(expected)
   })
 
+  it('shows the new routing to anyone notified that the stored choice changed', async () => {
+    const harness = await mount({ routing: ROUTING })
+    const seen: unknown[] = []
+    harness.ctx.on('domain/changed', () => {
+      const status = harness.status()
+      seen.push([status.mode, status.profile, status.routes.find(route => route.role === 'reader')?.provider])
+    })
+    await harness.setMode({ mode: 'codex', profile: 'qualidade' })
+    expect(seen).toEqual([['codex', 'qualidade', 'codex']])
+  })
+
   it('starts from the deployment defaults when nothing was stored', async () => {
     const harness = await mount({ routing: ROUTING, defaultMode: 'antigravity', defaultProfile: 'economico' })
     expect(harness.status()).toMatchObject({ mode: 'antigravity', profile: 'economico', crossReview: true, roleProviders: {} })

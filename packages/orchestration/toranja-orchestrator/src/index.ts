@@ -385,6 +385,15 @@ class RoutedStartError extends Error {
   }
 }
 
+/** Routing choices in force: the stored user choices over the deployment defaults. */
+interface LiveSettings {
+  readonly mode: ToranjaAgentMode
+  readonly profile: ToranjaExecutionProfile
+  readonly fallbackOrder: readonly ToranjaProviderId[]
+  readonly roleProviders: ReadonlyMap<Role, RunProvider>
+  readonly crossReview: boolean
+}
+
 interface ProviderRouting {
   readonly base?: Record<string, unknown>
   readonly models: ProviderModels
@@ -462,13 +471,35 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const ledger = new OrchestrationLedger(limits)
   const domain = await ctx.storageDomain.open(toranjaOrchestrationDomain)
   ctx.effect(() => () => domain.close(), 'toranja-orchestrator.domainClose')
-  // Stored choices win over deployment defaults field by field.
-  const stored = domain.global.get()
-  let crossReview = stored.crossReview ?? config.crossReview ?? true
+  const defaults = {
+    mode: config.defaultMode ?? 'team',
+    profile: config.defaultProfile ?? 'equilibrado',
+    fallbackOrder: config.fallbackOrder ?? RUN_PROVIDERS,
+    roleProviders: parseRoleProviders(config),
+    crossReview: config.crossReview ?? true,
+  } satisfies LiveSettings
+  // The stored global is the only source of the live routing: every reader
+  // resolves it over the deployment defaults, so a change is visible to
+  // routing the moment the storage domain holds it, never before or after.
+  let resolvedFrom: ToranjaOrchestrationState | undefined
+  let resolved: LiveSettings = defaults
+  const live = (): LiveSettings => {
+    const stored = domain.global.get()
+    if (stored !== resolvedFrom) {
+      resolvedFrom = stored
+      resolved = {
+        mode: stored.mode ?? defaults.mode,
+        profile: stored.profile ?? defaults.profile,
+        fallbackOrder: stored.fallbackOrder ?? defaults.fallbackOrder,
+        roleProviders: stored.roleProviders === undefined
+          ? defaults.roleProviders
+          : parseRoleProviders({ roleProviders: stored.roleProviders }),
+        crossReview: stored.crossReview ?? defaults.crossReview,
+      }
+    }
+    return resolved
+  }
   const replanOnGateFailure = config.replanOnGateFailure ?? true
-  let mode: ToranjaAgentMode = stored.mode ?? config.defaultMode ?? 'team'
-  let profile: ToranjaExecutionProfile = stored.profile ?? config.defaultProfile ?? 'equilibrado'
-  let fallbackOrder: readonly ToranjaProviderId[] = stored.fallbackOrder ?? config.fallbackOrder ?? RUN_PROVIDERS
   const providerName = (provider: RunProvider): string => {
     switch (provider) {
       case 'codex':
@@ -483,12 +514,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
 
   const routing = parseRouting(config)
-  let roleProviders = stored.roleProviders === undefined
-    ? parseRoleProviders(config)
-    : parseRoleProviders({ roleProviders: stored.roleProviders })
   const routeFor = (role: Role, provider: RunProvider): ToranjaRoleRoute => {
     const entry = routing.get(provider)
-    return resolveRoute(role, profile, provider, entry?.base === undefined ? {} : entry.models)
+    return resolveRoute(role, live().profile, provider, entry?.base === undefined ? {} : entry.models)
   }
   for (const [provider, entry] of routing) {
     if (entry.base === undefined || !isVariantProvider(provider)) continue
@@ -636,9 +664,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * named no provider may move to another connected provider.
    */
   const candidatesFor = (first: RunProvider, allowFallback: boolean): readonly RunProvider[] => {
-    if (!allowFallback || mode !== 'team') return [first]
+    if (!allowFallback || live().mode !== 'team') return [first]
     const available = availableRunProviders()
-    return [first, ...fallbackOrder.filter(provider => provider !== first && available.has(provider))]
+    return [first, ...live().fallbackOrder.filter(provider => provider !== first && available.has(provider))]
   }
   /**
    * Start a role on the first candidate provider that accepts it. Each refused
@@ -740,11 +768,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   /** Provider a role uses when the caller names none: the mode, else the role preference with fallback. */
   const providerFor = (role: Role): RunProvider => {
+    const { mode, roleProviders } = live()
     if (mode !== 'team') return mode
     return resolveFallbackProvider(
       roleProviders.get(role) ?? defaultProvider(role, mode),
       availableRunProviders(),
-      fallbackOrder,
+      live().fallbackOrder,
     )
   }
 
@@ -779,11 +808,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const lanes = currentProjects()
     return {
       generatedAt: new Date().toISOString(),
-      mode,
-      profile,
-      fallbackOrder,
-      roleProviders: Object.fromEntries(roleProviders),
-      crossReview,
+      mode: live().mode,
+      profile: live().profile,
+      fallbackOrder: live().fallbackOrder,
+      roleProviders: Object.fromEntries(live().roleProviders),
+      crossReview: live().crossReview,
       active: ledger.activeCount,
       limits,
       projects: lanes.map(project => ({ ...project, metrics: ledger.project(project.id) })),
@@ -816,7 +845,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const startCodexAndWait = async (
     request: ToranjaCodexDelegationRequest,
   ): Promise<ToranjaCodexDelegationResult> => {
-    assertProvidersAllowed(mode, ['codex'])
+    assertProvidersAllowed(live().mode, ['codex'])
     const { project, description, task } = validateAssignment(request)
     const route = routeFor(request.role, 'codex')
     const [lease] = ledger.reserveBatch([reservation(project, route, description)])
@@ -825,7 +854,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const { activation, verify } = await launch({
         project,
         route,
-        prompt: rolePrompt(project, route, task, profile),
+        prompt: rolePrompt(project, route, task, live().profile),
         label: `${project.title}: ${description} (codex)`,
         parent: request.parent,
         signal: request.signal,
@@ -875,17 +904,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ...request.roleProviders === undefined ? {} : { roleProviders: { ...request.roleProviders } },
       ...request.crossReview === undefined ? {} : { crossReview: request.crossReview },
     }
-    // Validate before storing, and change the live routing only once the
-    // write is durable: a failed write leaves the routing in force untouched.
-    const nextRoleProviders = next.roleProviders === undefined
-      ? undefined
-      : parseRoleProviders({ roleProviders: next.roleProviders })
+    // Validate before storing. The live routing derives from the stored
+    // value, so a failed write leaves the routing in force untouched.
+    if (next.roleProviders !== undefined) parseRoleProviders({ roleProviders: next.roleProviders })
     await domain.global.set(next)
-    mode = request.mode
-    if (next.profile !== undefined) profile = next.profile
-    if (next.fallbackOrder !== undefined) fallbackOrder = next.fallbackOrder
-    if (nextRoleProviders !== undefined) roleProviders = nextRoleProviders
-    if (next.crossReview !== undefined) crossReview = next.crossReview
     return readStatus()
   }
   const controller = new ToranjaOrchestrationController(ctx, readStatus, (request) => {
@@ -917,9 +939,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         projects: currentProjects(),
         roles: ROLES,
         providers: PROVIDERS,
-        mode,
-        profile,
-        fallbackOrder,
+        mode: live().mode,
+        profile: live().profile,
+        fallbackOrder: live().fallbackOrder,
         defaults: Object.fromEntries(ROLES.map(role => [role, providerFor(role)])),
         routes: ROLES.map(role => routeFor(role, providerFor(role))),
         limits,
@@ -961,14 +983,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const role = args.role
       const providerChoice = args.provider ?? providerFor(role)
       const selected: readonly RunProvider[] = providerChoice === 'both' ? ['codex', 'antigravity'] : [providerChoice]
-      assertProvidersAllowed(mode, selected)
+      assertProvidersAllowed(live().mode, selected)
       const { project, description, task } = validateAssignment(args)
       const leases = ledger.reserveBatch(selected.map(provider => reservation(project, routeFor(role, provider), description)))
       const request: RoutedRequest = {
         project,
         role,
         description,
-        prompt: route => rolePrompt(project, route, task, profile),
+        prompt: route => rolePrompt(project, route, task, live().profile),
         label: provider => `${project.title}: ${description} (${provider})`,
         parent,
         signal: exec.signal,
@@ -1058,7 +1080,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // reviewer's candidates, so it reviews its own work only as a last resort.
       const gateCandidates = (role: typeof roles[number]): readonly RunProvider[] => {
         const candidates = candidatesFor(providerFor(role), true)
-        if (role !== 'reviewer' || !crossReview || implementerProvider === undefined) return candidates
+        if (role !== 'reviewer' || !live().crossReview || implementerProvider === undefined) return candidates
         return [
           ...candidates.filter(provider => provider !== implementerProvider),
           ...candidates.filter(provider => provider === implementerProvider),
@@ -1149,7 +1171,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             project,
             role: 'planner',
             description: 'Replanejar após portão',
-            prompt: route => rolePrompt(project, route, task, profile),
+            prompt: route => rolePrompt(project, route, task, live().profile),
             label: provider => `${project.title}: replan after gate (${provider})`,
             parent,
             signal: exec.signal,
