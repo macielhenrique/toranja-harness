@@ -17,6 +17,23 @@ export type ToranjaTaskRole =
   | 'reviewer'
   | 'tester'
   | 'release'
+/** Model tier a provider maps to a concrete model and reasoning effort. */
+export type ToranjaModelTier = 'light' | 'advanced' | 'max'
+/** Filesystem access enforced for a delegated role. */
+export type ToranjaRoleAccess = 'read-only' | 'execute' | 'write'
+
+/** Route applied when one role is delegated: who runs it, on which model, with which access. */
+export interface ToranjaRoleRoute {
+  readonly role: ToranjaTaskRole
+  readonly provider: ToranjaProviderId
+  readonly tier: ToranjaModelTier
+  readonly access: ToranjaRoleAccess
+  /** Concrete model; omitted when the provider's native setting applies. */
+  readonly model?: string
+  /** Concrete reasoning effort; omitted when the provider's native setting applies. */
+  readonly effort?: string
+}
+
 /** Lifecycle state of a delegated project task. */
 export type ToranjaTaskState = 'active' | 'completed' | 'failed'
 
@@ -60,6 +77,12 @@ export interface ToranjaTaskStatus {
   readonly provider: ToranjaProviderId
   readonly role: ToranjaTaskRole
   readonly label: string
+  /** Model the task was started with; omitted for the provider's native setting. */
+  readonly model?: string
+  /** Reasoning effort the task was started with; omitted for the provider's native setting. */
+  readonly effort?: string
+  /** Access level enforced for the task. */
+  readonly access?: ToranjaRoleAccess
   readonly state: ToranjaTaskState
   readonly startedAt: string
   readonly settledAt?: string
@@ -84,6 +107,8 @@ export interface ToranjaOrchestrationStatus {
   }
   readonly projects: readonly ToranjaProjectStatus[]
   readonly providers: readonly ToranjaProviderStatus[]
+  /** Route each role takes under the current mode and profile when no provider is named. */
+  readonly routes: readonly ToranjaRoleRoute[]
   /** Newest first; bounded in memory by the orchestration ledger. */
   readonly tasks: readonly ToranjaTaskStatus[]
 }

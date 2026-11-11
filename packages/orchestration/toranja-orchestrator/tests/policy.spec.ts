@@ -4,7 +4,6 @@ import {
   assertProvidersAllowed,
   defaultProvider,
   parseGateVerdict,
-  recommendedModelTier,
   resolveFallbackProvider,
   slugifyProjectId,
   type OrchestrationLimits,
@@ -149,13 +148,4 @@ describe('provider routing mode', () => {
     ).toBe('antigravity')
   })
 
-  it('assigns model tiers according to role phase and execution profile', () => {
-    expect(recommendedModelTier('reader', 'qualidade')).toBe('light')
-    expect(recommendedModelTier('searcher', 'equilibrado')).toBe('light')
-    expect(recommendedModelTier('inspector', 'economico')).toBe('light')
-    expect(recommendedModelTier('tester', 'economico')).toBe('light')
-    expect(recommendedModelTier('tester', 'equilibrado')).toBe('advanced')
-    expect(recommendedModelTier('planner', 'economico')).toBe('advanced')
-    expect(recommendedModelTier('implementer', 'equilibrado')).toBe('advanced')
-  })
 })

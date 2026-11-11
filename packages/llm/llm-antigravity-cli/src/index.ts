@@ -60,14 +60,23 @@ const MAX_HANDOFF_CHARS = 16_000
 
 /** Configuration for the direct Antigravity CLI LLM adapter. */
 export interface Config {
+  /** Antigravity CLI executable resolved through `PATH` or an absolute path. */
   executable?: string
+  /** Time limit of one CLI turn in milliseconds. */
   timeoutMs?: number
+  /** Run the CLI with its own terminal sandbox enabled. */
   sandbox?: boolean
+  /** Auto-approve headless tool prompts; requires `sandbox`. */
   autoApproveTools?: boolean
+  /** Antigravity execution mode of the session. */
   mode?: 'accept-edits' | 'auto' | 'plan'
+  /** Model passed to the CLI; omitted to keep the model selected in the chat. */
   model?: string
+  /** Reasoning effort passed to the CLI; omitted to keep the CLI default. */
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  /** Upper bound of Codex delegations one primary turn may request. */
   maxCodexDelegationsPerTurn?: number
+  /** Explicit environment entries layered over the scrubbed parent environment. */
   env?: Record<string, string>
 }
 

@@ -139,6 +139,30 @@
         # The Agents panel can switch this at runtime and remembers the choice
         # in the local desktop profile.
         defaultMode: team
+        # Each delegation runs on a Toranja-owned provider instance that fixes
+        # the model, reasoning effort, and filesystem access of its role.
+        # Read-only roles use the Codex read-only sandbox and Antigravity plan
+        # mode; a tier without `model` keeps the provider's own default model.
+        routing:
+          codex:
+            base:
+              env:
+                CODEX_HOME: !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:os').homedir(), '.codex')
+            models:
+              light: { model: gpt-5.6-luna, effort: low }
+              advanced: { effort: medium }
+              max: { effort: high }
+          antigravity:
+            base:
+              executable: agy
+              timeoutMs: 600000
+              sandbox: true
+              autoApproveTools: true
+              mode: accept-edits
+            models:
+              light: { model: gemini-3.8-flash-low }
+              advanced: { model: gemini-4-argon-medium }
+              max: { model: gemini-4-argon-high }
 
     - id: subagent-antigravity
       name: '@deepseek-ai/dsh-subagent-antigravity'

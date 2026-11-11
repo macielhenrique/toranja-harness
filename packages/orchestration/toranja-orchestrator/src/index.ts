@@ -4,12 +4,18 @@
  * @module @deepseek-ai/dsh-toranja-orchestrator
  */
 
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { basename, isAbsolute } from 'node:path'
+import { stat } from 'node:fs/promises'
+import { basename, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SubagentActivation, SubagentResult } from '@deepseek-ai/dsh-subagent'
+import * as antigravityPlugin from '@deepseek-ai/dsh-subagent-antigravity'
+import * as codexPlugin from '@deepseek-ai/dsh-subagent-codex'
+import type {} from '@deepseek-ai/dsh-subprocess'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type {} from '@deepseek-ai/dsh-workspace'
@@ -18,7 +24,6 @@ import {
   assertProvidersAllowed,
   defaultProvider,
   parseGateVerdict,
-  recommendedModelTier,
   resolveFallbackProvider,
   PROVIDERS,
   ROLES,
@@ -27,12 +32,23 @@ import {
   type Role,
   type RunProvider,
 } from './policy.ts'
+import {
+  MODEL_TIERS,
+  accessViolation,
+  resolveRoute,
+  variantConfig,
+  variantName,
+  type ProviderModels,
+  type WorkspaceFingerprint,
+} from './routing.ts'
 import type {
   ToranjaAgentMode,
   ToranjaAgentModeRequest,
   ToranjaExecutionProfile,
   ToranjaOrchestrationStatus,
   ToranjaProviderId,
+  ToranjaRoleAccess,
+  ToranjaRoleRoute,
 } from './types.ts'
 import {
   ToranjaOrchestrator,
@@ -41,37 +57,87 @@ import {
 } from './service.ts'
 
 export * from './policy.ts'
+export * from './routing.ts'
 export * from './service.ts'
 export * from './types.ts'
 
 export const name = 'toranja-orchestrator'
-export const inject = ['subagents', 'systemPrompt', 'tools', 'workspaceRegistry']
+export const inject = ['subagents', 'subprocess', 'systemPrompt', 'tools', 'workspaceRegistry']
 
 const PROJECT_ID = /^[a-z][a-z0-9-]{1,31}$/
 const DEFAULT_MAX_TASK_CHARS = 12_000
+const GIT_GRACE_MS = 3_000
+
+/** Provider plugins Toranja can instantiate per route to fix model, effort, and access. */
+const VARIANT_PLUGINS = { codex: codexPlugin, antigravity: antigravityPlugin } as const
+type VariantProvider = keyof typeof VARIANT_PLUGINS
+
+function isVariantProvider(provider: RunProvider): provider is VariantProvider {
+  return Object.hasOwn(VARIANT_PLUGINS, provider)
+}
 
 /** One stable product lane backed by a local project directory. */
 export interface ProjectConfig {
+  /** Stable lane identifier matching `^[a-z][a-z0-9-]{1,31}$`. */
   id: string
+  /** Human-readable lane title. */
   title: string
+  /** Absolute project directory. */
   path: string
+}
+
+/** Model and reasoning effort of one tier. */
+export interface TierModelConfig {
+  /** Provider model id; omitted to keep the provider's default model. */
+  model?: string
+  /** Provider reasoning effort; omitted to keep the provider's default effort. */
+  effort?: string
+}
+
+/** Model routing of one provider. */
+export interface ProviderRoutingConfig {
+  /**
+   * Base configuration of the provider plugin. When present, Toranja starts its
+   * own provider instances per route and applies the model, effort, and access
+   * below; when absent, delegations use the deployment's unrouted instance.
+   */
+  base?: Record<string, unknown>
+  /** Model and reasoning effort per tier (`light`, `advanced`, `max`). */
+  models?: Record<string, TierModelConfig>
 }
 
 /** Product-owned orchestration settings. */
 export interface Config {
+  /** Static project lanes added to the registered Workspaces. */
   projects?: ProjectConfig[]
+  /** Registry name of the unrouted Codex provider. */
   codexProvider?: string
+  /** Registry name of the unrouted Antigravity provider. */
   antigravityProvider?: string
+  /** Registry name of the unrouted Claude Code provider. */
   claudeCodeProvider?: string
+  /** Registry name of the unrouted OpenRouter provider. */
   openrouterProvider?: string
+  /** Maximum Toranja-owned runs active at once. */
   maxConcurrentTotal?: number
+  /** Maximum active runs in one project lane. */
   maxConcurrentPerProject?: number
+  /** Maximum active runs on one provider. */
   maxConcurrentPerProvider?: number
+  /** Maximum length of one delegated task or gate input. */
   maxTaskChars?: number
+  /** Allow more than one implementer in the same project directory. */
   allowParallelImplementation?: boolean
+  /** Routing mode in force until the controller changes it. */
   defaultMode?: ToranjaAgentMode
+  /** Execution profile in force until the controller changes it. */
   defaultProfile?: ToranjaExecutionProfile
+  /** Order in which registered providers replace an unavailable preferred one. */
   fallbackOrder?: ToranjaProviderId[]
+  /** Per-provider model routing, keyed by provider id. */
+  routing?: Record<string, ProviderRoutingConfig>
+  /** Preferred provider per role in Team mode, keyed by role. */
+  roleProviders?: Record<string, ToranjaProviderId>
 }
 
 export const Config: z<Config> = z.object({
@@ -97,6 +163,15 @@ export const Config: z<Config> = z.object({
     'claude-code',
     'openrouter',
   ]),
+  routing: z.dict(z.object({
+    // A dict schema would default to `{}` and hide whether a base was configured.
+    base: z.any(),
+    models: z.dict(z.object({
+      model: z.string().min(1),
+      effort: z.string().min(1),
+    })).default({}),
+  })).default({}),
+  roleProviders: z.dict(z.union(['codex', 'antigravity', 'claude-code', 'openrouter'] as const)).default({}),
 })
 
 interface ResolvedProject extends ProjectConfig {
@@ -172,22 +247,18 @@ function resolveProjects(projects: readonly ProjectConfig[]): ResolvedProject[] 
 
 function rolePrompt(
   project: ResolvedProject,
-  role: Role,
+  route: ToranjaRoleRoute,
   task: string,
-  profile: ToranjaExecutionProfile = 'equilibrado',
+  profile: ToranjaExecutionProfile,
 ): ContentBlock[] {
-  const tier = recommendedModelTier(role, profile)
-  const tierLabel = tier === 'light'
-    ? 'LIGHTWEIGHT INVESTIGATION (Haiku 5.5 / Gemini 3.8 Flash / GPT-5.6 Luna-Terra — Read-only & Concise Summary)'
-    : 'ADVANCED REASONING (Gemini 4 Argon / Claude Opus-Sonnet / GPT-6.1 Sol)'
   return [{
     type: 'text',
     text: [
       `Toranja Harness project lane: ${project.title} (${project.id}).`,
       `Working directory boundary: ${project.path}.`,
-      `Assigned role: ${role} [${tierLabel}].`,
+      `Assigned role: ${route.role}. Model tier: ${route.tier}. Filesystem access: ${route.access}.`,
       `Execution profile: ${profile}.`,
-      ROLE_GUIDANCE[role],
+      ROLE_GUIDANCE[route.role],
       '',
       'Task:',
       task.trim(),
@@ -250,10 +321,15 @@ function gatePrompt(
 function monitorActivation(
   activation: SubagentActivation,
   lease: { settle(success: boolean, error?: string): void },
+  verify: () => Promise<string | undefined>,
 ): void {
   void activation.result.then(
-    (result) => {
-      lease.settle(result.stopReason === 'completed', result.diagnostic ?? result.stopReason)
+    async (result) => {
+      const violation = await verify()
+      lease.settle(
+        result.stopReason === 'completed' && violation === undefined,
+        violation ?? result.diagnostic ?? result.stopReason,
+      )
     },
     (error: unknown) => {
       lease.settle(false, error instanceof Error ? error.message : 'subagent result infrastructure failure')
@@ -261,11 +337,52 @@ function monitorActivation(
   )
 }
 
+interface ProviderRouting {
+  readonly base?: Record<string, unknown>
+  readonly models: ProviderModels
+}
+
+function parseRouting(config: Config): Map<RunProvider, ProviderRouting> {
+  const routing = new Map<RunProvider, ProviderRouting>()
+  for (const [key, value] of Object.entries(config.routing ?? {})) {
+    const provider = RUN_PROVIDERS.find(candidate => candidate === key)
+    if (provider === undefined) throw new Error(`toranja-orchestrator: routing names unknown provider ${JSON.stringify(key)}`)
+    const models: Partial<Record<typeof MODEL_TIERS[number], { model?: string; effort?: string }>> = {}
+    for (const [tierKey, model] of Object.entries(value.models ?? {})) {
+      const tier = MODEL_TIERS.find(candidate => candidate === tierKey)
+      if (tier === undefined) throw new Error(`toranja-orchestrator: routing.${key}.models names unknown tier ${JSON.stringify(tierKey)}`)
+      models[tier] = model
+    }
+    if (value.base !== undefined && (typeof value.base !== 'object' || value.base === null || Array.isArray(value.base))) {
+      throw new Error(`toranja-orchestrator: routing.${key}.base must be a mapping`)
+    }
+    if (value.base !== undefined && !isVariantProvider(provider)) {
+      throw new Error(`toranja-orchestrator: routing.${key}.base is not supported; ${key} has no Toranja-owned instances`)
+    }
+    if (value.base === undefined && Object.keys(models).length > 0) {
+      throw new Error(`toranja-orchestrator: routing.${key}.models requires routing.${key}.base; without it no model is applied`)
+    }
+    routing.set(provider, { ...value.base === undefined ? {} : { base: value.base }, models })
+  }
+  return routing
+}
+
+function parseRoleProviders(config: Config): Map<Role, RunProvider> {
+  const roleProviders = new Map<Role, RunProvider>()
+  for (const [key, provider] of Object.entries(config.roleProviders ?? {})) {
+    const role = ROLES.find(candidate => candidate === key)
+    if (role === undefined) throw new Error(`toranja-orchestrator: roleProviders names unknown role ${JSON.stringify(key)}`)
+    roleProviders.set(role, provider)
+  }
+  return roleProviders
+}
+
 interface GateRun {
   readonly role: 'reviewer' | 'tester'
   readonly provider: RunProvider
   readonly providerName: string
   readonly activation: SubagentActivation
+  readonly verify: () => Promise<string | undefined>
 }
 
 interface GateResult {
@@ -318,6 +435,153 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   }
 
+  const routing = parseRouting(config)
+  const roleProviders = parseRoleProviders(config)
+  const routeFor = (role: Role, provider: RunProvider): ToranjaRoleRoute => {
+    const entry = routing.get(provider)
+    return resolveRoute(role, profile, provider, entry?.base === undefined ? {} : entry.models)
+  }
+  for (const [provider, entry] of routing) {
+    if (entry.base === undefined || !isVariantProvider(provider)) continue
+    for (const role of ROLES) {
+      for (const candidate of ['economico', 'equilibrado', 'qualidade'] as const) {
+        const route = resolveRoute(role, candidate, provider, entry.models)
+        VARIANT_PLUGINS[provider].Config(variantConfig(provider, entry.base, route, variantName(providerName(provider), route)))
+      }
+    }
+  }
+  const variants = new Map<string, Promise<string>>()
+  /** Registry name of the provider instance that enforces `route`, started on first use. */
+  const instanceFor = (route: ToranjaRoleRoute): Promise<string> => {
+    const provider = route.provider
+    const base = routing.get(provider)?.base
+    if (base === undefined || !isVariantProvider(provider)) return Promise.resolve(providerName(provider))
+    const instance = variantName(providerName(provider), route)
+    let pending = variants.get(instance)
+    if (pending === undefined) {
+      pending = Promise.resolve(ctx.plugin(VARIANT_PLUGINS[provider], variantConfig(provider, base, route, instance)))
+        .then(() => instance)
+      variants.set(instance, pending)
+      pending.catch(() => { variants.delete(instance) })
+    }
+    return pending
+  }
+
+  const gitOutput = async (cwd: string, args: readonly string[]): Promise<Buffer | undefined> => {
+    const child = ctx.subprocess.spawn({
+      argv: ['git', ...args],
+      cwd,
+      stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+      graceMs: GIT_GRACE_MS,
+    })
+    child.stderr?.resume()
+    const chunks: Buffer[] = []
+    for await (const chunk of child.stdout as NonNullable<typeof child.stdout>) chunks.push(chunk as Buffer)
+    const outcome = await child.done
+    return outcome.exitCode === 0 ? Buffer.concat(chunks) : undefined
+  }
+  /**
+   * Hash path, size, and modification time of every untracked file and of each
+   * ignored file or collapsed ignored directory. A change deep inside an
+   * ignored directory does not alter that directory's own entry.
+   */
+  const untrackedHash = async (cwd: string, listings: readonly Buffer[]): Promise<string> => {
+    const hash = createHash('sha256')
+    const paths = listings.flatMap(listing => listing.toString('utf8').split('\0').filter(Boolean)).sort()
+    for (const path of paths) {
+      const facts = await stat(join(cwd, path)).then(
+        entry => `${entry.size}:${entry.mtimeMs}`,
+        () => 'missing',
+      )
+      hash.update(`${path}\0${facts}\0`)
+    }
+    return hash.digest('hex')
+  }
+  const fingerprint = async (cwd: string): Promise<WorkspaceFingerprint | undefined> => {
+    try {
+      const [tracked, untracked, ignored] = await Promise.all([
+        gitOutput(cwd, ['diff', 'HEAD', '--binary']),
+        gitOutput(cwd, ['ls-files', '--others', '--exclude-standard', '-z']),
+        gitOutput(cwd, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z']),
+      ])
+      if (tracked === undefined || untracked === undefined || ignored === undefined) return undefined
+      return {
+        tracked: createHash('sha256').update(tracked).digest('hex'),
+        untracked: await untrackedHash(cwd, [untracked, ignored]),
+      }
+    } catch (error: unknown) {
+      ctx.logger.warn(`toranja-orchestrator: working-tree fingerprint failed in ${cwd}: ${String(error)}`)
+      return undefined
+    }
+  }
+  /**
+   * Capture the working tree before a non-writing run. The returned check
+   * reports a change the role's access forbids. A concurrent implementer makes
+   * the comparison meaningless: a `strict` run then reports that its access
+   * could not be verified, and any other run reports nothing. The check also
+   * reports nothing when the directory is not a Git work tree with a commit.
+   */
+  const guardAccess = async (
+    project: ResolvedProject,
+    access: ToranjaRoleAccess,
+    strict: boolean,
+  ): Promise<() => Promise<string | undefined>> => {
+    const unverifiable = strict
+      ? 'access could not be verified: an implementer ran in the project during this run'
+      : undefined
+    if (access === 'write') return () => Promise.resolve(undefined)
+    if (ledger.hasActiveWriter(project.id)) return () => Promise.resolve(unverifiable)
+    const writersBefore = ledger.writerStartCount(project.id)
+    const before = await fingerprint(project.path)
+    if (before === undefined) return () => Promise.resolve(undefined)
+    return async () => {
+      if (ledger.writerStartCount(project.id) !== writersBefore) return unverifiable
+      const after = await fingerprint(project.path)
+      if (after === undefined) return undefined
+      const violation = accessViolation(access, before, after)
+      if (violation !== undefined) {
+        ctx.logger.warn(`toranja-orchestrator: ${violation} in project ${project.id}`)
+      }
+      return violation
+    }
+  }
+  /** Start one routed delegation on the provider instance that enforces its route. */
+  const launch = async (request: {
+    readonly project: ResolvedProject
+    readonly route: ToranjaRoleRoute
+    readonly prompt: ContentBlock[]
+    readonly label: string
+    readonly parent: Agent
+    readonly signal: AbortSignal
+    readonly delivery: 'caller' | 'parent'
+    /** Treat an unverifiable working tree as a failure instead of skipping the check. */
+    readonly strict?: boolean
+  }): Promise<{ activation: SubagentActivation; providerName: string; verify: () => Promise<string | undefined> }> => {
+    const instance = await instanceFor(request.route)
+    const verify = await guardAccess(request.project, request.route.access, request.strict ?? false)
+    const activation = await ctx.subagents.startActivation({
+      provider: instance,
+      label: request.label,
+      request: {
+        cwd: request.project.path,
+        prompt: request.prompt,
+        parent: request.parent,
+      },
+      signal: request.signal,
+      delivery: request.delivery,
+    })
+    return { activation, providerName: instance, verify }
+  }
+  const reservation = (project: ResolvedProject, route: ToranjaRoleRoute, label: string) => ({
+    project: project.id,
+    provider: route.provider,
+    role: route.role,
+    label,
+    model: route.model,
+    effort: route.effort,
+    access: route.access,
+  })
+
   const availableRunProviders = (): ReadonlySet<RunProvider> => {
     const registered = new Set(ctx.subagents.list())
     const available = new Set<RunProvider>()
@@ -327,6 +591,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     return available
+  }
+
+  /** Provider a role uses when the caller names none: the mode, else the role preference with fallback. */
+  const providerFor = (role: Role): RunProvider => {
+    if (mode !== 'team') return mode
+    return resolveFallbackProvider(
+      roleProviders.get(role) ?? defaultProvider(role, mode),
+      availableRunProviders(),
+      fallbackOrder,
+    )
   }
 
   const currentProjects = (): ResolvedProject[] => {
@@ -372,6 +646,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         available: registered.has(providerName(provider)),
         metrics: ledger.provider(provider),
       })),
+      routes: ROLES.map(role => routeFor(role, providerFor(role))),
       tasks: ledger.tasks(),
     }
   }
@@ -396,29 +671,25 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ): Promise<ToranjaCodexDelegationResult> => {
     assertProvidersAllowed(mode, ['codex'])
     const { project, description, task } = validateAssignment(request)
-    const [lease] = ledger.reserveBatch([{
-      project: project.id,
-      provider: 'codex',
-      role: request.role,
-      label: description,
-    }])
+    const route = routeFor(request.role, 'codex')
+    const [lease] = ledger.reserveBatch([reservation(project, route, description)])
     if (lease === undefined) throw new Error('toranja-orchestrator: missing Codex delegation reservation')
     try {
-      const activation = await ctx.subagents.startActivation({
-        provider: codexProvider,
+      const { activation, verify } = await launch({
+        project,
+        route,
+        prompt: rolePrompt(project, route, task, profile),
         label: `${project.title}: ${description} (codex)`,
-        request: {
-          cwd: project.path,
-          prompt: rolePrompt(project, request.role, task, profile),
-          parent: request.parent,
-        },
+        parent: request.parent,
         signal: request.signal,
         delivery: 'caller',
       })
       const result = await activation.result
+      const violation = await verify()
       const output = contentText(result.output).slice(0, 20_000)
-      const success = result.stopReason === 'completed'
-      lease.settle(success, result.diagnostic ?? (success ? undefined : result.stopReason))
+      const success = result.stopReason === 'completed' && violation === undefined
+      const diagnostic = violation ?? result.diagnostic
+      lease.settle(success, diagnostic ?? (success ? undefined : result.stopReason))
       return {
         project: project.id,
         role: request.role,
@@ -426,7 +697,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         subagentId: activation.childId,
         stopReason: result.stopReason,
         output,
-        ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
+        ...(diagnostic === undefined ? {} : { diagnostic }),
       }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Codex delegation infrastructure failure'
@@ -474,7 +745,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         mode,
         profile,
         fallbackOrder,
-        defaults: Object.fromEntries(ROLES.map(role => [role, defaultProvider(role, mode)])),
+        defaults: Object.fromEntries(ROLES.map(role => [role, providerFor(role)])),
+        routes: ROLES.map(role => routeFor(role, providerFor(role))),
         limits,
       }))
     },
@@ -512,49 +784,41 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const parent = exec.agent
       if (parent === undefined) throw new Error('delegate_project_task requires a calling agent')
       const role = args.role
-      const available = availableRunProviders()
-      const providerChoice = args.provider ?? (
-        mode === 'team'
-          ? resolveFallbackProvider(defaultProvider(role, mode), available, fallbackOrder)
-          : defaultProvider(role, mode)
-      )
+      const providerChoice = args.provider ?? providerFor(role)
       const selected: readonly RunProvider[] = providerChoice === 'both' ? ['codex', 'antigravity'] : [providerChoice]
       assertProvidersAllowed(mode, selected)
       const { project, description, task } = validateAssignment(args)
-      const prompt = rolePrompt(project, role, task, profile)
-      const leases = ledger.reserveBatch(selected.map(provider => ({
-        project: project.id,
-        provider,
-        role,
-        label: description,
-      })))
-      const results = await Promise.all(selected.map(async (provider, index) => {
-        const registryName = providerName(provider)
+      const routes = selected.map(provider => routeFor(role, provider))
+      const leases = ledger.reserveBatch(routes.map(route => reservation(project, route, description)))
+      const results = await Promise.all(routes.map(async (route, index) => {
+        const provider = route.provider
         const lease = requiredAt(leases, index, 'delegation reservation')
         try {
-          const activation = await ctx.subagents.startActivation({
-            provider: registryName,
+          const { activation, providerName: registryName, verify } = await launch({
+            project,
+            route,
+            prompt: rolePrompt(project, route, task, profile),
             label: `${project.title}: ${description} (${provider})`,
-            request: {
-              cwd: project.path,
-              prompt,
-              parent,
-            },
+            parent,
             signal: exec.signal,
             delivery: 'parent',
           })
-          monitorActivation(activation, lease)
+          monitorActivation(activation, lease, verify)
           return {
             ok: true as const,
             provider,
             providerName: registryName,
+            tier: route.tier,
+            access: route.access,
+            ...route.model === undefined ? {} : { model: route.model },
+            ...route.effort === undefined ? {} : { effort: route.effort },
             taskId: lease.taskId,
             subagentId: activation.childId,
           }
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : 'unknown provider startup failure'
           lease.settle(false, message)
-          return { ok: false as const, provider, providerName: registryName, error: message.slice(0, 4096) }
+          return { ok: false as const, provider, providerName: providerName(provider), error: message.slice(0, 4096) }
         }
       }))
       const activations = results.filter(result => result.ok)
@@ -568,7 +832,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   ctx.tools.register(defineTool({
     name: 'run_delivery_gate',
-    description: 'Run the Toranja release gate for one project. An Antigravity reviewer and a Codex tester independently inspect the current repository without editing it. The tool waits for both and passes only when both return an explicit PASS verdict.',
+    description: 'Run the Toranja release gate for one project. A reviewer and a tester, routed by the current mode and role preferences, independently inspect the current repository without editing tracked files. The tool waits for both and passes only when both return an explicit PASS verdict.',
     parameters: {
       project: { type: 'string', required: true, description: 'Project lane id from list_project_lanes.' },
       implementationSummary: { type: 'string', required: true, description: 'What changed, including relevant files and claimed validation.' },
@@ -592,38 +856,32 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (implementationSummary.length + acceptanceCriteria.length > maxTaskChars) {
         throw new Error(`run_delivery_gate input exceeds ${maxTaskChars} characters`)
       }
-      const assignments = [
-        { role: 'reviewer' as const, provider: 'antigravity' as const },
-        { role: 'tester' as const, provider: 'codex' as const },
-      ]
-      const leases = ledger.reserveBatch(assignments.map(({ role, provider }) => ({
-        project: project.id,
-        role,
-        provider,
-        label: `Portão de entrega: ${role}`,
-      })))
-      const starts = await Promise.all(assignments.map(async ({ role, provider }, index): Promise<GateRun | GateResult> => {
-        const registryName = providerName(provider)
+      if (ledger.hasActiveWriter(project.id)) {
+        throw new Error(`run_delivery_gate: an implementer is still active in project ${project.id}; run the gate after it settles`)
+      }
+      const routes = (['reviewer', 'tester'] as const).map(role => ({ role, route: routeFor(role, providerFor(role)) }))
+      const leases = ledger.reserveBatch(routes.map(({ route }) => reservation(project, route, `Portão de entrega: ${route.role}`)))
+      const starts = await Promise.all(routes.map(async ({ role, route }, index): Promise<GateRun | GateResult> => {
+        const provider = route.provider
         try {
-          const activation = await ctx.subagents.startActivation({
-            provider: registryName,
+          const { activation, providerName: registryName, verify } = await launch({
+            project,
+            route,
+            prompt: gatePrompt(project, role, implementationSummary, acceptanceCriteria),
             label: `${project.title}: delivery ${role} (${provider})`,
-            request: {
-              cwd: project.path,
-              prompt: gatePrompt(project, role, implementationSummary, acceptanceCriteria),
-              parent,
-            },
+            parent,
             signal: exec.signal,
             delivery: 'caller',
+            strict: true,
           })
-          return { role, provider, providerName: registryName, activation }
+          return { role, provider, providerName: registryName, activation, verify }
         } catch (error: unknown) {
           const diagnostic = error instanceof Error ? error.message : 'unknown provider startup failure'
           requiredAt(leases, index, 'delivery gate reservation').settle(false, diagnostic)
           return {
             role,
             provider,
-            providerName: registryName,
+            providerName: providerName(provider),
             subagentId: '',
             stopReason: 'startup-error',
             verdict: 'invalid',
@@ -637,10 +895,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         try {
           const result = await start.activation.result
           const output = contentText(result.output).slice(0, 20_000)
-          const verdict = parseGateVerdict(output)
+          const violation = await start.verify()
+          const verdict = violation === undefined ? parseGateVerdict(output) : 'invalid'
           const successful = result.stopReason === 'completed' && verdict === 'pass'
+          const diagnostic = violation ?? result.diagnostic
           requiredAt(leases, index, 'delivery gate reservation')
-            .settle(successful, result.diagnostic ?? (successful ? undefined : `${result.stopReason}/${verdict}`))
+            .settle(successful, diagnostic ?? (successful ? undefined : `${result.stopReason}/${verdict}`))
           return {
             role: start.role,
             provider: start.provider,
@@ -649,7 +909,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             stopReason: result.stopReason,
             verdict,
             output,
-            ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
+            ...(diagnostic === undefined ? {} : { diagnostic }),
           }
         } catch (error: unknown) {
           const diagnostic = error instanceof Error ? error.message : 'subagent result infrastructure failure'

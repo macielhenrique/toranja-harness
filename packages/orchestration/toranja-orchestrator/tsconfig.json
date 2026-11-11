@@ -27,6 +27,15 @@
       "path": "../../subagent/subagent"
     },
     {
+      "path": "../../subagent/subagent-antigravity"
+    },
+    {
+      "path": "../../subagent/subagent-codex"
+    },
+    {
+      "path": "../../subprocess/subprocess"
+    },
+    {
       "path": "../../typert/protocol"
     },
     {

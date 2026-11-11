@@ -3,7 +3,7 @@
 import type {
   MetricSnapshot,
   ToranjaAgentMode,
-  ToranjaExecutionProfile,
+  ToranjaRoleAccess,
   ToranjaTaskRole,
   ToranjaTaskState,
   ToranjaTaskStatus,
@@ -77,23 +77,6 @@ export function resolveFallbackProvider(
 }
 
 /**
- * Determine whether a role should run on a lightweight investigation model
- * (`Haiku`, `Gemini 3.8 Flash`, `GPT-5.6 Luna/Terra`) or an advanced reasoning
- * model (`Gemini 4 Argon`, `Claude Opus/Sonnet`, `GPT-6.1 Sol`).
- * @param role - Assigned task role.
- * @param profile - Active execution profile (`economico`, `equilibrado`, `qualidade`).
- * @returns Model tier (`'light'` or `'advanced'`).
- */
-export function recommendedModelTier(
-  role: Role,
-  profile: ToranjaExecutionProfile = 'equilibrado',
-): 'light' | 'advanced' {
-  if (role === 'reader' || role === 'searcher' || role === 'inspector') return 'light'
-  if (profile === 'economico' && (role === 'tester' || role === 'release')) return 'light'
-  return 'advanced'
-}
-
-/**
  * Keep solo modes exclusive even when a caller names a provider explicitly.
  * @param mode - Active Toranja agent mode.
  * @param providers - Providers requested for the operation.
@@ -147,6 +130,9 @@ export interface ReservationRequest {
   readonly provider: RunProvider
   readonly role: Role
   readonly label?: string
+  readonly model?: string | undefined
+  readonly effort?: string | undefined
+  readonly access?: ToranjaRoleAccess
 }
 
 interface MutableMetric {
@@ -170,6 +156,9 @@ interface MutableTask {
   provider: RunProvider
   role: Role
   label: string
+  model?: string
+  effort?: string
+  access?: ToranjaRoleAccess
   state: ToranjaTaskState
   startedAt: string
   settledAt?: string
@@ -202,6 +191,7 @@ export class OrchestrationLedger {
   private readonly projects = new Map<string, MutableMetric>()
   private readonly providers = new Map<string, MutableMetric>()
   private readonly activeWriters = new Map<string, number>()
+  private readonly writerStarts = new Map<string, number>()
   private readonly taskHistory: MutableTask[] = []
   private taskSequence = 0
 
@@ -263,6 +253,7 @@ export class OrchestrationLedger {
       providerMetric.lastStartedAt = startedAt
       if (request.role === 'implementer') {
         this.activeWriters.set(request.project, (this.activeWriters.get(request.project) ?? 0) + 1)
+        this.writerStarts.set(request.project, (this.writerStarts.get(request.project) ?? 0) + 1)
       }
       const task: MutableTask = {
         id: `toranja-${Date.now().toString(36)}-${(++this.taskSequence).toString(36)}`,
@@ -270,6 +261,9 @@ export class OrchestrationLedger {
         provider: request.provider,
         role: request.role,
         label: request.label?.trim().slice(0, 80) || request.role,
+        ...request.model === undefined ? {} : { model: request.model },
+        ...request.effort === undefined ? {} : { effort: request.effort },
+        ...request.access === undefined ? {} : { access: request.access },
         state: 'active',
         startedAt,
       }
@@ -321,6 +315,27 @@ export class OrchestrationLedger {
     if (removable.size === 0) return
     const retained = this.taskHistory.filter(task => !removable.has(task.id))
     this.taskHistory.splice(0, this.taskHistory.length, ...retained)
+  }
+
+  /**
+   * Whether an implementer currently holds the project's working tree, which
+   * makes a concurrent working-tree comparison meaningless.
+   * @param project - Project lane identifier.
+   * @returns True while at least one implementer is active in `project`.
+   */
+  hasActiveWriter(project: string): boolean {
+    return (this.activeWriters.get(project) ?? 0) > 0
+  }
+
+  /**
+   * Count implementers ever started in the project. An unchanged count across a
+   * run, with no active writer, means no implementer touched the working tree
+   * during that run.
+   * @param project - Project lane identifier.
+   * @returns Monotonic number of implementer reservations for `project`.
+   */
+  writerStartCount(project: string): number {
+    return this.writerStarts.get(project) ?? 0
   }
 
   /** Number of currently active reservations across all projects and providers. */

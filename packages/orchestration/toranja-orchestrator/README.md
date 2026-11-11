@@ -10,8 +10,52 @@ delegations that omit an explicit provider:
 
 - `codex`: route every role to Codex;
 - `antigravity`: route every role to Antigravity;
-- `team`: route planning and review to Antigravity, and implementation,
-  testing, and release to Codex.
+- `team`: route each role to its `roleProviders` entry, or by default planning
+  and review to Antigravity and implementation, testing, and release to Codex.
+  A provider that is not registered is replaced by the first registered one in
+  `fallbackOrder`, so a deployment with one connected provider routes every
+  role to it.
+
+## Routing by role
+
+Every delegation resolves a route: provider, model tier, concrete model and
+reasoning effort, and filesystem access. `get_orchestration_status` and the
+controller snapshot list the current route of each role under `routes`.
+
+| Role | Access | `economico` | `equilibrado` | `qualidade` |
+|---|---|---|---|---|
+| `reader`, `searcher`, `inspector` | `read-only` | `light` | `light` | `light` |
+| `planner`, `architect`, `reviewer` | `read-only` | `advanced` | `advanced` | `max` |
+| `implementer` | `write` | `advanced` | `advanced` | `advanced` |
+| `tester`, `release` | `execute` | `light` | `advanced` | `advanced` |
+
+`routing.<provider>.models` maps each tier to `{ model, effort }`; `max` uses
+the `advanced` entry when it has none, and an omitted field keeps the provider's
+own default. `routing.<provider>.base` is the configuration of that provider's
+plugin. With a `base`, Toranja starts its own provider instance per distinct
+route and applies the route to it; without one, delegations use the
+deployment's unrouted instance and no model is applied, so `models` without
+`base` is rejected at load. `base` is supported for `codex` and `antigravity`.
+
+| Provider | `read-only` enforcement |
+|---|---|
+| `codex` | Native `read-only` sandbox: writes are denied outside the model. |
+| `antigravity` | `plan` mode without tool auto-approval. The CLI applies it as a directive to the model, so it is advisory. |
+
+For `read-only` and `execute` roles Toranja also fingerprints the Git working
+tree before and after the run: the diff against `HEAD`, plus the path, size, and
+modification time of untracked and ignored entries. A `read-only` run that
+changes either, or an `execute` run that changes tracked files, settles as
+failed with that reason; in `run_delivery_gate` its verdict becomes `invalid`.
+The check detects a change and does not revert it. Its limits:
+
+- An ignored directory is fingerprinted as one entry, so a change deep inside
+  it, such as in `node_modules`, is not detected.
+- A directory that is not a Git work tree with a commit is not checked.
+- An implementer running in the same project makes the comparison meaningless.
+  `run_delivery_gate` refuses to start while one is active and turns the verdict
+  `invalid` when one starts during the gate; any other delegation skips the
+  check.
 
 An explicit provider always wins. The `both` option remains available for
 independent cross-provider read-only work; write isolation rejects two
@@ -27,8 +71,9 @@ concurrency. By default, two implementers cannot share one project worktree.
 
 `get_orchestration_status` reports provider registration plus active, completed,
 and failed run counts without spending provider credits. `run_delivery_gate`
-waits for an Antigravity reviewer and a Codex tester and returns `ready` only
-when both independently emit an explicit pass verdict. The Agent Team task board
+waits for a reviewer and a tester, routed like any other role under the current
+mode, and returns `ready` only when both independently emit an explicit pass
+verdict without changing tracked files. The Agent Team task board
 remains the durable source of task status, dependencies, ownership, and
 write-scope warnings.
 
