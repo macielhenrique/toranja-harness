@@ -546,6 +546,57 @@ describe('Toranja routed delegation', () => {
     expect(result.results[0]).toMatchObject({ role: 'reviewer', provider: 'codex' })
   })
 
+  it('keeps the routing in force when storing a change fails', async () => {
+    const disk = new MemoryMediaPool()
+    const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    disk.failNextWrites = 1
+    await expect(harness.setMode({
+      mode: 'codex',
+      profile: 'qualidade',
+      fallbackOrder: ['antigravity', 'codex'],
+      roleProviders: { reader: 'codex' },
+      crossReview: false,
+    })).rejects.toThrow('injected write failure')
+    expect(harness.status()).toMatchObject({
+      mode: 'team',
+      profile: 'equilibrado',
+      fallbackOrder: ['codex', 'antigravity', 'claude-code', 'openrouter'],
+      roleProviders: {},
+      crossReview: true,
+    })
+    const result = await delegate(harness, { role: 'reader' })
+    expect(result.activations).toEqual([expect.objectContaining({ provider: 'antigravity' })])
+  })
+
+  it('stores only what the user changed, so untouched defaults follow the deployment', async () => {
+    const disk = new MemoryMediaPool()
+    const first = await mount({ routing: ROUTING, defaultProfile: 'equilibrado' }, ['codex', 'antigravity'], disk)
+    await first.setMode({ mode: 'codex' })
+    const restarted = await mount({
+      routing: ROUTING,
+      defaultProfile: 'qualidade',
+      fallbackOrder: ['antigravity', 'codex'],
+      roleProviders: { planner: 'codex' },
+      crossReview: false,
+    }, ['codex', 'antigravity'], disk)
+    expect(restarted.status()).toMatchObject({
+      mode: 'codex',
+      profile: 'qualidade',
+      fallbackOrder: ['antigravity', 'codex'],
+      roleProviders: { planner: 'codex' },
+      crossReview: false,
+    })
+  })
+
+  it('keeps earlier stored choices when a later change touches another field', async () => {
+    const disk = new MemoryMediaPool()
+    const first = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    await first.setMode({ mode: 'team', profile: 'economico' })
+    await first.setMode({ mode: 'team', crossReview: false })
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(restarted.status()).toMatchObject({ mode: 'team', profile: 'economico', crossReview: false })
+  })
+
   it('starts from the deployment defaults when nothing was stored', async () => {
     const harness = await mount({ routing: ROUTING, defaultMode: 'antigravity', defaultProfile: 'economico' })
     expect(harness.status()).toMatchObject({ mode: 'antigravity', profile: 'economico', crossReview: true, roleProviders: {} })

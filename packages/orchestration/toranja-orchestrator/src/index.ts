@@ -53,7 +53,7 @@ import type {
   ToranjaRoleAccess,
   ToranjaRoleRoute,
 } from './types.ts'
-import { toranjaOrchestrationDomain } from './state.ts'
+import { toranjaOrchestrationDomain, type ToranjaOrchestrationState } from './state.ts'
 import {
   ToranjaOrchestrator,
   type ToranjaCodexDelegationRequest,
@@ -859,20 +859,29 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     startCodexAndWait,
   )
   const controller = new ToranjaOrchestrationController(ctx, readStatus, async (request) => {
-    mode = request.mode
-    if (request.profile !== undefined) profile = request.profile
-    if (request.fallbackOrder !== undefined && request.fallbackOrder.length > 0) {
-      fallbackOrder = request.fallbackOrder
+    // Only the fields this request names join the stored overrides, so a field
+    // the user never changed keeps following the deployment configuration.
+    const next: ToranjaOrchestrationState = {
+      ...domain.global.get(),
+      mode: request.mode,
+      ...request.profile === undefined ? {} : { profile: request.profile },
+      ...request.fallbackOrder === undefined || request.fallbackOrder.length === 0
+        ? {}
+        : { fallbackOrder: [...request.fallbackOrder] },
+      ...request.roleProviders === undefined ? {} : { roleProviders: { ...request.roleProviders } },
+      ...request.crossReview === undefined ? {} : { crossReview: request.crossReview },
     }
-    if (request.roleProviders !== undefined) roleProviders = parseRoleProviders({ roleProviders: { ...request.roleProviders } })
-    if (request.crossReview !== undefined) crossReview = request.crossReview
-    await domain.global.set({
-      mode,
-      profile,
-      fallbackOrder: [...fallbackOrder],
-      roleProviders: Object.fromEntries(roleProviders),
-      crossReview,
-    })
+    // Validate before storing, and change the live routing only once the
+    // write is durable: a failed write leaves the routing in force untouched.
+    const nextRoleProviders = next.roleProviders === undefined
+      ? undefined
+      : parseRoleProviders({ roleProviders: next.roleProviders })
+    await domain.global.set(next)
+    mode = request.mode
+    if (next.profile !== undefined) profile = next.profile
+    if (next.fallbackOrder !== undefined) fallbackOrder = next.fallbackOrder
+    if (nextRoleProviders !== undefined) roleProviders = nextRoleProviders
+    if (next.crossReview !== undefined) crossReview = next.crossReview
     return readStatus()
   })
 

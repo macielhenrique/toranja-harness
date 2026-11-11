@@ -19,10 +19,12 @@ delegations that omit an explicit provider:
 ## Stored choices
 
 The controller's `setMode` changes the mode, execution profile, fallback order,
-provider per role, and cross-review setting, and stores them in the
-`toranja_orchestration` storage domain before it returns. On restart each stored
-field replaces the matching `Config` default; a field the user never changed
-keeps following the configuration. Model routing (`routing`) and concurrency
+provider per role, and cross-review setting. It stores the fields the request
+names in the `toranja_orchestration` storage domain and changes the live routing
+only after that write succeeds; a failed write rejects and leaves the routing in
+force. On restart each stored field replaces the matching `Config` default; a
+field the user never changed is not stored and keeps following the
+configuration. Model routing (`routing`) and concurrency
 limits stay configuration-only.
 
 ## Routing by role
