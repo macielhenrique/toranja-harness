@@ -60,6 +60,8 @@ interface Harness {
   readonly brokenCli: Set<string>
   /** When set, every Git command the orchestrator runs fails. */
   gitBroken: boolean
+  /** How many of the next Git commands fail before Git works again. */
+  gitFailures: number
   /** Arguments of every Git command the orchestrator ran. */
   readonly gitRuns: string[][]
 }
@@ -130,6 +132,7 @@ async function mount(
     credentialFailure: undefined,
     brokenCli: new Set(),
     gitBroken: false,
+    gitFailures: 0,
     gitRuns: [],
   }
   ctx.provide('subprocess', {
@@ -137,7 +140,8 @@ async function mount(
       // The orchestrator runs Git by the absolute path it resolved from PATH.
       if (/(?:^|[\\/])git(?:\.exe)?$/iu.test(spec.argv[0] ?? '')) {
         harness.gitRuns.push(spec.argv.slice(1))
-        const child = spawn('git', harness.gitBroken ? ['not-a-git-command'] : spec.argv.slice(1), { cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+        const failing = harness.gitBroken || harness.gitFailures-- > 0
+        const child = spawn('git', failing ? ['not-a-git-command'] : spec.argv.slice(1), { cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe'] })
         const done = new Promise<{ exitCode: number | null }>((resolve) => {
           child.on('close', (exitCode) => { resolve({ exitCode }) })
         })
@@ -1155,6 +1159,32 @@ describe('Toranja routed delegation', () => {
     expect(tasks[0]).toMatchObject({ state: 'failed', error: 'execute role changed Git state that hides file changes' })
   })
 
+  it('catches an untracked file rewritten at the same size with its time put back', async () => {
+    const harness = await mount({ routing: ROUTING })
+    const notes = join(harness.repo, 'notes.txt')
+    writeFileSync(notes, 'draft one\n')
+    harness.agentSideEffect = () => {
+      const { atime, mtime } = statSync(notes)
+      writeFileSync(notes, 'DRAFT TWO\n')
+      utimesSync(notes, atime, mtime)
+    }
+    await delegate(harness, { role: 'reader', provider: 'codex' })
+    const tasks = await settled(harness)
+    expect(tasks[0]).toMatchObject({ state: 'failed', error: 'read-only role created, removed, or changed untracked files' })
+  })
+
+  it('reads the working tree again when Git fails once, instead of skipping the check', async () => {
+    const harness = await mount({ routing: ROUTING })
+    harness.agentSideEffect = (cwd) => {
+      writeFileSync(join(cwd, 'tracked.txt'), 'edited by the reader\n')
+      // Git is busy for a moment when the run ends, as when another worktree is being removed.
+      harness.gitFailures = 1
+    }
+    await delegate(harness, { role: 'reader', provider: 'codex' })
+    const tasks = await settled(harness)
+    expect(tasks[0]).toMatchObject({ state: 'failed', error: 'read-only role changed tracked files' })
+  })
+
   it('catches an edit an agent hid from Git with an index flag', async () => {
     const harness = await mount({ routing: ROUTING })
     await harness.setMode({ mode: 'codex' })
@@ -1305,6 +1335,38 @@ describe('Toranja routed delegation', () => {
       const tasks = await settled(harness)
       expect(readFileSync(join(run?.worktree ?? '', '.env'), 'utf8')).toBe('left by the implementer\n')
       expect(tasks.find(task => task.id === run?.taskId)).toMatchObject({ worktree: run?.worktree })
+    })
+
+    it('keeps the branch of an implementer that committed and then stepped back to where it started', async () => {
+      const { harness } = await isolated()
+      harness.agentSideEffect = (cwd) => {
+        const git = (...args: string[]): void => {
+          execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', ...args], { cwd, stdio: 'ignore' })
+        }
+        writeFileSync(join(cwd, 'tracked.txt'), 'committed by the implementer\n')
+        git('commit', '-q', '-am', 'work')
+        git('checkout', '-q', '--detach', 'HEAD~1')
+      }
+      const result = await delegate(harness, { role: 'implementer', provider: 'codex' })
+      const [run] = result.activations as { taskId: string; branch: string }[]
+      const tasks = await settled(harness)
+      expect(branches(harness)).toEqual([run?.branch])
+      expect(tasks.find(task => task.id === run?.taskId)).toMatchObject({ branch: run?.branch })
+    })
+
+    it('keeps a worktree that holds a nested repository, without looking inside it', async () => {
+      const { harness } = await isolated()
+      harness.agentSideEffect = (cwd) => {
+        // A gitlink: Git would inspect the nested repository with that repository's own configuration.
+        execFileSync('git', ['update-index', '--add', '--cacheinfo', '160000,1111111111111111111111111111111111111111,nested'], { cwd, stdio: 'ignore' })
+      }
+      const result = await delegate(harness, { role: 'implementer', provider: 'codex' })
+      const [run] = result.activations as { taskId: string; worktree: string }[]
+      const tasks = await settled(harness)
+      expect(existsSync(run?.worktree ?? '')).toBe(true)
+      expect(tasks.find(task => task.id === run?.taskId)).toMatchObject({ worktree: run?.worktree })
+      const status = harness.gitRuns.find(args => args.includes('status'))
+      expect(status).toEqual(expect.arrayContaining(['--ignore-submodules=all']))
     })
 
     it('rejects a worktree root that is not an absolute path', async () => {

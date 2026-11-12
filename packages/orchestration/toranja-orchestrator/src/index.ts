@@ -91,6 +91,8 @@ export const inject = ['storageDomain', 'subagents', 'subprocess', 'systemPrompt
 
 const PROJECT_ID = /^[a-z][a-z0-9-]{1,31}$/
 const DEFAULT_MAX_TASK_CHARS = 12_000
+/** Largest untracked file compared by content; a larger one is compared by size and time. */
+const UNTRACKED_CONTENT_LIMIT = 5 * 1024 * 1024
 const GIT_GRACE_MS = 3_000
 
 /** Provider plugins Toranja can instantiate per route to fix model, effort, and access. */
@@ -812,19 +814,25 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return outcome.exitCode === 0 ? Buffer.concat(chunks) : undefined
   }
   /**
-   * Hash path, size, and modification time of every untracked file and of each
-   * ignored file or collapsed ignored directory. A change deep inside an
-   * ignored directory does not alter that directory's own entry.
+   * Hash every untracked file by content, and each ignored file or collapsed
+   * ignored directory by path, size, and modification time. Ignored trees are
+   * often build output too large to read on every run, so a change deep
+   * inside an ignored directory does not alter that directory's own entry.
+   * An untracked file over the size limit is compared like an ignored one.
    */
-  const untrackedHash = async (cwd: string, listings: readonly Buffer[]): Promise<string> => {
+  const untrackedHash = async (cwd: string, untracked: Buffer, ignored: Buffer): Promise<string> => {
     const hash = createHash('sha256')
-    const paths = listings.flatMap(listing => listing.toString('utf8').split('\0').filter(Boolean)).sort()
-    for (const path of paths) {
-      const facts = await stat(join(cwd, path)).then(
-        entry => `${entry.size}:${entry.mtimeMs}`,
-        () => 'missing',
-      )
-      hash.update(`${path}\0${facts}\0`)
+    const list = (listing: Buffer): string[] => listing.toString('utf8').split('\0').filter(Boolean).sort()
+    for (const [paths, byContent] of [[list(untracked), true], [list(ignored), false]] as const) {
+      for (const path of paths) {
+        const facts = await stat(join(cwd, path)).then(
+          async entry => byContent && entry.isFile() && entry.size <= UNTRACKED_CONTENT_LIMIT
+            ? createHash('sha256').update(await readFile(join(cwd, path))).digest('hex')
+            : `${entry.size}:${entry.mtimeMs}`,
+          () => 'missing',
+        )
+        hash.update(`${path}\0${facts}\0`)
+      }
     }
     return hash.digest('hex')
   }
@@ -864,7 +872,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ]),
     }
   }
-  const fingerprint = async (cwd: string): Promise<WorkspaceFingerprint | undefined> => {
+  /**
+   * Fingerprint the working tree, once more when the first reading fails:
+   * Git can refuse for a moment while another command changes the repository,
+   * and a check skipped for that would let a change through unseen.
+   */
+  const fingerprint = async (cwd: string): Promise<WorkspaceFingerprint | undefined> =>
+    await readFingerprint(cwd) ?? await readFingerprint(cwd)
+  const readFingerprint = async (cwd: string): Promise<WorkspaceFingerprint | undefined> => {
     try {
       const filters = await filtersOff(cwd)
       if (filters === undefined) return undefined
@@ -891,7 +906,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
       return {
         tracked: createHash('sha256').update(tracked).digest('hex'),
-        untracked: await untrackedHash(cwd, [untracked, ignored]),
+        untracked: await untrackedHash(cwd, untracked, ignored),
         state: state.digest('hex'),
       }
     } catch (error: unknown) {
@@ -994,12 +1009,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     throw new Error('toranja-orchestrator: worktreeRoot must be an absolute path')
   }
   let laneSequence = 0
-  // Worktrees whose implementer has not settled. When the plugin stops, the
-  // ones left untouched are removed; one with work in it is kept.
-  const lanes = new Set<IsolatedLane>()
-  ctx.effect(() => async () => {
-    for (const lane of [...lanes]) await releaseLane(lane)
-  }, 'toranja-orchestrator.worktrees')
   /**
    * Create a worktree and branch of the project's current commit for one
    * implementer. Returns undefined when the project is not a Git work tree
@@ -1024,9 +1033,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         await gitOutput(project.path, ['branch', '-D', branch])
         return undefined
       }
-      const lane = { project, path, branch, base: head.toString('utf8').trim(), gitDir: gitDir.toString('utf8').trim() }
-      lanes.add(lane)
-      return lane
+      return { project, path, branch, base: head.toString('utf8').trim(), gitDir: gitDir.toString('utf8').trim() }
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: worktree for project ${project.id} could not be created: ${String(error)}`)
       return undefined
@@ -1041,17 +1048,24 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * @returns Whether the worktree was removed.
    */
   const releaseLane = async (lane: IsolatedLane): Promise<boolean> => {
-    lanes.delete(lane)
     try {
       const scope = [`--git-dir=${lane.gitDir}`, `--work-tree=${lane.path}`]
       const filters = await filtersOff(lane.project.path, scope)
       if (filters === undefined) return false
-      const [changes, head] = await Promise.all([
-        gitOutput(lane.project.path, [...scope, 'status', '--porcelain', '--ignored'], filters.overrides),
+      // A nested repository would be inspected with its own configuration,
+      // which is not read here, so submodules are not entered; an index that
+      // names one counts as work to keep. The branch is compared as well as
+      // the checked-out commit: the implementer may have committed and then
+      // stepped back.
+      const [changes, head, tip, index] = await Promise.all([
+        gitOutput(lane.project.path, [...scope, 'status', '--porcelain', '--ignored', '--ignore-submodules=all'], filters.overrides),
         gitOutput(lane.project.path, [...scope, 'rev-parse', 'HEAD']),
+        gitOutput(lane.project.path, ['rev-parse', `refs/heads/${lane.branch}`]),
+        gitOutput(lane.project.path, [...scope, 'ls-files', '-s', '-z']),
       ])
-      if (changes === undefined || head === undefined) return false
-      if (changes.length > 0 || head.toString('utf8').trim() !== lane.base) return false
+      if (changes === undefined || head === undefined || tip === undefined || index === undefined) return false
+      if (changes.length > 0 || index.toString('utf8').split('\0').some(entry => entry.startsWith('160000 '))) return false
+      if (head.toString('utf8').trim() !== lane.base || tip.toString('utf8').trim() !== lane.base) return false
       if (await gitOutput(lane.project.path, ['worktree', 'remove', '--force', lane.path]) === undefined) return false
       await gitOutput(lane.project.path, ['branch', '-D', lane.branch])
       return true

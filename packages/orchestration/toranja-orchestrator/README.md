@@ -123,7 +123,8 @@ The check detects a change and does not revert it. Its limits:
 - A directory that is not a Git work tree with a commit cannot be checked. A delegated task then runs unchecked; the delivery gate, which is strict, reports that access could not be verified and does not pass.
 - The repository belongs to the agents being checked, so the check runs nothing its Git configuration names: Git is resolved once from `PATH`, the file-system monitor is off, hooks are looked up in an empty directory the Host owns, external diff and textconv drivers are off, submodules are not entered, and every content filter (`filter.*.clean`, `smudge`, `process`) defined in any configuration scope is switched off for the check's commands. `required` is switched off with it, so a Git LFS repository is still read; its files are then compared as stored, the same way before and after the run. A filter whose name contains `=` cannot be switched off from the command line, so such a tree counts as unreadable.
 - A file Git was told to skip (`assume-unchanged` or `skip-worktree`) is invisible to `git diff`. The check compares those index flags, the content of each file under them, and the set of configured filters, and reports `changed Git state that hides file changes` when a non-writing role altered any of them.
-- Untracked and ignored files are compared by path, size, and modification time, not content: a same-size rewrite that restores the modification time is not seen.
+- Untracked files are compared by content, up to 5 MB each. Ignored files and directories, and larger untracked files, are compared by path, size, and modification time: there a same-size rewrite that restores the modification time is not seen, and a change deep inside an ignored directory is not either.
+- A reading that fails is tried once more before the check counts as unreadable, since Git can refuse for a moment while another command changes the repository.
 
 ## Implementer worktrees
 
@@ -137,9 +138,12 @@ project) instead of the project's working tree:
   does not hold the project's tree, so readers running meanwhile are still
   checked.
 - The activation reports `worktree` and `branch`. A worktree with changes,
-  commits, or files Git ignores is kept for review and merge, and its task
+  commits on its branch, a nested repository, or files Git ignores is kept for
+  review and merge, and its task
   keeps both fields in the status; one the implementer left untouched is
-  removed with its branch, also when the plugin stops while it is running.
+  removed with its branch once the implementer settles. When the plugin stops
+  while an implementer is running, its worktree is left in place, never removed
+  under it; such a leftover is removed by hand with `git worktree remove`.
 - The checkout runs with the repository's content filters off, so a Git LFS
   file is its pointer in the worktree. The worktree is later inspected through
   the Git directory recorded when it was created, not through the `.git` entry
