@@ -1369,6 +1369,28 @@ describe('Toranja routed delegation', () => {
       expect(status).toEqual(expect.arrayContaining(['--ignore-submodules=all']))
     })
 
+    it.each(['--assume-unchanged', '--skip-worktree'])('keeps a worktree whose edit is hidden from Git with %s', async (flag) => {
+      const { harness } = await isolated()
+      harness.agentSideEffect = (cwd) => {
+        writeFileSync(join(cwd, 'tracked.txt'), 'edited and then hidden\n')
+        execFileSync('git', ['update-index', flag, 'tracked.txt'], { cwd, stdio: 'ignore' })
+      }
+      const result = await delegate(harness, { role: 'implementer', provider: 'codex' })
+      const [run] = result.activations as { taskId: string; worktree: string }[]
+      await settled(harness)
+      expect(readFileSync(join(run?.worktree ?? '', 'tracked.txt'), 'utf8')).toBe('edited and then hidden\n')
+    })
+
+    it('lists untracked files of a worktree whatever the repository configures', async () => {
+      const { harness } = await isolated()
+      execFileSync('git', ['config', 'status.showUntrackedFiles', 'no'], { cwd: harness.repo, stdio: 'ignore' })
+      harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'new-file.txt'), 'new work\n') }
+      const result = await delegate(harness, { role: 'implementer', provider: 'codex' })
+      const [run] = result.activations as { taskId: string; worktree: string }[]
+      await settled(harness)
+      expect(existsSync(join(run?.worktree ?? '', 'new-file.txt'))).toBe(true)
+    })
+
     it('rejects a worktree root that is not an absolute path', async () => {
       await expect(mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot: 'relative/worktrees' }))
         .rejects.toThrow('worktreeRoot must be an absolute path')

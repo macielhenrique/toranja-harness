@@ -898,8 +898,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const hidden = index.toString('utf8').split('\0').filter(entry => /^[a-zS] /u.test(entry))
       const state = createHash('sha256').update(filters.names.join('\0')).update('\0\0')
       for (const entry of hidden) {
-        const content = await readFile(join(cwd, entry.slice(2))).then(
-          bytes => createHash('sha256').update(bytes).digest('hex'),
+        // Only a regular file is opened: a pipe put in its place would hold the Host.
+        const file = join(cwd, entry.slice(2))
+        const content = await stat(file).then(
+          async facts => facts.isFile()
+            ? createHash('sha256').update(await readFile(file)).digest('hex')
+            : `not-a-file:${facts.size}:${facts.mtimeMs}`,
           () => 'missing',
         )
         state.update(`${entry}\0${content}\0`)
@@ -1057,13 +1061,21 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // names one counts as work to keep. The branch is compared as well as
       // the checked-out commit: the implementer may have committed and then
       // stepped back.
-      const [changes, head, tip, index] = await Promise.all([
-        gitOutput(lane.project.path, [...scope, 'status', '--porcelain', '--ignored', '--ignore-submodules=all'], filters.overrides),
+      const [changes, head, tip, index, flags] = await Promise.all([
+        gitOutput(
+          lane.project.path,
+          // Untracked files are listed whatever `status.showUntrackedFiles` says in a configuration the implementer can write.
+          [...scope, 'status', '--porcelain', '--ignored', '--untracked-files=all', '--ignore-submodules=all'],
+          filters.overrides,
+        ),
         gitOutput(lane.project.path, [...scope, 'rev-parse', 'HEAD']),
         gitOutput(lane.project.path, ['rev-parse', `refs/heads/${lane.branch}`]),
         gitOutput(lane.project.path, [...scope, 'ls-files', '-s', '-z']),
+        gitOutput(lane.project.path, [...scope, 'ls-files', '-v', '-z']),
       ])
-      if (changes === undefined || head === undefined || tip === undefined || index === undefined) return false
+      if (changes === undefined || head === undefined || tip === undefined || index === undefined || flags === undefined) return false
+      // A file Git was told to skip is invisible to the status above, so it may hold work.
+      if (flags.toString('utf8').split('\0').some(entry => /^[a-zS] /u.test(entry))) return false
       if (changes.length > 0 || index.toString('utf8').split('\0').some(entry => entry.startsWith('160000 '))) return false
       if (head.toString('utf8').trim() !== lane.base || tip.toString('utf8').trim() !== lane.base) return false
       if (await gitOutput(lane.project.path, ['worktree', 'remove', '--force', lane.path]) === undefined) return false
