@@ -22,9 +22,11 @@ export async function apply(ctx: Context): Promise<void> {
   // The Host stores the routing mode durably. A version before that kept it in
   // browser storage: hand that value to the Host once, and drop the key only
   // after the Host answered, so a failed attempt is retried on the next load.
+  // Blocked storage or an unreachable Host must not keep the control from
+  // registering, so the migration only logs its failure.
   const legacyModeKey = 'toranja-harness.agent-mode'
-  const legacyMode = localStorage.getItem(legacyModeKey)
-  if (legacyMode !== null) {
+  try {
+    const legacyMode = localStorage.getItem(legacyModeKey)
     if (
       legacyMode === 'codex'
       || legacyMode === 'antigravity'
@@ -35,9 +37,11 @@ export async function apply(ctx: Context): Promise<void> {
       const adopted = await toranja.adoptLegacyMode({ mode: legacyMode })
       if (adopted.ok) localStorage.removeItem(legacyModeKey)
       else console.warn('Toranja agent mode from the earlier version could not be migrated')
-    } else {
+    } else if (legacyMode !== null) {
       localStorage.removeItem(legacyModeKey)
     }
+  } catch (error: unknown) {
+    console.warn('Toranja agent mode from the earlier version could not be migrated', error)
   }
   const actions: ToranjaControlInjected = {
     async readStatus() {

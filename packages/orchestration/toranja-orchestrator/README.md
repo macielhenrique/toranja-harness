@@ -34,8 +34,9 @@ by default `codex`, `agy`, and `claude` in `PATH`) and runs its official status
 command: `codex login status`, `claude auth status`, and `agy models`, which
 succeeds only for a signed-in account. Each provider then reports `connected`,
 `signed-out`, `not-installed`, or `unknown` under `providers[].connection`.
-Routing skips a provider that is signed out or not installed and keeps one that
-is `unknown`, which is every provider before the first probe. OpenRouter has no
+A status that could not be read reports `probe-failed`. Routing uses only
+providers that are `connected` or `unknown`, which is every provider before the
+first probe. OpenRouter has no
 CLI: it is `connected` while the credential `openrouterKeyRef` (by default
 `OPENROUTER_API_KEY`) is stored, and it stays out of routing until
 `routing.openrouter.models` names a model. `probeOnStart` runs one probe when
@@ -82,7 +83,7 @@ takes `models` alone, because the internal agent receives its model per start.
 | `codex` | Native `read-only` sandbox: writes are denied outside the model. |
 | `antigravity` | `plan` mode without tool auto-approval. The CLI applies it as a directive to the model, so it is advisory. |
 | `claude-code` | Native `plan` permission mode: Claude Code refuses edits and file creation. |
-| `openrouter` | None. The task runs on the internal `spawn` agent (`openrouterProvider`) with `agentOptions` selecting `openrouterLlmProvider` and the routed model; only the working-tree check below applies. |
+| `openrouter` | None. The task runs on the internal `spawn` agent (`openrouterProvider`) with `agentOptions` selecting `openrouterLlmProvider` and the routed model, and nothing keeps that agent from writing. OpenRouter therefore takes only the `write` role; `openrouterUnenforcedAccess` lets it take the others with the working-tree check below as the sole safeguard. |
 
 For `read-only` and `execute` roles Toranja also fingerprints the Git working
 tree before and after the run: the diff against `HEAD`, plus the path, size, and

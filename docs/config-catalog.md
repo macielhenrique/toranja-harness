@@ -1747,7 +1747,7 @@ export interface Config {
 ## `@deepseek-ai/dsh-llm-antigravity-cli`
 
 - `inject`: `agents` · `llm` · `sessions` · `subprocess` · `toranjaOrchestrator` · `workingDirectory`
-- `source`: [`packages/llm/llm-antigravity-cli/src/index.ts:64`](../packages/llm/llm-antigravity-cli/src/index.ts)
+- `source`: [`packages/llm/llm-antigravity-cli/src/index.ts:85`](../packages/llm/llm-antigravity-cli/src/index.ts)
 
 ```ts config-catalog
 /** Configuration for the direct Antigravity CLI LLM adapter. */
@@ -4364,7 +4364,7 @@ export type ToolPresentationMode = 'native' | 'ptc'
 ## `@deepseek-ai/dsh-toranja-orchestrator`
 
 - `inject`: `storageDomain` · `subagents` · `subprocess` · `systemPrompt` · `tools` · `workspaceRegistry`
-- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:135`](../packages/orchestration/toranja-orchestrator/src/index.ts)
+- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:136`](../packages/orchestration/toranja-orchestrator/src/index.ts)
 
 ```ts config-catalog
 /** Product-owned orchestration settings. */
@@ -4422,6 +4422,12 @@ export interface Config {
   openrouterLlmProvider?: string
   /** Credential reference holding the OpenRouter API key. */
   openrouterKeyRef?: string
+  /**
+   * Let OpenRouter run `read-only` and `execute` roles. The internal agent it
+   * runs on has no mode that prevents writing, so by default it takes only the
+   * `write` role; with this set, the working-tree check is the only safeguard.
+   */
+  openrouterUnenforcedAccess?: boolean
 }
 
 /** One stable product lane backed by a local project directory. */

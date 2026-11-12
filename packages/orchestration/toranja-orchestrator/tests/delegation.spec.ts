@@ -52,6 +52,10 @@ interface Harness {
   readonly requests: { provider: string; agentOptions?: Record<string, unknown> }[]
   /** Credential references the simulated credential store holds. */
   readonly credentials: Set<string>
+  /** When set, the simulated credential store fails with this message. */
+  credentialFailure: string | undefined
+  /** Executables whose status command cannot be started. */
+  readonly brokenCli: Set<string>
 }
 
 const repos: string[] = []
@@ -116,6 +120,8 @@ async function mount(
     connect: () => { throw new Error('controller not mounted') },
     requests: [],
     credentials: new Set(),
+    credentialFailure: undefined,
+    brokenCli: new Set(),
   }
   ctx.provide('subprocess', {
     spawn: (spec: { argv: readonly string[]; cwd: string }) => {
@@ -126,6 +132,7 @@ async function mount(
         })
         return { stdout: child.stdout, stderr: child.stderr, done, terminate: () => {}, waitForExit: () => done }
       }
+      if (harness.brokenCli.has(spec.argv[0] ?? '')) throw new Error('spawn EPERM')
       const scripted = harness.cli.get(spec.argv[0] ?? '')
       if (scripted !== undefined && !spec.argv.includes('-p')) {
         harness.cliRuns.push([...spec.argv])
@@ -190,7 +197,9 @@ async function mount(
     },
   } as never)
   ctx.provide('credentials', {
-    describe: (ref: string) => Promise.resolve({ configured: harness.credentials.has(ref) }),
+    describe: (ref: string) => harness.credentialFailure === undefined
+      ? Promise.resolve({ configured: harness.credentials.has(ref) })
+      : Promise.reject(new Error(harness.credentialFailure)),
   } as never)
   ctx.provide('tools', { register: (tool: Tool) => { tools.set(tool.name, tool); return () => {} } } as never)
   ctx.provide('systemPrompt', { section: () => () => {}, getSectionOrder: () => 0 } as never)
@@ -804,6 +813,7 @@ describe('Toranja routed delegation', () => {
     const harness = await mount({
       routing: { ...ROUTING, openrouter: { models: { light: { model: 'meta/llama-small' }, advanced: { model: 'meta/llama-large', effort: 'high' } } } },
       openrouterProvider: 'spawn',
+      openrouterUnenforcedAccess: true,
     }, ['codex', 'antigravity', 'spawn'])
     const reader = await delegate(harness, { role: 'reader', provider: 'openrouter' })
     expect(reader.activations).toEqual([expect.objectContaining({ provider: 'openrouter', providerName: 'spawn', model: 'meta/llama-small' })])
@@ -818,8 +828,8 @@ describe('Toranja routed delegation', () => {
 
   it('refuses an OpenRouter task when no model is routed for its tier', async () => {
     const harness = await mount({ routing: ROUTING, openrouterProvider: 'spawn' }, ['codex', 'spawn'])
-    await expect(delegate(harness, { role: 'reader', provider: 'openrouter' }))
-      .rejects.toThrow('routing.openrouter.models has no model for the light tier')
+    await expect(delegate(harness, { role: 'implementer', provider: 'openrouter' }))
+      .rejects.toThrow('routing.openrouter.models has no model for the advanced tier')
   })
 
   it('reports OpenRouter as connected only while its API key is stored', async () => {
@@ -855,7 +865,51 @@ describe('Toranja routed delegation', () => {
       openrouterProvider: 'spawn',
     }, ['spawn'])
     expect(withModel.status().providers.find(provider => provider.id === 'openrouter')?.available).toBe(true)
-    expect(withModel.status().routes.map(route => route.provider)).toEqual(Array.from({ length: 9 }, () => 'openrouter'))
+    // Without a way to keep it from writing, OpenRouter takes only the writing role.
+    expect(withModel.status().routes.filter(route => route.provider === 'openrouter').map(route => route.role))
+      .toEqual(['implementer'])
+  })
+
+  it('refuses to run OpenRouter in a role that must not write, unless the deployment accepts that risk', async () => {
+    const routing = { ...ROUTING, openrouter: { models: { light: { model: 'meta/llama-small' }, advanced: { model: 'meta/llama-large' } } } }
+    const harness = await mount({ routing, openrouterProvider: 'spawn' }, ['codex', 'antigravity', 'spawn'])
+    await expect(delegate(harness, { role: 'reader', provider: 'openrouter' }))
+      .rejects.toThrow('OpenRouter cannot be kept from writing, so it does not run the read-only role reader')
+    await expect(delegate(harness, { role: 'tester', provider: 'openrouter' }))
+      .rejects.toThrow('does not run the execute role tester')
+    const implemented = await delegate(harness, { role: 'implementer', provider: 'openrouter' })
+    expect(implemented.activations).toEqual([expect.objectContaining({ provider: 'openrouter' })])
+  })
+
+  it('treats a provider whose status command could not run as unusable', async () => {
+    const bin = installed('codex', 'claude')
+    const harness = await mount({
+      routing: ROUTING,
+      executables: { codex: bin.codex, 'claude-code': bin.claude, antigravity: join(tmpdir(), 'no-such-agy') },
+    }, ['codex', 'antigravity', 'claude-code'])
+    harness.brokenCli.add(bin.codex)
+    harness.cli.set(bin.claude, { exitCode: 0, stdout: JSON.stringify({ loggedIn: true }) })
+    const status = await harness.probe()
+    expect(status.providers.find(provider => provider.id === 'codex')).toMatchObject({ connection: 'probe-failed', available: false })
+    expect(status.routes.map(route => route.provider)).toEqual(Array.from({ length: 9 }, () => 'claude-code'))
+  })
+
+  it('still reports the CLI providers when the credential store cannot be read', async () => {
+    const bin = installed('codex')
+    const harness = await mount({
+      routing: ROUTING,
+      openrouterProvider: 'spawn',
+      executables: { codex: bin.codex, 'claude-code': join(tmpdir(), 'no-such-claude'), antigravity: join(tmpdir(), 'no-such-agy') },
+    }, ['codex', 'spawn'])
+    harness.cli.set(bin.codex, { exitCode: 0, stdout: 'Logged in using ChatGPT' })
+    harness.credentialFailure = 'credential store is locked'
+    const status = await harness.probe()
+    expect(Object.fromEntries(status.providers.map(provider => [provider.id, provider.connection]))).toEqual({
+      codex: 'connected',
+      antigravity: 'not-installed',
+      'claude-code': 'not-installed',
+      openrouter: 'probe-failed',
+    })
   })
 
   it('delegates through the unrouted instance when Toranja owns none', async () => {

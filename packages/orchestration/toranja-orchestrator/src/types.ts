@@ -81,10 +81,11 @@ export interface MetricSnapshot {
 
 /**
  * Sign-in state of a provider: `connected` and `signed-out` come from its
- * official status command, `not-installed` means its CLI was not found, and
- * `unknown` means it was not probed or has no local state to read.
+ * official status command, `not-installed` means its CLI was not found,
+ * `probe-failed` means the status could not be read, and `unknown` means the
+ * provider was never probed. Only `connected` and `unknown` providers are routed.
  */
-export type ToranjaProviderConnection = 'connected' | 'signed-out' | 'not-installed' | 'unknown'
+export type ToranjaProviderConnection = 'connected' | 'signed-out' | 'not-installed' | 'probe-failed' | 'unknown'
 
 /** Runtime status and counters for one agent provider. */
 export interface ToranjaProviderStatus {

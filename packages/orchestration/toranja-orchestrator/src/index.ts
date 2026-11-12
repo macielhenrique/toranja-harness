@@ -51,6 +51,7 @@ import {
   accessViolation,
   isProviderFailure,
   resolveRoute,
+  roleAccess,
   variantConfig,
   variantName,
   type ProviderModels,
@@ -186,6 +187,12 @@ export interface Config {
   openrouterLlmProvider?: string
   /** Credential reference holding the OpenRouter API key. */
   openrouterKeyRef?: string
+  /**
+   * Let OpenRouter run `read-only` and `execute` roles. The internal agent it
+   * runs on has no mode that prevents writing, so by default it takes only the
+   * `write` role; with this set, the working-tree check is the only safeguard.
+   */
+  openrouterUnenforcedAccess?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -227,6 +234,7 @@ export const Config: z<Config> = z.object({
   probeTimeoutMs: z.number().default(20_000),
   openrouterLlmProvider: z.string().min(1).default('openrouter'),
   openrouterKeyRef: z.string().min(1).default('OPENROUTER_API_KEY'),
+  openrouterUnenforcedAccess: z.boolean().default(false),
 })
 
 interface ResolvedProject extends ProjectConfig {
@@ -726,6 +734,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }): Promise<{ activation: SubagentActivation; providerName: string; verify: () => Promise<string | undefined> }> => {
     const instance = await instanceFor(request.route)
     const { route } = request
+    if (!canRun(route.provider, route.role)) {
+      throw new Error(`toranja-orchestrator: OpenRouter cannot be kept from writing, so it does not run the ${route.access} role ${route.role}; set openrouterUnenforcedAccess to accept that`)
+    }
     if (route.provider === 'openrouter' && route.model === undefined) {
       throw new Error(`toranja-orchestrator: routing.openrouter.models has no model for the ${route.tier} tier`)
     }
@@ -766,10 +777,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * Providers to try for a role, in order. Only a Team-mode delegation that
    * named no provider may move to another connected provider.
    */
-  const candidatesFor = (first: RunProvider, allowFallback: boolean): readonly RunProvider[] => {
+  const candidatesFor = (first: RunProvider, allowFallback: boolean, role: Role): readonly RunProvider[] => {
     if (!allowFallback || live().mode !== 'team') return [first]
     const available = availableRunProviders()
-    return [first, ...live().fallbackOrder.filter(provider => provider !== first && available.has(provider))]
+    return [
+      first,
+      ...live().fallbackOrder.filter(provider => provider !== first && available.has(provider) && canRun(provider, role)),
+    ]
   }
   /**
    * Start a role on the first candidate provider that accepts it. Each refused
@@ -894,8 +908,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const connected = command.connected(outcome.exitCode, Buffer.concat(chunks).toString('utf8'))
       return { connection: connected ? 'connected' : 'signed-out', executable }
     } catch (error: unknown) {
+      // An unreadable status must not count as connected: the provider stays
+      // out of routing until a later probe succeeds.
       ctx.logger.warn(`toranja-orchestrator: ${provider} status command failed: ${String(error)}`)
-      return { connection: 'unknown', executable }
+      return { connection: 'probe-failed', executable }
     }
   }
   const openrouterLlmProvider = config.openrouterLlmProvider ?? 'openrouter'
@@ -904,7 +920,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const probeOpenrouter = async (): Promise<ProviderConnection> => {
     const credentials = ctx.get('credentials')
     if (credentials === undefined) return { connection: 'unknown' }
-    return { connection: (await credentials.describe(openrouterKeyRef)).configured ? 'connected' : 'signed-out' }
+    try {
+      return { connection: (await credentials.describe(openrouterKeyRef)).configured ? 'connected' : 'signed-out' }
+    } catch (error: unknown) {
+      ctx.logger.warn(`toranja-orchestrator: OpenRouter credential could not be read: ${String(error)}`)
+      return { connection: 'probe-failed' }
+    }
   }
   const probeProviders = async (): Promise<void> => {
     const [probed, openrouter] = await Promise.all([
@@ -936,6 +957,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return { provider, command }
   }
 
+  const openrouterUnenforcedAccess = config.openrouterUnenforcedAccess ?? false
+  /**
+   * Whether a provider may take a role. OpenRouter runs on the internal agent,
+   * which nothing keeps from writing, so it takes non-writing roles only when
+   * the deployment accepts detection after the fact as the sole safeguard.
+   */
+  const canRun = (provider: RunProvider, role: Role): boolean =>
+    provider !== 'openrouter' || openrouterUnenforcedAccess || roleAccess(role) === 'write'
+
   const availableRunProviders = (): ReadonlySet<RunProvider> => {
     const registered = new Set(ctx.subagents.list())
     const available = new Set<RunProvider>()
@@ -953,7 +983,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (mode !== 'team') return mode
     return resolveFallbackProvider(
       roleProviders.get(role) ?? defaultProvider(role, mode),
-      availableRunProviders(),
+      new Set([...availableRunProviders()].filter(provider => canRun(provider, role))),
       live().fallbackOrder,
     )
   }
@@ -1116,7 +1146,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   if (config.probeOnStart === true) {
     // Not awaited: slow CLIs must not delay startup; routing treats an
     // unprobed provider as usable until the probe settles.
-    void probeProviders()
+    void probeProviders().catch((error: unknown) => {
+      ctx.logger.warn(`toranja-orchestrator: startup provider probe failed: ${String(error)}`)
+    })
   }
 
   for (const project of configuredProjects) {
@@ -1211,7 +1243,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         try {
           const started = await startRouted(
             request,
-            candidatesFor(first, args.provider === undefined),
+            candidatesFor(first, args.provider === undefined, role),
             requiredAt(leases, index, 'delegation reservation'),
           )
           const { route } = started
@@ -1290,7 +1322,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // Cross-review moves the implementing provider to the end of the
       // reviewer's candidates, so it reviews its own work only as a last resort.
       const gateCandidates = (role: typeof roles[number]): readonly RunProvider[] => {
-        const candidates = candidatesFor(providerFor(role), true)
+        const candidates = candidatesFor(providerFor(role), true, role)
         if (role !== 'reviewer' || !live().crossReview || implementerProvider === undefined) return candidates
         return [
           ...candidates.filter(provider => provider !== implementerProvider),
@@ -1387,7 +1419,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             parent,
             signal: exec.signal,
             delivery: 'parent',
-          }, candidatesFor(providerFor('planner'), true))
+          }, candidatesFor(providerFor('planner'), true, 'planner'))
           settleInBackground(started)
           replan = {
             role: 'planner',
