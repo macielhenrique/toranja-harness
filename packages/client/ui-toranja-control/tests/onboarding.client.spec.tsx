@@ -59,9 +59,11 @@ interface MountOptions {
   explicit?: boolean
   /** Fail the named Host reads before the step mounts. */
   failing?: readonly ('readStatus' | 'probeProviders')[]
+  /** Answer of the first sign-in check, held by the test. */
+  firstCheck?: Promise<ToranjaOrchestrationStatus>
 }
 
-function mount(initial = status(), { explicit = false, failing = [] }: MountOptions = {}) {
+function mount(initial = status(), { explicit = false, failing = [], firstCheck }: MountOptions = {}) {
   let current = initial
   const complete = vi.fn()
   const host = {
@@ -80,6 +82,7 @@ function mount(initial = status(), { explicit = false, failing = [] }: MountOpti
     set: (next: ToranjaOrchestrationStatus) => { current = next },
   }
   for (const read of failing) host[read].mockRejectedValue(new Error('offline'))
+  if (firstCheck !== undefined) host.probeProviders.mockReturnValueOnce(firstCheck)
   // The step reads only the coordinator's props and its injected actions.
   const props = {
     stepId: 'toranja-orchestrator', explicit, complete, openSection: vi.fn(), ...host,
@@ -95,10 +98,39 @@ describe('Toranja first-run setup', () => {
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 
-  it('does not block the app when the Host cannot be read at all', async () => {
+  it('says so and offers another try when the Host cannot be read, without counting the setup as done', async () => {
     const host = mount(status(), { failing: ['readStatus', 'probeProviders'] })
+    const dialog = await screen.findByRole('dialog', { name: 'Conecte seus agentes' })
+    expect(within(dialog).getByRole('alert').textContent).toContain('offline')
+    expect(host.complete).not.toHaveBeenCalled()
+    host.readStatus.mockResolvedValue(status())
+    host.probeProviders.mockResolvedValue(status())
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Tentar de novo' }))
+    // The dialog is drawn again with the providers once the Host answers.
+    expect(await screen.findByRole('list', { name: 'Provedores' })).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('lets the user leave an unreadable setup for this session, to see it again next time', async () => {
+    const host = mount(status(), { failing: ['readStatus', 'probeProviders'] })
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Pular por agora' }))
     await waitFor(() => { expect(host.complete).toHaveBeenCalledTimes(1) })
-    expect(screen.queryByRole('dialog')).toBeNull()
+    // Nothing was stored: the Host could not be reached, so the setup shows again on the next start.
+    expect(host.updateSettings).not.toHaveBeenCalled()
+  })
+
+  it('keeps a choice the user made while the first sign-in check was still running', async () => {
+    const check = Promise.withResolvers<ToranjaOrchestrationStatus>()
+    const host = mount(status(), { firstCheck: check.promise })
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Continuar' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Como você quer trabalhar' })
+    fireEvent.click(within(dialog).getByRole('radio', { name: 'Só Codex' }))
+    await waitFor(() => { expect(within(dialog).getByRole('radio', { name: 'Só Codex' }).getAttribute('aria-checked')).toBe('true') })
+    // The check answers late, with the snapshot from before the choice.
+    check.resolve(status())
+    await new Promise((resolve) => { setTimeout(resolve, 20) })
+    expect(within(dialog).getByRole('radio', { name: 'Só Codex' }).getAttribute('aria-checked')).toBe('true')
+    expect(host.setMode).toHaveBeenCalledTimes(1)
   })
 
   it('shows the last known sign-in states when reading them fresh fails', async () => {

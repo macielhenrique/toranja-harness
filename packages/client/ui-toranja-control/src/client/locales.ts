@@ -381,6 +381,8 @@ export const ONBOARDING_COPY = {
   modeIntro: 'Em Equipe, o Toranja distribui cada tarefa ao agente mais adequado e troca de agente quando um fica sem cota. Você também pode usar um agente só.',
   later: 'Papéis, modelos por nível e ordem de fallback ficam em Configurações → Orquestrador.',
   skip: 'Pular por agora',
+  retry: 'Tentar de novo',
+  unreadable: 'Não foi possível ler o estado dos agentes agora.',
   next: 'Continuar',
   back: 'Voltar',
   finish: 'Concluir',

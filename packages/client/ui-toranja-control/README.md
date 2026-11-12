@@ -49,8 +49,11 @@ Each control stores its change as it is used, so closing the app midway loses
 nothing and the setup opens again on the next start. **Concluir** and **Pular
 por agora** both store `onboarded` and end the step; if that cannot be stored,
 the dialog stays open with the Host's reason. The step ends itself without
-showing when the setup was already finished, and also when the Host cannot be
-read, so it never blocks the app.
+showing when the setup was already finished. When the Host cannot be read, the
+dialog says so and offers another try; leaving it then stores nothing, so the
+setup shows again on the next start. An answer from the Host is shown only
+while no later request was made, so a slow sign-in check cannot undo a choice
+made meanwhile.
 
 Still set in the deployment configuration, not on this page: the provider
 instances (`routing.<provider>.base`), CLI executables, the OpenRouter credential

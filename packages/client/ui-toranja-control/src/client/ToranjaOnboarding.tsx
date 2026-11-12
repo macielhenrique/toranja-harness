@@ -51,35 +51,47 @@ export function ToranjaOnboarding({
     complete()
   }, [complete])
 
-  useEffect(() => {
-    mounted.current = true
-    void (async () => {
-      let known: ToranjaOrchestrationStatus
-      try {
-        known = await readStatus()
-      } catch {
-        if (mounted.current) end()
-        return
+  // Every request takes a number; an answer is shown only while no later
+  // request was made, so a slow sign-in check cannot undo a newer choice.
+  const latest = useRef(0)
+  const [unreadable, setUnreadable] = useState<string>()
+
+  const load = useCallback(async (): Promise<void> => {
+    const request = ++latest.current
+    let known: ToranjaOrchestrationStatus
+    try {
+      known = await readStatus()
+    } catch (reason) {
+      // The user is told and may try again; the setup is not counted as done.
+      if (alive() && request === latest.current) {
+        setUnreadable(reason instanceof Error ? reason.message : ORCHESTRATOR_COPY.loadFailed)
       }
-      if (!mounted.current) return
-      if (known.onboarded && !explicit) {
-        end()
-        return
-      }
-      setStatus(known)
-      // The stored states may predate a sign-in made outside the app.
-      try {
-        const fresh = await probeProviders()
-        if (alive()) setStatus(fresh)
-      } catch {
-        // The last known states stay on screen; Verificar conexões retries.
-      }
-    })()
-    return () => { mounted.current = false }
+      return
+    }
+    if (!alive() || request !== latest.current) return
+    setUnreadable(undefined)
+    if (known.onboarded && !explicit) {
+      end()
+      return
+    }
+    setStatus(known)
+    // The stored states may predate a sign-in made outside the app.
+    try {
+      const fresh = await probeProviders()
+      if (alive() && request === latest.current) setStatus(fresh)
+    } catch {
+      // The last known states stay on screen; Verificar conexões retries.
+    }
   }, [end, explicit, probeProviders, readStatus])
 
+  useEffect(() => {
+    mounted.current = true
+    void load()
+    return () => { mounted.current = false }
+  }, [load])
+
   // The dialog owns the viewport while it shows.
-  const showing = status !== undefined
+  const showing = status !== undefined || unreadable !== undefined
   useEffect(() => {
     if (!showing) return
     const appRoot = document.getElementById('root')
@@ -89,14 +101,31 @@ export function ToranjaOnboarding({
     return () => { appRoot.inert = previous }
   }, [showing])
 
-  if (status === undefined) return null
+  if (status === undefined) {
+    if (unreadable === undefined) return null
+    return (
+      <Modal open title={ONBOARDING_COPY.providersTitle} onClose={ignoreImplicitDismiss} headless className={css.dialog as string}>
+        <div className={css.content}>
+          <h2 className={css.title}>{ONBOARDING_COPY.providersTitle}</h2>
+          <div role="alert" className={section.error}>{ONBOARDING_COPY.unreadable} {unreadable}</div>
+          <div className={css.actions}>
+            {/* Nothing is stored here: the setup shows again on the next start. */}
+            <Button variant="ghost" onClick={end}>{ONBOARDING_COPY.skip}</Button>
+            <span className={css.spacer} />
+            <Button variant="primary" onClick={() => { setUnreadable(undefined); void load() }}>{ONBOARDING_COPY.retry}</Button>
+          </div>
+        </div>
+      </Modal>
+    )
+  }
 
   const run = async (change: () => Promise<ToranjaOrchestrationStatus>): Promise<boolean> => {
+    const request = ++latest.current
     setBusy(true)
     setNotice(undefined)
     try {
       const next = await change()
-      if (mounted.current) {
+      if (mounted.current && request === latest.current) {
         setStatus(next)
         setError(undefined)
       }
