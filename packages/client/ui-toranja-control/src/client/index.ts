@@ -22,8 +22,10 @@ export const inject = ['remote', 'slots']
  */
 export async function apply(ctx: Context): Promise<void> {
   await ctx.remote.$mount(TYPERT_REMOTE)
-  // Mounting the contribution installs its namespace on the Remote service.
-  const { toranja } = ctx.remote
+  // Mounting the contribution provides its namespace as the `remote.toranja`
+  // service. The lookup is untyped, so the namespace type is stated here.
+  const toranja = ctx.get('remote.toranja') as Context['remote']['toranja'] | undefined
+  if (toranja === undefined) throw new Error('Toranja Remote namespace did not mount')
   // The Host stores the routing mode durably. A version before that kept it in
   // browser storage: hand that value to the Host once, and drop the key only
   // after the Host answered, so a failed attempt is retried on the next load.

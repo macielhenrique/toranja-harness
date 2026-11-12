@@ -28,7 +28,10 @@ async function bench() {
     connectProvider: vi.fn(() => Promise.resolve({ ok: true, value: { provider: 'codex', command: ['codex', 'login'] } })),
     adoptLegacyMode: vi.fn(() => Promise.resolve({ ok: true, value: snapshot })),
   }
-  ctx.provide('remote', { $mount: () => Promise.resolve(), toranja })
+  // As in the real Remote service: mounting a contribution provides each
+  // namespace as its own `remote.<name>` service, not as a property of `remote`.
+  ctx.provide('remote', { $mount: () => Promise.resolve() })
+  ctx.provide('remote.toranja', toranja)
   const registrations: Registration[] = []
   ctx.provide('slots', {
     inject(_name: string, callback: () => () => void) { return callback() },
