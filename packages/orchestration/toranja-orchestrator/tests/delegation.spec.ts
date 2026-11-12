@@ -58,6 +58,10 @@ interface Harness {
   credentialFailure: string | undefined
   /** Executables whose status command cannot be started. */
   readonly brokenCli: Set<string>
+  /** When set, every Git command the orchestrator runs fails. */
+  gitBroken: boolean
+  /** Arguments of every Git command the orchestrator ran. */
+  readonly gitRuns: string[][]
 }
 
 const repos: string[] = []
@@ -125,11 +129,14 @@ async function mount(
     credentials: new Set(),
     credentialFailure: undefined,
     brokenCli: new Set(),
+    gitBroken: false,
+    gitRuns: [],
   }
   ctx.provide('subprocess', {
     spawn: (spec: { argv: readonly string[]; cwd: string }) => {
       if (spec.argv[0] === 'git') {
-        const child = spawn('git', spec.argv.slice(1), { cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+        harness.gitRuns.push(spec.argv.slice(1))
+        const child = spawn('git', harness.gitBroken ? ['not-a-git-command'] : spec.argv.slice(1), { cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe'] })
         const done = new Promise<{ exitCode: number | null }>((resolve) => {
           child.on('close', (exitCode) => { resolve({ exitCode }) })
         })
@@ -1029,6 +1036,51 @@ describe('Toranja routed delegation', () => {
     expect(roles(harness, 'codex')).toHaveLength(9)
     const accepting = await mount({ routing, openrouterProvider: 'spawn', openrouterUnenforcedAccess: true }, ['codex', 'spawn'])
     expect(roles(accepting, 'openrouter')).toHaveLength(9)
+  })
+
+  it('remembers that the first-run setup was finished, across restarts', async () => {
+    const disk = new MemoryMediaPool()
+    const first = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(first.status().onboarded).toBe(false)
+    await first.update({ onboarded: true })
+    expect(first.status().onboarded).toBe(true)
+    // Another setting changed later does not undo it.
+    await first.update({ crossReview: false })
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(restarted.status()).toMatchObject({ onboarded: true, crossReview: false })
+  })
+
+  it('does not pass a delivery gate whose read-only access could not be checked', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await harness.setMode({ mode: 'codex' })
+    harness.gitBroken = true
+    const result = await runGate(harness)
+    expect(result).toMatchObject({ passed: false })
+    expect(result.results[0]).toMatchObject({ verdict: 'invalid', diagnostic: 'access could not be verified: the working tree could not be read' })
+  })
+
+  it('reads the working tree without running anything the repository configures', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await delegate(harness, { role: 'reader', provider: 'codex' })
+    await settled(harness)
+    expect(harness.gitRuns.length).toBeGreaterThan(0)
+    for (const args of harness.gitRuns) {
+      // A file-system monitor or hook named in the repository's own Git config would run on the Host.
+      expect(args.slice(0, 4)).toEqual(['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath='])
+    }
+    expect(harness.gitRuns.find(args => args.includes('diff'))).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv']))
+  })
+
+  it('brings a stored team size down to a limit the deployment lowered', async () => {
+    const disk = new MemoryMediaPool()
+    const first = await mount({ routing: ROUTING, maxTeamSize: 6 }, ['codex', 'antigravity'], disk)
+    await first.update({ teamSize: 6 })
+    const restarted = await mount({ routing: ROUTING, maxTeamSize: 3 }, ['codex', 'antigravity'], disk)
+    expect(restarted.status()).toMatchObject({ teamSize: 3, limits: { maxConcurrentPerProject: 3, maxTeamSize: 3 } })
+  })
+
+  it('rejects a deployment fallback order that repeats a provider', async () => {
+    await expect(mount({ routing: ROUTING, fallbackOrder: ['codex', 'codex'] })).rejects.toThrow('fallbackOrder repeats codex')
   })
 
   it('changes one setting without restating the mode, so a mode chosen meanwhile is kept', async () => {

@@ -371,3 +371,17 @@ export function formatTierModelsLabel(provider: string): string {
 export function formatTierFieldLabel(field: 'model' | 'effort', tier: string): string {
   return `${field === 'model' ? 'Modelo' : 'Esforço'} do nível ${tier}`
 }
+
+/** Static Portuguese (Brazil) copy for the first-run setup. */
+export const ONBOARDING_COPY = {
+  providersTitle: 'Conecte seus agentes',
+  providersIntro: 'Conecte os agentes que você quer usar: um só, dois, ou todos. Os que você pular agora podem ser conectados depois em Configurações → Orquestrador.',
+  noneConnected: 'Nenhum agente conectado ainda. Sem pelo menos um, o Toranja não tem a quem delegar tarefas.',
+  modeTitle: 'Como você quer trabalhar',
+  modeIntro: 'Em Equipe, o Toranja distribui cada tarefa ao agente mais adequado e troca de agente quando um fica sem cota. Você também pode usar um agente só.',
+  later: 'Papéis, modelos por nível e ordem de fallback ficam em Configurações → Orquestrador.',
+  skip: 'Pular por agora',
+  next: 'Continuar',
+  back: 'Voltar',
+  finish: 'Concluir',
+} as const

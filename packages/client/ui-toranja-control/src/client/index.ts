@@ -9,6 +9,7 @@ import type { ToranjaAgentMode } from '@deepseek-ai/dsh-toranja-orchestrator/typ
 import { COPY, ORCHESTRATOR_COPY } from './locales.ts'
 import { OrchestratorSection, type OrchestratorSectionInjected } from './OrchestratorSection.tsx'
 import { ToranjaControl, type ToranjaControlInjected } from './ToranjaControl.tsx'
+import { ToranjaOnboarding } from './ToranjaOnboarding.tsx'
 
 /** Required client services for the Toranja Control header action and the Orchestrator settings page. */
 export const inject = ['remote', 'slots']
@@ -87,7 +88,16 @@ export async function apply(ctx: Context): Promise<void> {
     label: () => ORCHESTRATOR_COPY.nav,
     inject: () => sectionActions,
   }, OrchestratorSection))
+  // First-run setup, after the product's own welcome and sign-in steps. It
+  // ends itself at once when the Host says the setup was already finished.
+  ctx.slots.inject('settings.onboarding', () => ctx.slots.register({
+    name: 'settings.onboarding',
+    id: 'toranja-orchestrator',
+    order: 10,
+    inject: () => sectionActions,
+  }, ToranjaOnboarding))
 }
 
 export type { OrchestratorSectionInjected, OrchestratorSectionProps } from './OrchestratorSection.tsx'
 export type { ToranjaControlInjected, ToranjaControlProps } from './ToranjaControl.tsx'
+export type { ToranjaOnboardingProps } from './ToranjaOnboarding.tsx'

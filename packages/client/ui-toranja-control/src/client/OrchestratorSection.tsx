@@ -5,25 +5,20 @@ import type {
   ToranjaAgentMode,
   ToranjaConnectResult,
   ToranjaOrchestrationStatus,
-  ToranjaProviderConnection,
   ToranjaProviderId,
   ToranjaSettingsRequest,
 } from '@deepseek-ai/dsh-toranja-orchestrator/types'
-import { Button, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { StateDotState, TagTone } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import {
-  CONNECTION_LABELS,
   COPY,
-  MODE_OPTIONS,
   ORCHESTRATOR_COPY,
   PROFILE_OPTIONS,
-  formatConnectLabel,
   formatConnectNotice,
-  formatProviderHint,
   formatProviderName,
   formatTeamSizeHint,
 } from './locales.ts'
+import { ModePicker, ProviderList, TeamSizeStepper } from './OrchestratorControls.tsx'
 import { OrchestratorRouting } from './OrchestratorRouting.tsx'
 import css from './OrchestratorSection.module.css'
 
@@ -39,26 +34,12 @@ export interface OrchestratorSectionInjected {
   probeProviders: () => Promise<ToranjaOrchestrationStatus>
   /** Open a provider's official sign-in command in a terminal. */
   connectProvider: (provider: ToranjaProviderId) => Promise<ToranjaConnectResult>
+  /** Milliseconds between background reads of the Host; five seconds when omitted. */
+  refreshMs?: number
 }
 
 /** Props for the Orchestrator settings page. */
 export type OrchestratorSectionProps = PropsRuntime<'settings.section'> & OrchestratorSectionInjected
-
-const CONNECTION_DOTS: Readonly<Record<ToranjaProviderConnection, StateDotState>> = {
-  connected: 'done',
-  'signed-out': 'warning',
-  'not-installed': 'error',
-  'probe-failed': 'error',
-  unknown: 'idle',
-}
-
-const CONNECTION_TONES: Readonly<Record<ToranjaProviderConnection, TagTone>> = {
-  connected: 'success',
-  'signed-out': 'warning',
-  'not-installed': 'neutral',
-  'probe-failed': 'danger',
-  unknown: 'quiet',
-}
 
 /** How often the page reads the Host again, so a change made elsewhere shows up. */
 const REFRESH_MS = 5_000
@@ -69,7 +50,7 @@ const REFRESH_MS = 5_000
  * @returns The page element tree.
  */
 export function OrchestratorSection({
-  readStatus, setMode, updateSettings, probeProviders, connectProvider,
+  readStatus, setMode, updateSettings, probeProviders, connectProvider, refreshMs = REFRESH_MS,
 }: OrchestratorSectionProps) {
   const [status, setStatus] = useState<ToranjaOrchestrationStatus>()
   const [error, setError] = useState<string>()
@@ -80,14 +61,22 @@ export function OrchestratorSection({
   // put the older snapshot back when it answers after it.
   const latest = useRef(0)
   const mounted = useRef(true)
+  // Requests the user started and that have not answered yet. A background
+  // read waits for them: started before a change is stored, it could answer
+  // after it with the older snapshot.
+  const pending = useRef(0)
 
   const show = useCallback(async (
     read: () => Promise<ToranjaOrchestrationStatus>,
     failure: string,
     quiet = false,
   ): Promise<boolean> => {
+    if (quiet && pending.current > 0) return true
     const request = ++latest.current
-    if (!quiet) setBusy(true)
+    if (!quiet) {
+      pending.current += 1
+      setBusy(true)
+    }
     try {
       const next = await read()
       if (mounted.current && request === latest.current) {
@@ -100,19 +89,23 @@ export function OrchestratorSection({
       if (mounted.current && !quiet) setError(reason instanceof Error ? reason.message : failure)
       return false
     } finally {
-      if (mounted.current && !quiet) setBusy(false)
+      if (!quiet) {
+        pending.current -= 1
+        // The controls stay locked until every request the user started answered.
+        if (mounted.current && pending.current === 0) setBusy(false)
+      }
     }
   }, [])
 
   useEffect(() => {
     mounted.current = true
     void show(readStatus, ORCHESTRATOR_COPY.loadFailed)
-    const timer = setInterval(() => { void show(readStatus, ORCHESTRATOR_COPY.loadFailed, true) }, REFRESH_MS)
+    const timer = setInterval(() => { void show(readStatus, ORCHESTRATOR_COPY.loadFailed, true) }, refreshMs)
     return () => {
       mounted.current = false
       clearInterval(timer)
     }
-  }, [readStatus, show])
+  }, [readStatus, refreshMs, show])
 
   const save = (request: ToranjaSettingsRequest): Promise<boolean> => {
     setNotice(undefined)
@@ -121,6 +114,7 @@ export function OrchestratorSection({
   const change = (request: ToranjaSettingsRequest): void => { void save(request) }
 
   const connect = async (provider: ToranjaProviderId): Promise<void> => {
+    pending.current += 1
     setBusy(true)
     try {
       await connectProvider(provider)
@@ -130,7 +124,8 @@ export function OrchestratorSection({
     } catch (reason) {
       if (mounted.current) setError(reason instanceof Error ? reason.message : ORCHESTRATOR_COPY.connectFailed)
     } finally {
-      if (mounted.current) setBusy(false)
+      pending.current -= 1
+      if (mounted.current && pending.current === 0) setBusy(false)
     }
   }
 
@@ -156,66 +151,19 @@ export function OrchestratorSection({
               </Button>
             </header>
             <p className={css.hint}>{ORCHESTRATOR_COPY.providersHint}</p>
-            <ul className={css.providers} aria-label={ORCHESTRATOR_COPY.providersHeading}>
-              {status.providers.map((provider) => {
-                const name = formatProviderName(provider.id)
-                const hint = formatProviderHint(name, provider)
-                // OpenRouter signs in with an API key, and a missing CLI has nothing to sign in to.
-                const canConnect = provider.id !== 'openrouter'
-                  && provider.connection !== 'connected' && provider.connection !== 'not-installed'
-                return (
-                  <li key={provider.id} className={css.provider} aria-label={name}>
-                    <div className={css.providerHeading}>
-                      <StateDot state={CONNECTION_DOTS[provider.connection]} />
-                      <strong>{name}</strong>
-                      <Tag tone={CONNECTION_TONES[provider.connection]}>{CONNECTION_LABELS[provider.connection]}</Tag>
-                      {canConnect && (
-                        <Button
-                          size="sm"
-                          variant="primary"
-                          className={css.connect}
-                          disabled={busy}
-                          aria-label={formatConnectLabel(name)}
-                          onClick={() => { void connect(provider.id) }}
-                        >
-                          {ORCHESTRATOR_COPY.connect}
-                        </Button>
-                      )}
-                    </div>
-                    {hint !== undefined && <p className={css.hint}>{hint}</p>}
-                  </li>
-                )
-              })}
-            </ul>
+            <ProviderList providers={status.providers} busy={busy} onConnect={(provider) => { void connect(provider) }} />
           </section>
 
           <section className={css.group}>
             <h3>{ORCHESTRATOR_COPY.modeHeading}</h3>
-            <div className={css.choices} role="radiogroup" aria-label={COPY.modePickerAria}>
-              {MODE_OPTIONS.map((option) => {
-                const selected = status.mode === option.mode
-                const usable = option.mode === 'team'
-                  || status.providers.some(provider => provider.id === option.mode && provider.available)
-                return (
-                  <button
-                    key={option.mode}
-                    type="button"
-                    role="radio"
-                    aria-checked={selected}
-                    className={selected ? css.choiceActive : css.choice}
-                    disabled={busy || (!usable && !selected)}
-                    onClick={() => {
-                      if (selected) return
-                      setNotice(undefined)
-                      void show(() => setMode(option.mode), ORCHESTRATOR_COPY.saveFailed)
-                    }}
-                  >
-                    {option.label}
-                  </button>
-                )
-              })}
-            </div>
-            <p className={css.hint}>{MODE_OPTIONS.find(option => option.mode === status.mode)?.description}</p>
+            <ModePicker
+              status={status}
+              busy={busy}
+              onChoose={(mode) => {
+                setNotice(undefined)
+                void show(() => setMode(mode), ORCHESTRATOR_COPY.saveFailed)
+              }}
+            />
             <p className={css.hint}>{COPY.primaryHint}</p>
 
             <div className={css.row}>
@@ -223,25 +171,7 @@ export function OrchestratorSection({
                 <h4>{ORCHESTRATOR_COPY.teamSizeHeading}</h4>
                 <p className={css.hint}>{formatTeamSizeHint(status.limits.maxTeamSize)}</p>
               </div>
-              <div className={css.stepper} role="group" aria-label={ORCHESTRATOR_COPY.teamSizeHeading}>
-                <button
-                  type="button"
-                  aria-label={ORCHESTRATOR_COPY.decreaseTeam}
-                  disabled={busy || status.teamSize <= 1}
-                  onClick={() => { change({ teamSize: status.teamSize - 1 }) }}
-                >
-                  −
-                </button>
-                <span className={css.count}>{status.teamSize}</span>
-                <button
-                  type="button"
-                  aria-label={ORCHESTRATOR_COPY.increaseTeam}
-                  disabled={busy || status.teamSize >= status.limits.maxTeamSize}
-                  onClick={() => { change({ teamSize: status.teamSize + 1 }) }}
-                >
-                  +
-                </button>
-              </div>
+              <TeamSizeStepper status={status} busy={busy} onChange={(teamSize) => { change({ teamSize }) }} />
             </div>
 
             <h4>{ORCHESTRATOR_COPY.profileHeading}</h4>

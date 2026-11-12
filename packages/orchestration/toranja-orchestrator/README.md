@@ -28,7 +28,14 @@ and leaves the routing in force. On restart each stored field replaces the
 matching `Config` default; a field the user never changed is not stored and
 keeps following the configuration. A change applies to tasks started
 afterwards: a running task keeps the provider, model, and effort it started
-with. `fallbackOrder` rejects an unknown or repeated provider.
+with. `fallbackOrder` rejects an unknown or repeated provider, in a request and
+in the configuration alike. `onboarded` records that the user finished or
+dismissed the first-run setup.
+
+Stored values are held to the configuration in force when they are read: a
+stored team size above a lowered `maxTeamSize` is brought down to it, and stored
+tier models a provider's current configuration no longer accepts are ignored
+with a warning, leaving the deployment table in force for that provider.
 
 `tierModels` sets the model and effort of a tier per provider. Each provider the
 request names has its table replaced: a tier it omits follows
@@ -113,7 +120,8 @@ The check detects a change and does not revert it. Its limits:
 
 - An ignored directory is fingerprinted as one entry, so a change deep inside
   it, such as in `node_modules`, is not detected.
-- A directory that is not a Git work tree with a commit is not checked.
+- A directory that is not a Git work tree with a commit cannot be checked. A delegated task then runs unchecked; the delivery gate, which is strict, reports that access could not be verified and does not pass.
+- The check runs Git with the repository's file-system monitor and hooks path switched off and without external diff or textconv drivers, so nothing the repository's own Git configuration names runs on the Host.
 - An implementer running in the same project makes the comparison meaningless.
   `run_delivery_gate` refuses to start while one is active and turns the verdict
   `invalid` when one starts during the gate; any other delegation skips the

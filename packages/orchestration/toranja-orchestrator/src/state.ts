@@ -29,6 +29,7 @@ export const toranjaOrchestrationState = z.object({
   roleProviders: z.partialRecord(role, provider).optional(),
   crossReview: z.boolean().optional(),
   teamSize: z.number().int().positive().optional(),
+  onboarded: z.boolean().optional(),
   tierModels: z.partialRecord(provider, z.partialRecord(z.enum(['light', 'advanced', 'max']), tierModel)).optional(),
 })
 

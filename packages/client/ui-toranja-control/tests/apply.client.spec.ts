@@ -43,12 +43,16 @@ async function bench() {
 }
 
 describe('ui-toranja-control apply', () => {
-  it('registers the header panel and the Orchestrator settings page', async () => {
+  it('registers the header panel, the Orchestrator settings page, and the first-run setup', async () => {
     const { registrations, section } = await bench()
     expect(registrations.map(registration => [registration.name, registration.id])).toEqual([
       ['conversation.session.header.actions', 'toranja-control'],
       ['settings.section', 'toranja-orchestrator'],
+      ['settings.onboarding', 'toranja-orchestrator'],
     ])
+    // The setup talks to the Host through the same actions as the page.
+    const setup = registrations.find(registration => registration.name === 'settings.onboarding')
+    expect(setup?.inject?.()).toBe(section?.inject?.())
     expect(section?.label?.()).toBe('Orquestrador')
   })
 

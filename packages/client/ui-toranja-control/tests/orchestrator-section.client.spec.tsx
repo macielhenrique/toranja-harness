@@ -43,6 +43,7 @@ function status(rest: Partial<ToranjaOrchestrationStatus> = {}): ToranjaOrchestr
     roleProviders: {},
     crossReview: true,
     teamSize: 2,
+    onboarded: true,
     active: 0,
     limits: {
       maxConcurrentTotal: 4, maxConcurrentPerProject: 2, maxConcurrentPerProvider: 2, maxTeamSize: 3, allowParallelImplementation: false,
@@ -73,7 +74,7 @@ function status(rest: Partial<ToranjaOrchestrationStatus> = {}): ToranjaOrchestr
 }
 
 /** Mount the page over a Host that stores what it is sent and answers with the new snapshot. */
-function mount(initial = status()) {
+function mount(initial = status(), refreshMs?: number) {
   let current = initial
   const host = {
     readStatus: vi.fn(() => Promise.resolve(current)),
@@ -91,7 +92,7 @@ function mount(initial = status()) {
     set: (next: ToranjaOrchestrationStatus) => { current = next },
   }
   // The page reads only its injected actions; the renderer's own runtime props are not part of this seam.
-  const props = { close: () => undefined, ...host } as unknown as OrchestratorSectionProps
+  const props = { close: () => undefined, refreshMs, ...host } as unknown as OrchestratorSectionProps
   render(<OrchestratorSection {...props} />)
   return host
 }
@@ -180,6 +181,27 @@ describe('Orchestrator settings page: mode, team size, and profile', () => {
     const profiles = await screen.findByRole('radiogroup', { name: 'Perfil de custo e qualidade' })
     fireEvent.click(within(profiles).getByRole('radio', { name: 'Qualidade' }))
     await waitFor(() => { expect(host.updateSettings).toHaveBeenCalledWith({ profile: 'qualidade' }) })
+  })
+
+  it('does not read the Host again over a change that is still being stored', async () => {
+    const host = mount(status(), 15)
+    const profiles = await screen.findByRole('radiogroup', { name: 'Perfil de custo e qualidade' })
+    const stored = Promise.withResolvers<ToranjaOrchestrationStatus>()
+    host.updateSettings.mockReturnValueOnce(stored.promise)
+    fireEvent.click(within(profiles).getByRole('radio', { name: 'Qualidade' }))
+    await waitFor(() => { expect(host.updateSettings).toHaveBeenCalledTimes(1) })
+    const readsBefore = host.readStatus.mock.calls.length
+    // Several refresh intervals pass while the change is in flight.
+    await new Promise((resolve) => { setTimeout(resolve, 80) })
+    expect(host.readStatus.mock.calls.length).toBe(readsBefore)
+    expect(within(profiles).getByRole<HTMLButtonElement>('radio', { name: 'Econômico' }).disabled).toBe(true)
+    host.set(status({ profile: 'qualidade' }))
+    stored.resolve(status({ profile: 'qualidade' }))
+    await waitFor(() => {
+      expect(within(profiles).getByRole('radio', { name: 'Qualidade' }).getAttribute('aria-checked')).toBe('true')
+    })
+    // Reading resumes once the change is stored.
+    await waitFor(() => { expect(host.readStatus.mock.calls.length).toBeGreaterThan(readsBefore) })
   })
 
   it('shows why a change was rejected and keeps what the Host has stored', async () => {

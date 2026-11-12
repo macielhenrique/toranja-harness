@@ -76,6 +76,8 @@ export interface ToranjaSettingsRequest {
    * that provider. Providers not named keep theirs.
    */
   readonly tierModels?: Readonly<Partial<Record<ToranjaProviderId, ToranjaTierModels>>>
+  /** Whether the user finished or dismissed the first-run setup. */
+  readonly onboarded?: boolean
 }
 
 /** Request to change the routing mode, optionally together with other settings. */
@@ -183,6 +185,8 @@ export interface ToranjaOrchestrationStatus {
   readonly crossReview: boolean
   /** How many agents may work in one project at the same time. */
   readonly teamSize: number
+  /** Whether the user finished or dismissed the first-run setup. */
+  readonly onboarded: boolean
   readonly active: number
   readonly limits: {
     readonly maxConcurrentTotal: number

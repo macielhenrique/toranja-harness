@@ -592,11 +592,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     maxConcurrentPerProvider: Math.max(configuredLimits.maxConcurrentPerProvider, teamSize),
     allowParallelImplementation: configuredLimits.allowParallelImplementation,
   })
-  const maxTeamSize = positiveInteger('maxTeamSize', config.maxTeamSize ?? 8)
+  // The deployment's own default team size is never above the limit it reports.
+  const maxTeamSize = Math.max(
+    positiveInteger('maxTeamSize', config.maxTeamSize ?? 8),
+    configuredLimits.maxConcurrentPerProject,
+  )
   const ledger = new OrchestrationLedger(() => limitsFor(live().teamSize))
   const domain = await ctx.storageDomain.open(toranjaOrchestrationDomain)
   ctx.effect(() => () => domain.close(), 'toranja-orchestrator.domainClose')
   const routing = parseRouting(config)
+  /** Check a fallback order: every entry a known provider, none repeated. */
+  const parseFallbackOrder = (order: readonly string[]): ToranjaProviderId[] => order.map((key, index) => {
+    const provider = RUN_PROVIDERS.find(candidate => candidate === key)
+    if (provider === undefined) throw new Error(`toranja-orchestrator: fallbackOrder names unknown provider ${JSON.stringify(key)}`)
+    if (order.indexOf(key) !== index) throw new Error(`toranja-orchestrator: fallbackOrder repeats ${provider}`)
+    return provider
+  })
   /**
    * Whether tier models reach a provider's tasks: Toranja starts its own
    * instance of the provider per model, or the provider takes the model per
@@ -616,7 +627,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const defaults = {
     mode: config.defaultMode ?? 'team',
     profile: config.defaultProfile ?? 'equilibrado',
-    fallbackOrder: config.fallbackOrder ?? RUN_PROVIDERS,
+    fallbackOrder: config.fallbackOrder === undefined ? RUN_PROVIDERS : parseFallbackOrder(config.fallbackOrder),
     roleProviders: parseRoleProviders(config),
     crossReview: config.crossReview ?? true,
     teamSize: configuredLimits.maxConcurrentPerProject,
@@ -634,13 +645,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       resolved = {
         mode: stored.mode ?? defaults.mode,
         profile: stored.profile ?? defaults.profile,
-        fallbackOrder: stored.fallbackOrder ?? defaults.fallbackOrder,
+        // An order stored by an earlier version may repeat a provider.
+        fallbackOrder: stored.fallbackOrder === undefined ? defaults.fallbackOrder : [...new Set(stored.fallbackOrder)],
         roleProviders: stored.roleProviders === undefined
           ? defaults.roleProviders
           : parseRoleProviders({ roleProviders: stored.roleProviders }),
         crossReview: stored.crossReview ?? defaults.crossReview,
-        teamSize: stored.teamSize ?? defaults.teamSize,
-        models: stored.tierModels === undefined ? defaults.models : modelsInForce(stored.tierModels),
+        // The deployment may have lowered the limit since the size was stored.
+        teamSize: Math.min(stored.teamSize ?? defaults.teamSize, maxTeamSize),
+        models: stored.tierModels === undefined ? defaults.models : storedModelsInForce(stored.tierModels),
       }
     }
     return resolved
@@ -677,6 +690,24 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   }
   for (const [provider, entry] of routing) validateVariants(provider, entry.models)
+  /**
+   * Tier models in force from a stored table. A provider whose stored models
+   * its current configuration no longer accepts falls back to the deployment
+   * table, with a warning, so routing keeps working after such a change.
+   */
+  const storedModelsInForce = (stored: NonNullable<ToranjaOrchestrationState['tierModels']>): Map<RunProvider, ProviderModels> => {
+    const models = modelsInForce(stored)
+    for (const provider of RUN_PROVIDERS) {
+      if (stored[provider] === undefined) continue
+      try {
+        validateVariants(provider, models.get(provider) ?? {})
+      } catch (error: unknown) {
+        ctx.logger.warn(`toranja-orchestrator: stored tier models of ${provider} are no longer valid and are ignored: ${String(error)}`)
+        models.set(provider, defaults.models.get(provider) ?? {})
+      }
+    }
+    return models
+  }
   /** Validate the tier models of a settings request and return them trimmed. */
   const parseTierModels = (
     requested: NonNullable<ToranjaAgentModeRequest['tierModels']>,
@@ -728,7 +759,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   const gitOutput = async (cwd: string, args: readonly string[]): Promise<Buffer | undefined> => {
     const child = ctx.subprocess.spawn({
-      argv: ['git', ...args],
+      // The repository belongs to the agents being checked: a file-system
+      // monitor or hooks path in its own Git config must not run on the Host.
+      argv: ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=', ...args],
       cwd,
       stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
       graceMs: GIT_GRACE_MS,
@@ -759,7 +792,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const fingerprint = async (cwd: string): Promise<WorkspaceFingerprint | undefined> => {
     try {
       const [tracked, untracked, ignored] = await Promise.all([
-        gitOutput(cwd, ['diff', 'HEAD', '--binary']),
+        gitOutput(cwd, ['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--binary']),
         gitOutput(cwd, ['ls-files', '--others', '--exclude-standard', '-z']),
         gitOutput(cwd, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z']),
       ])
@@ -777,8 +810,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * Capture the working tree before a non-writing run. The returned check
    * reports a change the role's access forbids. A concurrent implementer makes
    * the comparison meaningless: a `strict` run then reports that its access
-   * could not be verified, and any other run reports nothing. The check also
-   * reports nothing when the directory is not a Git work tree with a commit.
+   * could not be verified, and any other run reports nothing. The same holds
+   * when the directory is not a Git work tree with a commit or Git fails.
    */
   const guardAccess = async (
     project: ResolvedProject,
@@ -788,15 +821,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const unverifiable = strict
       ? 'access could not be verified: an implementer ran in the project during this run'
       : undefined
+    const unreadable = strict
+      ? 'access could not be verified: the working tree could not be read'
+      : undefined
     if (access === 'write') return () => Promise.resolve(undefined)
     if (ledger.hasActiveWriter(project.id)) return () => Promise.resolve(unverifiable)
     const writersBefore = ledger.writerStartCount(project.id)
     const before = await fingerprint(project.path)
-    if (before === undefined) return () => Promise.resolve(undefined)
+    if (before === undefined) return () => Promise.resolve(unreadable)
     return async () => {
       if (ledger.writerStartCount(project.id) !== writersBefore) return unverifiable
       const after = await fingerprint(project.path)
-      if (after === undefined) return undefined
+      if (after === undefined) return unreadable
       const violation = accessViolation(access, before, after)
       if (violation !== undefined) {
         ctx.logger.warn(`toranja-orchestrator: ${violation} in project ${project.id}`)
@@ -1109,6 +1145,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       roleProviders: Object.fromEntries(live().roleProviders),
       crossReview: live().crossReview,
       teamSize: live().teamSize,
+      onboarded: domain.global.get().onboarded === true,
       active: ledger.activeCount,
       limits: { ...limitsFor(live().teamSize), maxTeamSize },
       projects: lanes.map(project => ({ ...project, metrics: ledger.project(project.id) })),
@@ -1207,12 +1244,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         .filter(([, table]) => Object.keys(table).length > 0))
     const fallbackOrder = request.fallbackOrder === undefined || request.fallbackOrder.length === 0
       ? undefined
-      : request.fallbackOrder.map((key, index, order) => {
-        const provider = RUN_PROVIDERS.find(candidate => candidate === key)
-        if (provider === undefined) throw new Error(`toranja-orchestrator: fallbackOrder names unknown provider ${JSON.stringify(key)}`)
-        if (order.indexOf(key) !== index) throw new Error(`toranja-orchestrator: fallbackOrder repeats ${provider}`)
-        return provider
-      })
+      : parseFallbackOrder(request.fallbackOrder)
     if (request.teamSize !== undefined && positiveInteger('teamSize', request.teamSize) > maxTeamSize) {
       throw new Error(`toranja-orchestrator: teamSize must not exceed ${maxTeamSize}, the deployment's maxTeamSize`)
     }
@@ -1227,6 +1259,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ...request.crossReview === undefined ? {} : { crossReview: request.crossReview },
       ...request.teamSize === undefined ? {} : { teamSize: positiveInteger('teamSize', request.teamSize) },
       ...tierModels === undefined ? {} : { tierModels },
+      ...request.onboarded === undefined ? {} : { onboarded: request.onboarded },
     }
     // Validate before storing. The live routing derives from the stored
     // value, so a failed write leaves the routing in force untouched.

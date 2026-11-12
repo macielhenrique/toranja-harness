@@ -27,10 +27,30 @@ it through the controller, never starting an agent:
 
 Every change except the mode goes through `updateSettings`, which names only the
 field that changed, so the page never restates a mode it read earlier. The page
-reads the Host again every five seconds and after each change; a model the user
-is still typing is kept across those reads, and a rejected change shows the
+reads the Host again every five seconds and after each change, never while a
+change is still being stored; a model the user is still typing is kept across
+those reads, and a rejected change shows the
 Host's reason and leaves the stored value on screen. Changes apply to tasks
 started afterwards.
+
+## First-run setup
+
+The package registers a step with the settings onboarding coordinator (slot
+`settings.onboarding`, after the product's own steps). It shows until the Host
+reports `onboarded`:
+
+1. **Conecte seus agentes**: the same provider list as the settings page, read
+   fresh with `probeProviders`. Any provider can be left unconnected; the step
+   warns when none is connected.
+2. **Como você quer trabalhar**: Team or one provider, and the team size in Team
+   mode.
+
+Each control stores its change as it is used, so closing the app midway loses
+nothing and the setup opens again on the next start. **Concluir** and **Pular
+por agora** both store `onboarded` and end the step; if that cannot be stored,
+the dialog stays open with the Host's reason. The step ends itself without
+showing when the setup was already finished, and also when the Host cannot be
+read, so it never blocks the app.
 
 Still set in the deployment configuration, not on this page: the provider
 instances (`routing.<provider>.base`), CLI executables, the OpenRouter credential
