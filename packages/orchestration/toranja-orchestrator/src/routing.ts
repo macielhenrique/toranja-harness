@@ -163,6 +163,12 @@ export interface WorkspaceFingerprint {
   readonly tracked: string
   /** Hash of the path, size, and modification time of untracked and ignored entries. */
   readonly untracked: string
+  /**
+   * Hash of the Git state that can hide a change from the two hashes above:
+   * the index flags that make Git skip a file, the files under those flags,
+   * and the content filters the repository configures.
+   */
+  readonly state: string
 }
 
 /**
@@ -178,6 +184,7 @@ export function accessViolation(
   after: WorkspaceFingerprint,
 ): string | undefined {
   if (access === 'write') return undefined
+  if (before.state !== after.state) return `${access} role changed Git state that hides file changes`
   if (before.tracked !== after.tracked) return `${access} role changed tracked files`
   if (access === 'read-only' && before.untracked !== after.untracked) return 'read-only role created, removed, or changed untracked files'
   return undefined

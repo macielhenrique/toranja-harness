@@ -121,7 +121,32 @@ The check detects a change and does not revert it. Its limits:
 - An ignored directory is fingerprinted as one entry, so a change deep inside
   it, such as in `node_modules`, is not detected.
 - A directory that is not a Git work tree with a commit cannot be checked. A delegated task then runs unchecked; the delivery gate, which is strict, reports that access could not be verified and does not pass.
-- The check runs Git with the repository's file-system monitor and hooks path switched off and without external diff or textconv drivers, so nothing the repository's own Git configuration names runs on the Host.
+- The repository belongs to the agents being checked, so the check runs nothing its Git configuration names: Git is resolved once from `PATH`, the file-system monitor is off, hooks are looked up in an empty directory the Host owns, external diff and textconv drivers are off, and every content filter (`filter.*.clean`, `smudge`, `process`) the repository defines is switched off for the check's commands.
+- A file Git was told to skip (`assume-unchanged` or `skip-worktree`) is invisible to `git diff`. The check compares those index flags, the size and time of each file under them, and the set of configured filters, and reports `changed Git state that hides file changes` when a non-writing role altered any of them.
+- Untracked and ignored files are compared by path, size, and modification time, not content: a same-size rewrite that restores the modification time is not seen.
+
+## Implementer worktrees
+
+With `implementerWorktrees`, `delegate_project_task` gives each implementer a Git
+worktree and branch of its own (`toranja/<id>`, created from the project's
+current commit under `worktreeRoot`, by default `.toranja-worktrees` beside the
+project) instead of the project's working tree:
+
+- Implementers can then work at the same time, up to the team size, and
+  `both` or `all` gives each provider its own worktree. An isolated implementer
+  does not hold the project's tree, so readers running meanwhile are still
+  checked.
+- The activation reports `worktree` and `branch`. A worktree with changes or
+  commits is kept for review and merge, and its task keeps both fields in the
+  status; one the implementer left untouched is removed with its branch.
+- `run_delivery_gate` with that task's `implementationTaskId` runs the reviewer
+  and tester in the worktree.
+- Uncommitted changes in the project's tree are not in the worktree: it starts
+  from the commit. Merging the branch back is left to the leader or the user.
+- When the project is not a Git work tree with a commit, or Git refuses, the
+  implementer runs in the project's own tree under the one-at-a-time rule.
+
+The option is off by default.
 - An implementer running in the same project makes the comparison meaningless.
   `run_delivery_gate` refuses to start while one is active and turns the verdict
   `invalid` when one starts during the gate; any other delegation skips the

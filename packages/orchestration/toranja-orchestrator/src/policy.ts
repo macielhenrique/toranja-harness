@@ -136,6 +136,10 @@ export interface ReservationRequest {
   readonly model?: string | undefined
   readonly effort?: string | undefined
   readonly access?: ToranjaRoleAccess
+  /** Git worktree the task writes in instead of the project's own tree. */
+  readonly worktree?: string | undefined
+  /** Branch of that worktree. */
+  readonly branch?: string | undefined
 }
 
 interface MutableMetric {
@@ -166,6 +170,8 @@ interface MutableTask {
   startedAt: string
   settledAt?: string
   error?: string
+  worktree?: string
+  branch?: string
 }
 
 const freshMetric = (): MutableMetric => ({ active: 0, completed: 0, failed: 0 })
@@ -226,7 +232,8 @@ export class OrchestrationLedger {
     for (const request of requests) {
       projectAdds.set(request.project, (projectAdds.get(request.project) ?? 0) + 1)
       providerAdds.set(request.provider, (providerAdds.get(request.provider) ?? 0) + 1)
-      if (request.role === 'implementer') {
+      // An implementer in its own worktree does not hold the project's tree.
+      if (request.role === 'implementer' && request.worktree === undefined) {
         writerAdds.set(request.project, (writerAdds.get(request.project) ?? 0) + 1)
       }
     }
@@ -263,7 +270,8 @@ export class OrchestrationLedger {
       providerMetric.active += 1
       projectMetric.lastStartedAt = startedAt
       providerMetric.lastStartedAt = startedAt
-      if (request.role === 'implementer') {
+      const holdsTree = request.role === 'implementer' && request.worktree === undefined
+      if (holdsTree) {
         this.activeWriters.set(request.project, (this.activeWriters.get(request.project) ?? 0) + 1)
         this.writerStarts.set(request.project, (this.writerStarts.get(request.project) ?? 0) + 1)
       }
@@ -276,6 +284,8 @@ export class OrchestrationLedger {
         ...request.model === undefined ? {} : { model: request.model },
         ...request.effort === undefined ? {} : { effort: request.effort },
         ...request.access === undefined ? {} : { access: request.access },
+        ...request.worktree === undefined ? {} : { worktree: request.worktree },
+        ...request.branch === undefined ? {} : { branch: request.branch },
         state: 'active',
         startedAt,
       }
@@ -308,7 +318,7 @@ export class OrchestrationLedger {
               providerMetric.lastError = safeError
             }
           }
-          if (request.role === 'implementer') {
+          if (holdsTree) {
             const writers = (this.activeWriters.get(request.project) ?? 1) - 1
             if (writers === 0) this.activeWriters.delete(request.project)
             else this.activeWriters.set(request.project, writers)
@@ -327,6 +337,17 @@ export class OrchestrationLedger {
     if (removable.size === 0) return
     const retained = this.taskHistory.filter(task => !removable.has(task.id))
     this.taskHistory.splice(0, this.taskHistory.length, ...retained)
+  }
+
+  /**
+   * Forget the worktree of a task whose worktree was removed.
+   * @param taskId - Task whose worktree no longer exists.
+   */
+  dropWorktree(taskId: string): void {
+    const task = this.taskHistory.find(candidate => candidate.id === taskId)
+    if (task === undefined) return
+    delete task.worktree
+    delete task.branch
   }
 
   /**

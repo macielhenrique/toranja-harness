@@ -164,6 +164,10 @@ export interface ToranjaTaskStatus {
   readonly effort?: string
   /** Access level enforced for the task. */
   readonly access?: ToranjaRoleAccess
+  /** Git worktree an isolated implementer wrote in, while it is kept for review. */
+  readonly worktree?: string
+  /** Branch of that worktree, holding the implementer's changes. */
+  readonly branch?: string
   readonly state: ToranjaTaskState
   readonly startedAt: string
   readonly settledAt?: string

@@ -120,12 +120,13 @@ describe('Toranja routing policy', () => {
   })
 
   it('reports only changes the access level forbids', () => {
-    const before = { tracked: 'a', untracked: 'b' }
-    expect(accessViolation('write', before, { tracked: 'x', untracked: 'y' })).toBeUndefined()
+    const before = { tracked: 'a', untracked: 'b', state: 's' }
+    expect(accessViolation('write', before, { tracked: 'x', untracked: 'y', state: 's' })).toBeUndefined()
     expect(accessViolation('read-only', before, before)).toBeUndefined()
-    expect(accessViolation('read-only', before, { tracked: 'a', untracked: 'y' })).toBe('read-only role created, removed, or changed untracked files')
-    expect(accessViolation('read-only', before, { tracked: 'x', untracked: 'b' })).toBe('read-only role changed tracked files')
-    expect(accessViolation('execute', before, { tracked: 'a', untracked: 'y' })).toBeUndefined()
-    expect(accessViolation('execute', before, { tracked: 'x', untracked: 'b' })).toBe('execute role changed tracked files')
+    expect(accessViolation('read-only', before, { tracked: 'a', untracked: 'y', state: 's' })).toBe('read-only role created, removed, or changed untracked files')
+    expect(accessViolation('read-only', before, { tracked: 'x', untracked: 'b', state: 's' })).toBe('read-only role changed tracked files')
+    expect(accessViolation('execute', before, { tracked: 'a', untracked: 'y', state: 's' })).toBeUndefined()
+    expect(accessViolation('execute', before, { tracked: 'x', untracked: 'b', state: 's' })).toBe('execute role changed tracked files')
+    expect(accessViolation('execute', before, { ...before, state: 'other' })).toBe('execute role changed Git state that hides file changes')
   })
 })

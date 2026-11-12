@@ -5,9 +5,10 @@
  */
 
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { stat } from 'node:fs/promises'
-import { basename, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -152,6 +153,14 @@ export interface Config {
   maxConcurrentPerProject?: number
   /** Largest team size the user may set; it bounds how far the team size raises the concurrency limits. */
   maxTeamSize?: number
+  /**
+   * Run each implementer in a Git worktree and branch of its own instead of
+   * the project's working tree, so implementers can work at the same time and
+   * a change waits on its branch for review. Off by default.
+   */
+  implementerWorktrees?: boolean
+  /** Directory the implementer worktrees are created under; by default `.toranja-worktrees` beside each project. */
+  worktreeRoot?: string
   /** Maximum active runs on one provider. */
   maxConcurrentPerProvider?: number
   /** Maximum length of one delegated task or gate input. */
@@ -212,6 +221,8 @@ export const Config: z<Config> = z.object({
   maxConcurrentTotal: z.number().default(4),
   maxConcurrentPerProject: z.number().default(2),
   maxTeamSize: z.number().default(8),
+  implementerWorktrees: z.boolean().default(false),
+  worktreeRoot: z.string().min(1),
   maxConcurrentPerProvider: z.number().default(2),
   maxTaskChars: z.number().default(DEFAULT_MAX_TASK_CHARS),
   allowParallelImplementation: z.boolean().default(false),
@@ -460,6 +471,17 @@ interface RoutedRequest {
   readonly signal: AbortSignal
   readonly delivery: 'caller' | 'parent'
   readonly strict?: boolean
+  /** Worktree the run works in instead of the project's own tree. */
+  readonly lane?: IsolatedLane
+}
+
+/** Git worktree and branch created for one implementer. */
+interface IsolatedLane {
+  readonly project: ResolvedProject
+  readonly path: string
+  readonly branch: string
+  /** Commit the worktree started from. */
+  readonly base: string
 }
 
 interface StartedRun {
@@ -757,11 +779,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return pending
   }
 
-  const gitOutput = async (cwd: string, args: readonly string[]): Promise<Buffer | undefined> => {
+  // The repository belongs to the agents being checked, so nothing its own Git
+  // configuration names may run on the Host: no file-system monitor, hooks
+  // looked up in a directory the Host owns and keeps empty, and no lock or
+  // index refresh a reading command would otherwise take. Git itself is
+  // resolved once from PATH, never from the project directory.
+  const noHooks = mkdtempSync(join(tmpdir(), 'toranja-no-hooks-'))
+  ctx.effect(() => () => { rmSync(noHooks, { recursive: true, force: true }) }, 'toranja-orchestrator.noHooks')
+  const gitExecutable = findExecutable('git') ?? 'git'
+  const gitOutput = async (
+    cwd: string,
+    args: readonly string[],
+    overrides: readonly string[] = [],
+  ): Promise<Buffer | undefined> => {
     const child = ctx.subprocess.spawn({
-      // The repository belongs to the agents being checked: a file-system
-      // monitor or hooks path in its own Git config must not run on the Host.
-      argv: ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=', ...args],
+      argv: [
+        gitExecutable, '--no-optional-locks',
+        '-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${noHooks}`,
+        ...overrides.flatMap(override => ['-c', override]),
+        ...args,
+      ],
       cwd,
       stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
       graceMs: GIT_GRACE_MS,
@@ -791,15 +828,38 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
   const fingerprint = async (cwd: string): Promise<WorkspaceFingerprint | undefined> => {
     try {
-      const [tracked, untracked, ignored] = await Promise.all([
-        gitOutput(cwd, ['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--binary']),
-        gitOutput(cwd, ['ls-files', '--others', '--exclude-standard', '-z']),
-        gitOutput(cwd, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z']),
+      // Reading the configuration runs nothing. Every content filter it
+      // defines is then switched off for the commands below: a clean or
+      // process filter would otherwise run on the Host when Git reads a file.
+      const local = await gitOutput(cwd, ['config', '--local', '--includes', '--null', '--list'])
+      if (local === undefined) return undefined
+      const filters = local.toString('utf8').split('\0')
+        .map(entry => entry.split('\n', 1)[0] ?? '')
+        .filter(key => /^filter\..+\.(?:clean|smudge|process)$/u.test(key))
+      const off = [...new Set(filters)].map(key => `${key}=`)
+      const [tracked, untracked, ignored, index] = await Promise.all([
+        gitOutput(cwd, ['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--binary'], off),
+        gitOutput(cwd, ['ls-files', '--others', '--exclude-standard', '-z'], off),
+        gitOutput(cwd, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], off),
+        gitOutput(cwd, ['ls-files', '-v', '-z'], off),
       ])
-      if (tracked === undefined || untracked === undefined || ignored === undefined) return undefined
+      if (tracked === undefined || untracked === undefined || ignored === undefined || index === undefined) return undefined
+      // `ls-files -v` tags a file Git was told to skip with a lowercase letter
+      // (assume-unchanged) or `S` (skip-worktree). The diff above does not see
+      // such a file, so its flag and its content facts are compared here.
+      const hidden = index.toString('utf8').split('\0').filter(entry => /^[a-zS] /u.test(entry))
+      const state = createHash('sha256').update(filters.sort().join('\0')).update('\0\0')
+      for (const entry of hidden) {
+        const facts = await stat(join(cwd, entry.slice(2))).then(
+          file => `${file.size}:${file.mtimeMs}`,
+          () => 'missing',
+        )
+        state.update(`${entry}\0${facts}\0`)
+      }
       return {
         tracked: createHash('sha256').update(tracked).digest('hex'),
         untracked: await untrackedHash(cwd, [untracked, ignored]),
+        state: state.digest('hex'),
       }
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: working-tree fingerprint failed in ${cwd}: ${String(error)}`)
@@ -883,7 +943,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     })
     return { activation, providerName: instance, verify }
   }
-  const reservation = (project: ResolvedProject, route: ToranjaRoleRoute, label: string) => ({
+  const reservation = (project: ResolvedProject, route: ToranjaRoleRoute, label: string, lane?: IsolatedLane) => ({
     project: project.id,
     provider: route.provider,
     role: route.role,
@@ -891,7 +951,54 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     model: route.model,
     effort: route.effort,
     access: route.access,
+    worktree: lane?.path,
+    branch: lane?.branch,
   })
+
+  const implementerWorktrees = config.implementerWorktrees ?? false
+  let laneSequence = 0
+  /**
+   * Create a worktree and branch of the project's current commit for one
+   * implementer. Returns undefined when the project is not a Git work tree
+   * with a commit or Git refuses, and the implementer then runs in the
+   * project's own tree under the one-implementer-at-a-time rule.
+   */
+  const isolate = async (project: ResolvedProject): Promise<IsolatedLane | undefined> => {
+    if (!implementerWorktrees) return undefined
+    const name = `${Date.now().toString(36)}-${(++laneSequence).toString(36)}`
+    const path = join(config.worktreeRoot ?? join(dirname(project.path), '.toranja-worktrees'), project.id, name)
+    const branch = `toranja/${name}`
+    try {
+      const head = await gitOutput(project.path, ['rev-parse', 'HEAD'])
+      if (head === undefined) return undefined
+      if (await gitOutput(project.path, ['worktree', 'add', '-q', '-b', branch, path, 'HEAD']) === undefined) return undefined
+      return { project, path, branch, base: head.toString('utf8').trim() }
+    } catch (error: unknown) {
+      ctx.logger.warn(`toranja-orchestrator: worktree for project ${project.id} could not be created: ${String(error)}`)
+      return undefined
+    }
+  }
+  /**
+   * Remove the worktree and branch of an implementer that left nothing
+   * behind. One with changes or commits is kept for review and merge.
+   * @returns Whether the worktree was removed.
+   */
+  const releaseLane = async (lane: IsolatedLane): Promise<boolean> => {
+    try {
+      const [changes, head] = await Promise.all([
+        gitOutput(lane.path, ['status', '--porcelain']),
+        gitOutput(lane.path, ['rev-parse', 'HEAD']),
+      ])
+      if (changes === undefined || head === undefined) return false
+      if (changes.length > 0 || head.toString('utf8').trim() !== lane.base) return false
+      if (await gitOutput(lane.project.path, ['worktree', 'remove', '--force', lane.path]) === undefined) return false
+      await gitOutput(lane.project.path, ['branch', '-D', lane.branch])
+      return true
+    } catch (error: unknown) {
+      ctx.logger.warn(`toranja-orchestrator: worktree ${lane.path} could not be inspected: ${String(error)}`)
+      return false
+    }
+  }
 
   /**
    * Providers to try for a role, in order. Only a Team-mode delegation that
@@ -922,12 +1029,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const route = routeFor(request.role, provider)
       try {
         lease ??= requiredAt(
-          ledger.reserveBatch([reservation(request.project, route, request.description)]),
+          ledger.reserveBatch([reservation(request.project, route, request.description, request.lane)]),
           0,
           'delegation reservation',
         )
         const launched = await launch({
-          project: request.project,
+          // An isolated implementer works in its worktree, not the project's tree.
+          project: request.lane === undefined ? request.project : { ...request.project, path: request.lane.path },
           route,
           prompt: request.prompt(route),
           label: request.label(provider),
@@ -984,7 +1092,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   /** Settle the ledger task of a run whose result is delivered to the parent agent. */
   const settleInBackground = (started: StartedRun): void => {
-    void awaitRouted(started).then(({ run, result, violation, error }) => {
+    void awaitRouted(started).then(async ({ run, result, violation, error }) => {
+      const { lane } = run.request
+      if (lane !== undefined && await releaseLane(lane)) ledger.dropWorktree(run.lease.taskId)
       run.lease.settle(
         result?.stopReason === 'completed' && violation === undefined,
         violation ?? error ?? result?.diagnostic ?? result?.stopReason,
@@ -1373,21 +1483,35 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (selected.length === 0) throw new Error('delegate_project_task: no connected provider is available')
       assertProvidersAllowed(live().mode, selected)
       const { project, description, task } = validateAssignment(args)
-      const leases = ledger.reserveBatch(selected.map(provider => reservation(project, routeFor(role, provider), description)))
-      const request: RoutedRequest = {
-        project,
-        role,
-        description,
-        prompt: route => rolePrompt(project, route, task, live().profile),
-        label: provider => `${project.title}: ${description} (${provider})`,
-        parent,
-        signal: exec.signal,
-        delivery: 'parent',
+      // Each implementer gets a worktree of its own when the deployment asks for it.
+      const lanes = await Promise.all(selected.map(() => role === 'implementer' ? isolate(project) : Promise.resolve(undefined)))
+      let leases: ReservationLease[]
+      try {
+        leases = ledger.reserveBatch(selected.map((provider, index) =>
+          reservation(project, routeFor(role, provider), description, lanes[index])))
+      } catch (error: unknown) {
+        for (const lane of lanes) if (lane !== undefined) await releaseLane(lane)
+        throw error
+      }
+      const requestFor = (lane: IsolatedLane | undefined): RoutedRequest => {
+        const place = lane === undefined ? project : { ...project, path: lane.path }
+        return {
+          project,
+          role,
+          description,
+          prompt: route => rolePrompt(place, route, task, live().profile),
+          label: provider => `${project.title}: ${description} (${provider})`,
+          parent,
+          signal: exec.signal,
+          delivery: 'parent',
+          ...lane === undefined ? {} : { lane },
+        }
       }
       const results = await Promise.all(selected.map(async (first, index) => {
+        const lane = lanes[index]
         try {
           const started = await startRouted(
-            request,
+            requestFor(lane),
             candidatesFor(first, args.provider === undefined, role),
             requiredAt(leases, index, 'delegation reservation'),
           )
@@ -1404,8 +1528,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             ...started.fallbackFrom.length === 0 ? {} : { fallbackFrom: started.fallbackFrom },
             taskId: started.lease.taskId,
             subagentId: started.activation.childId,
+            // The change stays on this branch, in this worktree, until it is reviewed and merged.
+            ...lane === undefined ? {} : { worktree: lane.path, branch: lane.branch },
           }
         } catch (error: unknown) {
+          if (lane !== undefined) await releaseLane(lane)
           if (!(error instanceof RoutedStartError)) throw error
           return { ok: false as const, attempts: error.attempts }
         }
@@ -1475,6 +1602,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         ]
       }
       const candidates = { reviewer: gateCandidates('reviewer'), tester: gateCandidates('tester') }
+      // An isolated implementation is reviewed where it was written: its worktree.
+      const place = implementation?.worktree === undefined ? project : { ...project, path: implementation.worktree }
       const leases = ledger.reserveBatch(roles.map(role => reservation(
         project,
         routeFor(role, requiredAt(candidates[role], 0, 'gate provider')),
@@ -1484,10 +1613,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         let started: StartedRun
         try {
           started = await startRouted({
-            project,
+            project: place,
             role,
             description: `Portão de entrega: ${role}`,
-            prompt: () => gatePrompt(project, role, implementationSummary, acceptanceCriteria),
+            prompt: () => gatePrompt(place, role, implementationSummary, acceptanceCriteria),
             label: provider => `${project.title}: delivery ${role} (${provider})`,
             parent,
             signal: exec.signal,
