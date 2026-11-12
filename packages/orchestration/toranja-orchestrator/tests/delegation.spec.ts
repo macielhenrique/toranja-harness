@@ -1021,6 +1021,16 @@ describe('Toranja routed delegation', () => {
     expect(harness.status().providers.find(provider => provider.id === 'codex')?.tierModels).toMatchObject({ light: { model: 'gpt-tiny' } })
   })
 
+  it('reports the roles each provider may take, so OpenRouter is offered only for writing', async () => {
+    const routing = { ...ROUTING, openrouter: { models: { advanced: { model: 'meta/llama-large' } } } }
+    const roles = (harness: Harness, id: string) => harness.status().providers.find(provider => provider.id === id)?.roles
+    const harness = await mount({ routing, openrouterProvider: 'spawn' }, ['codex', 'antigravity', 'spawn'])
+    expect(roles(harness, 'openrouter')).toEqual(['implementer'])
+    expect(roles(harness, 'codex')).toHaveLength(9)
+    const accepting = await mount({ routing, openrouterProvider: 'spawn', openrouterUnenforcedAccess: true }, ['codex', 'spawn'])
+    expect(roles(accepting, 'openrouter')).toHaveLength(9)
+  })
+
   it('changes one setting without restating the mode, so a mode chosen meanwhile is kept', async () => {
     const disk = new MemoryMediaPool()
     const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)

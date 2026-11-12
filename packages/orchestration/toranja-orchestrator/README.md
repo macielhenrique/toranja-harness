@@ -41,7 +41,9 @@ the result under `providers[]`: `tierModels` is the table in force,
 `tierModelOverrides` the tiers the user set, `tierModelsEditable` whether the
 deployment allows setting them, and `readOnlyEnforcement` how a `read-only`
 task is kept from writing there (`none` when Toranja owns no instance of the
-provider). Provider instances (`routing.<provider>.base`), executables,
+provider). `roles` lists the roles the provider may take: every role, except
+that OpenRouter takes only the writing role unless `openrouterUnenforcedAccess`
+is set. Provider instances (`routing.<provider>.base`), executables,
 credential references, and the concurrency limits stay configuration-only.
 
 ## Connected providers and team size

@@ -128,6 +128,8 @@ export interface ToranjaProviderStatus {
   readonly connection: ToranjaProviderConnection
   /** Executable the sign-in state was read from, when one is installed. */
   readonly executable?: string
+  /** Roles this provider may take; one that cannot be kept from writing takes only writing roles. */
+  readonly roles: readonly ToranjaTaskRole[]
   /** How this provider keeps a `read-only` task from writing in this deployment. */
   readonly readOnlyEnforcement: ToranjaReadOnlyEnforcement
   /** Model and effort in force per tier: what the user set over the deployment configuration. */

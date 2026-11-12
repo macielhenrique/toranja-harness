@@ -1117,6 +1117,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         registryName: providerName(provider),
         available: registered.has(providerName(provider)) && usable(provider),
         ...connectionOf(provider),
+        roles: ROLES.filter(role => canRun(provider, role)),
         readOnlyEnforcement: provider !== 'openrouter' && tierModelsEditable(provider) ? READ_ONLY_ENFORCEMENT[provider] : 'none',
         tierModels: live().models.get(provider) ?? {},
         tierModelOverrides: tierModelsEditable(provider) ? domain.global.get().tierModels?.[provider] ?? {} : {},
