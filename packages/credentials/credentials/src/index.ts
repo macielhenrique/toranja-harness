@@ -16,20 +16,6 @@ export type {
   ApiKeyRecord, CredentialInfo, CredentialKey, CredentialRecord, CredentialRef, GrantRecord,
 } from './types.ts'
 
-export { UnifiedAuthManager } from './auth-manager.ts'
-
-export type {
-  AuthAttemptId,
-  AuthAttemptSnapshot,
-  AuthErrorCode,
-  AuthPhase,
-  AuthProviderId,
-  ProviderAuthStatus,
-  StartBrowserLoginRequest,
-  SubmitApiKeyRequest,
-  UnifiedAuthService,
-} from './auth-providers.ts'
-
 const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 /** Both halves of a {@link CredentialKey}; the `/` between them is what keeps it out of {@link REF_PATTERN}. */

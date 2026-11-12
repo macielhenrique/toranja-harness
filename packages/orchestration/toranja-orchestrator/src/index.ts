@@ -11,7 +11,8 @@ import { basename, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { ReasoningEffortId, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SubagentActivation, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import * as antigravityPlugin from '@deepseek-ai/dsh-subagent-antigravity'
 import * as claudeCodePlugin from '@deepseek-ai/dsh-subagent-claude-code'
@@ -38,9 +39,11 @@ import {
 import {
   CLI_PROVIDERS,
   DEFAULT_EXECUTABLES,
+  LOGIN_COMMANDS,
   STATUS_COMMANDS,
   commandArgv,
   findExecutable,
+  terminalArgv,
   type ProviderConnection,
 } from './connection.ts'
 import {
@@ -56,6 +59,8 @@ import {
 import type {
   ToranjaAgentMode,
   ToranjaAgentModeRequest,
+  ToranjaConnectRequest,
+  ToranjaConnectResult,
   ToranjaLegacyModeRequest,
   ToranjaExecutionProfile,
   ToranjaOrchestrationStatus,
@@ -177,6 +182,10 @@ export interface Config {
   probeOnStart?: boolean
   /** Time limit of one provider status command, in milliseconds. */
   probeTimeoutMs?: number
+  /** LLM provider id that OpenRouter tasks select on the internal agent. */
+  openrouterLlmProvider?: string
+  /** Credential reference holding the OpenRouter API key. */
+  openrouterKeyRef?: string
 }
 
 export const Config: z<Config> = z.object({
@@ -216,6 +225,8 @@ export const Config: z<Config> = z.object({
   executables: z.dict(z.string().min(1)).default({}),
   probeOnStart: z.boolean().default(false),
   probeTimeoutMs: z.number().default(20_000),
+  openrouterLlmProvider: z.string().min(1).default('openrouter'),
+  openrouterKeyRef: z.string().min(1).default('OPENROUTER_API_KEY'),
 })
 
 interface ResolvedProject extends ProjectConfig {
@@ -232,6 +243,7 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
     private readonly writeMode: (request: ToranjaAgentModeRequest) => Promise<ToranjaOrchestrationStatus>,
     private readonly adoptMode: (mode: ToranjaAgentMode) => Promise<ToranjaOrchestrationStatus>,
     private readonly probe: () => Promise<ToranjaOrchestrationStatus>,
+    private readonly connect: (request: ToranjaConnectRequest) => ToranjaConnectResult,
   ) {
     super(ctx, 'toranjaOrchestrationController', { namespace: 'toranja' })
   }
@@ -264,6 +276,18 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
   @Remote
   probeProviders(): Promise<ToranjaOrchestrationStatus> {
     return this.probe()
+  }
+
+  /**
+   * Open the provider's official sign-in command in a terminal window. The
+   * user completes the sign-in there; call {@link probeProviders} afterwards to
+   * read the result. Toranja never sees the account credentials.
+   * @param request - Provider to sign in to.
+   * @returns The command that was opened.
+   */
+  @Remote
+  connectProvider(request: ToranjaConnectRequest): ToranjaConnectResult {
+    return this.connect(request)
   }
 
   /**
@@ -468,7 +492,9 @@ function parseRouting(config: Config): Map<RunProvider, ProviderRouting> {
     if (value.base !== undefined && !isVariantProvider(provider)) {
       throw new Error(`toranja-orchestrator: routing.${key}.base is not supported; ${key} has no Toranja-owned instances`)
     }
-    if (value.base === undefined && Object.keys(models).length > 0) {
+    // OpenRouter runs on the internal agent, which takes its model per start
+    // and needs no provider instance of its own.
+    if (value.base === undefined && provider !== 'openrouter' && Object.keys(models).length > 0) {
       throw new Error(`toranja-orchestrator: routing.${key}.models requires routing.${key}.base; without it no model is applied`)
     }
     routing.set(provider, { ...value.base === undefined ? {} : { base: value.base }, models })
@@ -579,7 +605,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const routing = parseRouting(config)
   const routeFor = (role: Role, provider: RunProvider): ToranjaRoleRoute => {
     const entry = routing.get(provider)
-    return resolveRoute(role, live().profile, provider, entry?.base === undefined ? {} : entry.models)
+    const applied = entry !== undefined && (entry.base !== undefined || provider === 'openrouter')
+    return resolveRoute(role, live().profile, provider, applied ? entry.models : {})
   }
   for (const [provider, entry] of routing) {
     if (entry.base === undefined || !isVariantProvider(provider)) continue
@@ -698,6 +725,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     readonly strict?: boolean
   }): Promise<{ activation: SubagentActivation; providerName: string; verify: () => Promise<string | undefined> }> => {
     const instance = await instanceFor(request.route)
+    const { route } = request
+    if (route.provider === 'openrouter' && route.model === undefined) {
+      throw new Error(`toranja-orchestrator: routing.openrouter.models has no model for the ${route.tier} tier`)
+    }
     const verify = await guardAccess(request.project, request.route.access, request.strict ?? false)
     const activation = await ctx.subagents.startActivation({
       provider: instance,
@@ -706,6 +737,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         cwd: request.project.path,
         prompt: request.prompt,
         parent: request.parent,
+        ...route.provider !== 'openrouter' || route.model === undefined
+          ? {}
+          : {
+            agentOptions: {
+              provider: openrouterLlmProvider,
+              model: route.model,
+              ...route.effort === undefined ? {} : { reasoningEffort: ReasoningEffortId(route.effort) },
+            },
+          },
       },
       signal: request.signal,
       delivery: request.delivery,
@@ -830,6 +870,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     connections.get(provider) ?? { connection: 'unknown' }
   /** A provider is usable unless a probe found its CLI missing or signed out. */
   const usable = (provider: RunProvider): boolean => {
+    // OpenRouter has no default model: until one is routed it cannot run a task.
+    if (provider === 'openrouter' && Object.keys(routing.get('openrouter')?.models ?? {}).length === 0) return false
     const { connection } = connectionOf(provider)
     return connection === 'connected' || connection === 'unknown'
   }
@@ -856,9 +898,42 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       return { connection: 'unknown', executable }
     }
   }
+  const openrouterLlmProvider = config.openrouterLlmProvider ?? 'openrouter'
+  const openrouterKeyRef = credentialRef(config.openrouterKeyRef ?? 'OPENROUTER_API_KEY')
+  /** OpenRouter is connected while its API key is stored; without a credential store its state is unknown. */
+  const probeOpenrouter = async (): Promise<ProviderConnection> => {
+    const credentials = ctx.get('credentials')
+    if (credentials === undefined) return { connection: 'unknown' }
+    return { connection: (await credentials.describe(openrouterKeyRef)).configured ? 'connected' : 'signed-out' }
+  }
   const probeProviders = async (): Promise<void> => {
-    const probed = await Promise.all(CLI_PROVIDERS.map(async provider => [provider, await probeProvider(provider)] as const))
+    const [probed, openrouter] = await Promise.all([
+      Promise.all(CLI_PROVIDERS.map(async provider => [provider, await probeProvider(provider)] as const)),
+      probeOpenrouter(),
+    ])
     for (const [provider, connection] of probed) connections.set(provider, connection)
+    connections.set('openrouter', openrouter)
+  }
+  const connectProvider = (request: ToranjaConnectRequest): ToranjaConnectResult => {
+    const provider = CLI_PROVIDERS.find(candidate => candidate === request.provider)
+    if (provider === undefined) {
+      throw new Error('toranja-orchestrator: OpenRouter connects with an API key stored in Settings, not with a sign-in command')
+    }
+    const executable = findExecutable(executables[provider] ?? DEFAULT_EXECUTABLES[provider])
+    if (executable === undefined) throw new Error(`toranja-orchestrator: ${provider} is not installed`)
+    const command = [executable, ...LOGIN_COMMANDS[provider]]
+    const child = ctx.subprocess.spawn({
+      argv: terminalArgv(command),
+      cwd: process.cwd(),
+      stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+      graceMs: GIT_GRACE_MS,
+    })
+    child.stdout?.resume()
+    child.stderr?.resume()
+    void child.done.catch((error: unknown) => {
+      ctx.logger.warn(`toranja-orchestrator: ${provider} sign-in terminal failed: ${String(error)}`)
+    })
+    return { provider, command }
   }
 
   const availableRunProviders = (): ReadonlySet<RunProvider> => {
@@ -1036,6 +1111,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       await probeProviders()
       return readStatus()
     },
+    connectProvider,
   )
   if (config.probeOnStart === true) {
     // Not awaited: slow CLIs must not delay startup; routing treats an

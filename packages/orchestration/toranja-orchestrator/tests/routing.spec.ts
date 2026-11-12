@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   ROLES,
   accessViolation,
+  commandArgv,
+  terminalArgv,
   isProviderFailure,
   modelTier,
   resolveRoute,
@@ -99,6 +101,22 @@ describe('Toranja routing policy', () => {
       'the requested file does not exist',
       'read-only role changed tracked files',
     ]) expect(isProviderFailure(diagnostic), String(diagnostic)).toBe(false)
+  })
+
+  it('opens a command in a visible terminal on each platform', () => {
+    expect(terminalArgv(['C:/bin/codex.cmd', 'login'], 'win32'))
+      .toEqual(['cmd.exe', '/d', '/c', 'start', 'Toranja Harness', 'cmd.exe', '/d', '/k', 'C:/bin/codex.cmd', 'login'])
+    expect(terminalArgv(['/usr/bin/claude', 'auth', 'login'], 'darwin'))
+      .toEqual(['osascript', '-e', 'tell application "Terminal" to do script "\'/usr/bin/claude\' \'auth\' \'login\'"', '-e', 'tell application "Terminal" to activate'])
+    expect(terminalArgv(['/usr/bin/agy'], 'linux'))
+      .toEqual(['x-terminal-emulator', '-e', '/usr/bin/agy'])
+  })
+
+  it('runs a Windows batch shim through cmd.exe and any other executable directly', () => {
+    expect(commandArgv('C:/npm/codex.cmd', ['login', 'status'], 'win32'))
+      .toEqual(['cmd.exe', '/d', '/s', '/c', 'C:/npm/codex.cmd', 'login', 'status'])
+    expect(commandArgv('C:/agy/agy.exe', ['models'], 'win32')).toEqual(['C:/agy/agy.exe', 'models'])
+    expect(commandArgv('/usr/bin/codex', ['login', 'status'], 'linux')).toEqual(['/usr/bin/codex', 'login', 'status'])
   })
 
   it('reports only changes the access level forbids', () => {

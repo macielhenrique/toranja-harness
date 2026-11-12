@@ -57,6 +57,18 @@ export interface ToranjaLegacyModeRequest {
   readonly mode: ToranjaAgentMode
 }
 
+/** Request to start the sign-in of one provider. */
+export interface ToranjaConnectRequest {
+  readonly provider: ToranjaProviderId
+}
+
+/** Sign-in command opened in a terminal for the user to complete. */
+export interface ToranjaConnectResult {
+  readonly provider: ToranjaProviderId
+  /** Executable and arguments running in the terminal. */
+  readonly command: readonly string[]
+}
+
 /** Counters and timestamps for a project lane or provider. */
 export interface MetricSnapshot {
   readonly active: number

@@ -50,6 +50,8 @@
   config:
     providers:
       openai-codex: {}
+      # The key is stored through Settings as OPENROUTER_API_KEY.
+      openrouter: {}
 
 - id: agent-default-model
   name: '@deepseek-ai/dsh-agent-default-model'
@@ -128,6 +130,14 @@
         # added under `projects: []`.
         codexProvider: codex
         antigravityProvider: antigravity
+        # OpenRouter tasks run on the internal `spawn` agent with the model
+        # routed for the role. It joins routing once `routing.openrouter.models`
+        # names at least one model, for example:
+        #   openrouter:
+        #     models:
+        #       light: { model: <openrouter model id> }
+        #       advanced: { model: <openrouter model id> }
+        openrouterProvider: spawn
         # Credit-aware admission: at most four Toranja-owned runs globally,
         # two per project, and two per provider. Two implementers never share
         # one worktree; parallel coding will use separate worktrees in a later slice.

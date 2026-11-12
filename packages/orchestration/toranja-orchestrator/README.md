@@ -35,8 +35,18 @@ command: `codex login status`, `claude auth status`, and `agy models`, which
 succeeds only for a signed-in account. Each provider then reports `connected`,
 `signed-out`, `not-installed`, or `unknown` under `providers[].connection`.
 Routing skips a provider that is signed out or not installed and keeps one that
-is `unknown`, which is every provider before the first probe and OpenRouter
-always. `probeOnStart` runs one probe when the plugin starts.
+is `unknown`, which is every provider before the first probe. OpenRouter has no
+CLI: it is `connected` while the credential `openrouterKeyRef` (by default
+`OPENROUTER_API_KEY`) is stored, and it stays out of routing until
+`routing.openrouter.models` names a model. `probeOnStart` runs one probe when
+the plugin starts.
+
+`connectProvider` opens the provider's official sign-in command in a terminal
+window: `codex login`, `claude auth login`, or `agy`, whose interactive start
+begins its own sign-in. The user completes the sign-in in that window and the
+client reads the result with `probeProviders`. The orchestrator never receives
+account credentials. OpenRouter connects with an API key stored through
+Settings, so `connectProvider` rejects it.
 
 The team size is how many agents may work in one project at the same time. It
 defaults to `maxConcurrentPerProject`, the user changes it with `teamSize` on
@@ -64,13 +74,15 @@ own default. `routing.<provider>.base` is the configuration of that provider's
 plugin. With a `base`, Toranja starts its own provider instance per distinct
 route and applies the route to it; without one, delegations use the
 deployment's unrouted instance and no model is applied, so `models` without
-`base` is rejected at load. `base` is supported for `codex`, `antigravity`, and `claude-code`.
+`base` is rejected at load. `base` is supported for `codex`, `antigravity`, and `claude-code`. `openrouter`
+takes `models` alone, because the internal agent receives its model per start.
 
 | Provider | `read-only` enforcement |
 |---|---|
 | `codex` | Native `read-only` sandbox: writes are denied outside the model. |
 | `antigravity` | `plan` mode without tool auto-approval. The CLI applies it as a directive to the model, so it is advisory. |
 | `claude-code` | Native `plan` permission mode: Claude Code refuses edits and file creation. |
+| `openrouter` | None. The task runs on the internal `spawn` agent (`openrouterProvider`) with `agentOptions` selecting `openrouterLlmProvider` and the routed model; only the working-tree check below applies. |
 
 For `read-only` and `execute` roles Toranja also fingerprints the Git working
 tree before and after the run: the diff against `HEAD`, plus the path, size, and

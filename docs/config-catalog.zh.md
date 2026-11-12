@@ -4366,7 +4366,7 @@ export type ToolPresentationMode = 'native' | 'ptc'
 ## `@deepseek-ai/dsh-toranja-orchestrator`
 
 - `inject`: `storageDomain` · `subagents` · `subprocess` · `systemPrompt` · `tools` · `workspaceRegistry`
-- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:130`](../packages/orchestration/toranja-orchestrator/src/index.ts)
+- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:135`](../packages/orchestration/toranja-orchestrator/src/index.ts)
 
 ```ts config-catalog
 /** Product-owned orchestration settings. */
@@ -4420,6 +4420,10 @@ export interface Config {
   probeOnStart?: boolean
   /** Time limit of one provider status command, in milliseconds. */
   probeTimeoutMs?: number
+  /** LLM provider id that OpenRouter tasks select on the internal agent. */
+  openrouterLlmProvider?: string
+  /** Credential reference holding the OpenRouter API key. */
+  openrouterKeyRef?: string
 }
 
 /** One stable product lane backed by a local project directory. */

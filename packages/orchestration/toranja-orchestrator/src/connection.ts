@@ -92,3 +92,37 @@ export interface ProviderConnection {
   /** Executable the state was read from, when one is installed. */
   readonly executable?: string
 }
+
+/**
+ * Official sign-in command of each CLI. Antigravity has no sign-in subcommand:
+ * starting the CLI interactively begins its own sign-in.
+ */
+export const LOGIN_COMMANDS: Readonly<Record<CliProvider, readonly string[]>> = {
+  codex: ['login'],
+  antigravity: [],
+  'claude-code': ['auth', 'login'],
+}
+
+/**
+ * Build the argv that opens a command in a visible terminal window, where the
+ * user completes an interactive sign-in with the provider's own CLI.
+ * @param command - Executable and arguments to run in the terminal.
+ * @param platform - Platform whose terminal is used.
+ * @returns Argv for a shell-less spawn.
+ */
+export function terminalArgv(command: readonly string[], platform: NodeJS.Platform = process.platform): string[] {
+  switch (platform) {
+    case 'win32':
+      return ['cmd.exe', '/d', '/c', 'start', 'Toranja Harness', 'cmd.exe', '/d', '/k', ...command]
+    case 'darwin': {
+      const script = command.map(part => `'${part.replaceAll("'", String.raw`'\''`)}'`).join(' ')
+      return [
+        'osascript',
+        '-e', `tell application "Terminal" to do script "${script.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`,
+        '-e', 'tell application "Terminal" to activate',
+      ]
+    }
+    default:
+      return ['x-terminal-emulator', '-e', ...command]
+  }
+}

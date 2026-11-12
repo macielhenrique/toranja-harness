@@ -47,6 +47,11 @@ interface Harness {
   /** Answers of the simulated provider CLIs to status commands, keyed by executable path. */
   readonly cli: Map<string, { exitCode: number; stdout: string }>
   readonly probe: () => Promise<ToranjaOrchestrationStatus>
+  readonly connect: (provider: string) => Promise<{ command: readonly string[] }>
+  /** Start requests received by the simulated subagent service, in order. */
+  readonly requests: { provider: string; agentOptions?: Record<string, unknown> }[]
+  /** Credential references the simulated credential store holds. */
+  readonly credentials: Set<string>
 }
 
 const repos: string[] = []
@@ -108,6 +113,9 @@ async function mount(
     failing: new Map(),
     cli: new Map(),
     probe: () => { throw new Error('controller not mounted') },
+    connect: () => { throw new Error('controller not mounted') },
+    requests: [],
+    credentials: new Set(),
   }
   ctx.provide('subprocess', {
     spawn: (spec: { argv: readonly string[]; cwd: string }) => {
@@ -146,8 +154,12 @@ async function mount(
     },
     startActivation: async (start: {
       provider: string
-      request: { cwd: string; signal?: AbortSignal; prompt: { text: string }[] }
+      request: { cwd: string; signal?: AbortSignal; prompt: { text: string }[]; agentOptions?: Record<string, unknown> }
     }) => {
+      harness.requests.push({
+        provider: start.provider,
+        ...start.request.agentOptions === undefined ? {} : { agentOptions: start.request.agentOptions },
+      })
       const family = start.provider.split('~')[0] ?? start.provider
       const refusal = harness.offline.get(family)
       if (refusal !== undefined) throw new Error(refusal)
@@ -177,6 +189,9 @@ async function mount(
       }
     },
   } as never)
+  ctx.provide('credentials', {
+    describe: (ref: string) => Promise.resolve({ configured: harness.credentials.has(ref) }),
+  } as never)
   ctx.provide('tools', { register: (tool: Tool) => { tools.set(tool.name, tool); return () => {} } } as never)
   ctx.provide('systemPrompt', { section: () => () => {}, getSectionOrder: () => 0 } as never)
   ctx.provide('workspaceRegistry', {
@@ -195,6 +210,7 @@ async function mount(
     setMode: (request: Record<string, unknown>) => Promise.resolve(controller.setMode(request as never)),
     adoptLegacyMode: (mode: string) => controller.adoptLegacyMode({ mode: mode as never }),
     probe: () => controller.probeProviders(),
+    connect: async (provider: string) => controller.connectProvider({ provider: provider as never }),
   })
 }
 
@@ -722,7 +738,7 @@ describe('Toranja routed delegation', () => {
       codex: 'connected',
       antigravity: 'not-installed',
       'claude-code': 'signed-out',
-      openrouter: 'unknown',
+      openrouter: 'signed-out',
     })
     expect(harness.cliRuns).toEqual(expect.arrayContaining([
       [bin.codex, 'login', 'status'],
@@ -782,6 +798,64 @@ describe('Toranja routed delegation', () => {
     await harness.setMode({ mode: 'team', teamSize: 2 })
     const two = await delegate(harness, { role: 'reviewer', provider: 'all' })
     expect((two.activations as { provider: string }[]).map(run => run.provider)).toEqual(['codex', 'antigravity'])
+  })
+
+  it('runs an OpenRouter task as an internal agent on the model routed for the role', async () => {
+    const harness = await mount({
+      routing: { ...ROUTING, openrouter: { models: { light: { model: 'meta/llama-small' }, advanced: { model: 'meta/llama-large', effort: 'high' } } } },
+      openrouterProvider: 'spawn',
+    }, ['codex', 'antigravity', 'spawn'])
+    const reader = await delegate(harness, { role: 'reader', provider: 'openrouter' })
+    expect(reader.activations).toEqual([expect.objectContaining({ provider: 'openrouter', providerName: 'spawn', model: 'meta/llama-small' })])
+    expect(harness.requests.at(-1)).toEqual({ provider: 'spawn', agentOptions: { provider: 'openrouter', model: 'meta/llama-small' } })
+    await settled(harness)
+    await delegate(harness, { role: 'planner', provider: 'openrouter' })
+    expect(harness.requests.at(-1)).toEqual({
+      provider: 'spawn',
+      agentOptions: { provider: 'openrouter', model: 'meta/llama-large', reasoningEffort: 'high' },
+    })
+  })
+
+  it('refuses an OpenRouter task when no model is routed for its tier', async () => {
+    const harness = await mount({ routing: ROUTING, openrouterProvider: 'spawn' }, ['codex', 'spawn'])
+    await expect(delegate(harness, { role: 'reader', provider: 'openrouter' }))
+      .rejects.toThrow('routing.openrouter.models has no model for the light tier')
+  })
+
+  it('reports OpenRouter as connected only while its API key is stored', async () => {
+    const harness = await mount({ routing: ROUTING, openrouterProvider: 'spawn' }, ['codex', 'spawn'])
+    const openrouter = async (): Promise<unknown> =>
+      (await harness.probe()).providers.find(provider => provider.id === 'openrouter')?.connection
+    expect(await openrouter()).toBe('signed-out')
+    harness.credentials.add('OPENROUTER_API_KEY')
+    expect(await openrouter()).toBe('connected')
+  })
+
+  it('opens the official sign-in command of a CLI provider in a terminal', async () => {
+    const bin = installed('codex', 'claude')
+    const harness = await mount({
+      routing: ROUTING,
+      executables: { codex: bin.codex, 'claude-code': bin.claude, antigravity: join(tmpdir(), 'no-such-agy') },
+    }, ['codex', 'antigravity', 'claude-code'])
+    expect((await harness.connect('codex')).command).toEqual([bin.codex, 'login'])
+    expect((await harness.connect('claude-code')).command).toEqual([bin.claude, 'auth', 'login'])
+    expect(harness.agyRuns.slice(-2)).toEqual([
+      orchestrator.terminalArgv([bin.codex, 'login']),
+      orchestrator.terminalArgv([bin.claude, 'auth', 'login']),
+    ])
+    await expect(harness.connect('antigravity')).rejects.toThrow('antigravity is not installed')
+    await expect(harness.connect('openrouter')).rejects.toThrow('OpenRouter connects with an API key')
+  })
+
+  it('keeps OpenRouter out of routing until a model is configured for it', async () => {
+    const without = await mount({ routing: ROUTING, openrouterProvider: 'spawn' }, ['spawn'])
+    expect(without.status().providers.find(provider => provider.id === 'openrouter')?.available).toBe(false)
+    const withModel = await mount({
+      routing: { ...ROUTING, openrouter: { models: { light: { model: 'meta/llama-small' }, advanced: { model: 'meta/llama-large' } } } },
+      openrouterProvider: 'spawn',
+    }, ['spawn'])
+    expect(withModel.status().providers.find(provider => provider.id === 'openrouter')?.available).toBe(true)
+    expect(withModel.status().routes.map(route => route.provider)).toEqual(Array.from({ length: 9 }, () => 'openrouter'))
   })
 
   it('delegates through the unrouted instance when Toranja owns none', async () => {
