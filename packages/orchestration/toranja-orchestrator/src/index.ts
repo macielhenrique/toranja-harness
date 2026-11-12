@@ -93,6 +93,8 @@ const PROJECT_ID = /^[a-z][a-z0-9-]{1,31}$/
 const DEFAULT_MAX_TASK_CHARS = 12_000
 /** Largest untracked file compared by content; a larger one is compared by size and time. */
 const UNTRACKED_CONTENT_LIMIT = 5 * 1024 * 1024
+/** Bytes of untracked files read in one fingerprint; past it, the rest are compared by size and time. */
+const UNTRACKED_CONTENT_BUDGET = 64 * 1024 * 1024
 const GIT_GRACE_MS = 3_000
 
 /** Provider plugins Toranja can instantiate per route to fix model, effort, and access. */
@@ -822,13 +824,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    */
   const untrackedHash = async (cwd: string, untracked: Buffer, ignored: Buffer): Promise<string> => {
     const hash = createHash('sha256')
+    // One reading has a total budget too, so a tree full of untracked files does not stall every task.
+    let budget = UNTRACKED_CONTENT_BUDGET
     const list = (listing: Buffer): string[] => listing.toString('utf8').split('\0').filter(Boolean).sort()
     for (const [paths, byContent] of [[list(untracked), true], [list(ignored), false]] as const) {
       for (const path of paths) {
         const facts = await stat(join(cwd, path)).then(
-          async entry => byContent && entry.isFile() && entry.size <= UNTRACKED_CONTENT_LIMIT
-            ? createHash('sha256').update(await readFile(join(cwd, path))).digest('hex')
-            : `${entry.size}:${entry.mtimeMs}`,
+          async (entry) => {
+            if (!byContent || !entry.isFile() || entry.size > UNTRACKED_CONTENT_LIMIT || entry.size > budget) {
+              return `${entry.size}:${entry.mtimeMs}`
+            }
+            budget -= entry.size
+            return createHash('sha256').update(await readFile(join(cwd, path))).digest('hex')
+          },
           () => 'missing',
         )
         hash.update(`${path}\0${facts}\0`)
