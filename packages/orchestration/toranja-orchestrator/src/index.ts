@@ -48,6 +48,7 @@ import {
 } from './connection.ts'
 import {
   MODEL_TIERS,
+  READ_ONLY_ENFORCEMENT,
   accessViolation,
   isProviderFailure,
   resolveRoute,
@@ -60,6 +61,7 @@ import {
 import type {
   ToranjaAgentMode,
   ToranjaAgentModeRequest,
+  ToranjaSettingsRequest,
   ToranjaConnectRequest,
   ToranjaConnectResult,
   ToranjaLegacyModeRequest,
@@ -148,6 +150,8 @@ export interface Config {
   maxConcurrentTotal?: number
   /** Maximum active runs in one project lane. */
   maxConcurrentPerProject?: number
+  /** Largest team size the user may set; it bounds how far the team size raises the concurrency limits. */
+  maxTeamSize?: number
   /** Maximum active runs on one provider. */
   maxConcurrentPerProvider?: number
   /** Maximum length of one delegated task or gate input. */
@@ -207,6 +211,7 @@ export const Config: z<Config> = z.object({
   openrouterProvider: z.string().min(1).default('openrouter'),
   maxConcurrentTotal: z.number().default(4),
   maxConcurrentPerProject: z.number().default(2),
+  maxTeamSize: z.number().default(8),
   maxConcurrentPerProvider: z.number().default(2),
   maxTaskChars: z.number().default(DEFAULT_MAX_TASK_CHARS),
   allowParallelImplementation: z.boolean().default(false),
@@ -248,7 +253,9 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
   constructor(
     ctx: Context,
     private readonly read: () => ToranjaOrchestrationStatus,
-    private readonly writeMode: (request: ToranjaAgentModeRequest) => Promise<ToranjaOrchestrationStatus>,
+    private readonly write: (
+      request: ToranjaSettingsRequest & { readonly mode?: ToranjaAgentMode },
+    ) => Promise<ToranjaOrchestrationStatus>,
     private readonly adoptMode: (mode: ToranjaAgentMode) => Promise<ToranjaOrchestrationStatus>,
     private readonly probe: () => Promise<ToranjaOrchestrationStatus>,
     private readonly connect: (request: ToranjaConnectRequest) => ToranjaConnectResult,
@@ -266,14 +273,31 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
   }
 
   /**
-   * Change the routing mode, execution profile, fallback order, provider per
-   * role, or cross-review setting, and store the result durably.
+   * Change the routing mode, optionally together with other settings, and
+   * store the result durably.
    * @param request - Target routing mode and the optional settings to replace.
    * @returns Updated orchestration snapshot, after the change is durable.
    */
   @Remote
   setMode(request: ToranjaAgentModeRequest): Promise<ToranjaOrchestrationStatus> {
-    return this.writeMode(request)
+    return this.write(request)
+  }
+
+  /**
+   * Change the execution profile, fallback order, provider per role,
+   * cross-review setting, team size, or tier models, and store the result
+   * durably. The routing mode is left as stored, so a caller holding an older
+   * snapshot does not undo a mode chosen meanwhile. A change applies to tasks
+   * started afterwards; a running task keeps the route it started with.
+   * @param request - The settings to replace; omitted ones keep their value.
+   * @returns Updated orchestration snapshot, after the change is durable.
+   */
+  @Remote
+  updateSettings(request: ToranjaSettingsRequest): Promise<ToranjaOrchestrationStatus> {
+    // Remote input is untyped at run time: a `mode` slipped into this request
+    // must not change the routing mode.
+    const { mode: _mode, ...settings } = request as ToranjaSettingsRequest & { readonly mode?: unknown }
+    return this.write(settings)
   }
 
   /**
@@ -476,6 +500,8 @@ interface LiveSettings {
   readonly roleProviders: ReadonlyMap<Role, RunProvider>
   readonly crossReview: boolean
   readonly teamSize: number
+  /** Tier models in force per provider: the user's over the deployment's. */
+  readonly models: ReadonlyMap<RunProvider, ProviderModels>
 }
 
 interface ProviderRouting {
@@ -566,9 +592,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     maxConcurrentPerProvider: Math.max(configuredLimits.maxConcurrentPerProvider, teamSize),
     allowParallelImplementation: configuredLimits.allowParallelImplementation,
   })
+  const maxTeamSize = positiveInteger('maxTeamSize', config.maxTeamSize ?? 8)
   const ledger = new OrchestrationLedger(() => limitsFor(live().teamSize))
   const domain = await ctx.storageDomain.open(toranjaOrchestrationDomain)
   ctx.effect(() => () => domain.close(), 'toranja-orchestrator.domainClose')
+  const routing = parseRouting(config)
+  /**
+   * Whether tier models reach a provider's tasks: Toranja starts its own
+   * instance of the provider per model, or the provider takes the model per
+   * task as OpenRouter does.
+   */
+  const tierModelsEditable = (provider: RunProvider): boolean =>
+    provider === 'openrouter' || (isVariantProvider(provider) && routing.get(provider)?.base !== undefined)
+  /** Tier models in force: per tier, what the user stored over the deployment table. */
+  const modelsInForce = (stored: ToranjaOrchestrationState['tierModels']): Map<RunProvider, ProviderModels> =>
+    new Map(RUN_PROVIDERS.map((provider) => {
+      const editable = tierModelsEditable(provider)
+      return [provider, {
+        ...editable ? routing.get(provider)?.models : {},
+        ...editable ? stored?.[provider] : {},
+      }]
+    }))
   const defaults = {
     mode: config.defaultMode ?? 'team',
     profile: config.defaultProfile ?? 'equilibrado',
@@ -576,6 +620,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     roleProviders: parseRoleProviders(config),
     crossReview: config.crossReview ?? true,
     teamSize: configuredLimits.maxConcurrentPerProject,
+    models: modelsInForce(undefined),
   } satisfies LiveSettings
   // The stored global is the only source of the live routing: every reader
   // resolves it over the deployment defaults, so a change is visible to
@@ -595,6 +640,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           : parseRoleProviders({ roleProviders: stored.roleProviders }),
         crossReview: stored.crossReview ?? defaults.crossReview,
         teamSize: stored.teamSize ?? defaults.teamSize,
+        models: stored.tierModels === undefined ? defaults.models : modelsInForce(stored.tierModels),
       }
     }
     return resolved
@@ -613,20 +659,55 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   }
 
-  const routing = parseRouting(config)
-  const routeFor = (role: Role, provider: RunProvider): ToranjaRoleRoute => {
-    const entry = routing.get(provider)
-    const applied = entry !== undefined && (entry.base !== undefined || provider === 'openrouter')
-    return resolveRoute(role, live().profile, provider, applied ? entry.models : {})
-  }
-  for (const [provider, entry] of routing) {
-    if (entry.base === undefined || !isVariantProvider(provider)) continue
+  const routeFor = (role: Role, provider: RunProvider): ToranjaRoleRoute =>
+    resolveRoute(role, live().profile, provider, live().models.get(provider) ?? {})
+  /**
+   * Check that every instance a tier table can lead to has a valid provider
+   * configuration, so a model or effort the provider rejects fails when it is
+   * set and not when a task first needs it.
+   */
+  const validateVariants = (provider: RunProvider, models: ProviderModels): void => {
+    const base = routing.get(provider)?.base
+    if (base === undefined || !isVariantProvider(provider)) return
     for (const role of ROLES) {
       for (const candidate of ['economico', 'equilibrado', 'qualidade'] as const) {
-        const route = resolveRoute(role, candidate, provider, entry.models)
-        VARIANT_PLUGINS[provider].Config(variantConfig(provider, entry.base, route, variantName(providerName(provider), route)))
+        const route = resolveRoute(role, candidate, provider, models)
+        VARIANT_PLUGINS[provider].Config(variantConfig(provider, base, route, variantName(providerName(provider), route)))
       }
     }
+  }
+  for (const [provider, entry] of routing) validateVariants(provider, entry.models)
+  /** Validate the tier models of a settings request and return them trimmed. */
+  const parseTierModels = (
+    requested: NonNullable<ToranjaAgentModeRequest['tierModels']>,
+  ): NonNullable<ToranjaOrchestrationState['tierModels']> => {
+    const parsed: NonNullable<ToranjaOrchestrationState['tierModels']> = {}
+    for (const [key, table] of Object.entries(requested)) {
+      const provider = RUN_PROVIDERS.find(candidate => candidate === key)
+      if (provider === undefined) throw new Error(`toranja-orchestrator: tierModels names unknown provider ${JSON.stringify(key)}`)
+      if (!tierModelsEditable(provider)) {
+        throw new Error(`toranja-orchestrator: tierModels.${provider} cannot be set; the deployment gives Toranja no instance of ${provider} to apply a model to`)
+      }
+      const models: Partial<Record<typeof MODEL_TIERS[number], { model?: string; effort?: string }>> = {}
+      for (const [tierKey, entry] of Object.entries(table)) {
+        const tier = MODEL_TIERS.find(candidate => candidate === tierKey)
+        if (tier === undefined) throw new Error(`toranja-orchestrator: tierModels.${provider} names unknown tier ${JSON.stringify(tierKey)}`)
+        const text = (field: 'model' | 'effort'): string | undefined => {
+          const value: unknown = entry[field]
+          if (value === undefined) return undefined
+          if (typeof value !== 'string' || value.trim().length === 0) {
+            throw new Error(`toranja-orchestrator: tierModels.${provider}.${tier}.${field} must not be empty`)
+          }
+          return value.trim()
+        }
+        const model = text('model')
+        const effort = text('effort')
+        models[tier] = { ...model === undefined ? {} : { model }, ...effort === undefined ? {} : { effort } }
+      }
+      validateVariants(provider, { ...routing.get(provider)?.models, ...models })
+      parsed[provider] = models
+    }
+    return parsed
   }
   const variants = new Map<string, Promise<string>>()
   /** Registry name of the provider instance that enforces `route`, started on first use. */
@@ -888,7 +969,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   /** A provider is usable unless a probe found its CLI missing or signed out. */
   const usable = (provider: RunProvider): boolean => {
     // OpenRouter has no default model: until one is routed it cannot run a task.
-    if (provider === 'openrouter' && Object.keys(routing.get('openrouter')?.models ?? {}).length === 0) return false
+    if (provider === 'openrouter' && Object.keys(live().models.get('openrouter') ?? {}).length === 0) return false
     const { connection } = connectionOf(provider)
     return connection === 'connected' || connection === 'unknown'
   }
@@ -1029,13 +1110,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       crossReview: live().crossReview,
       teamSize: live().teamSize,
       active: ledger.activeCount,
-      limits: limitsFor(live().teamSize),
+      limits: { ...limitsFor(live().teamSize), maxTeamSize },
       projects: lanes.map(project => ({ ...project, metrics: ledger.project(project.id) })),
       providers: RUN_PROVIDERS.map(provider => ({
         id: provider,
         registryName: providerName(provider),
         available: registered.has(providerName(provider)) && usable(provider),
         ...connectionOf(provider),
+        readOnlyEnforcement: provider !== 'openrouter' && tierModelsEditable(provider) ? READ_ONLY_ENFORCEMENT[provider] : 'none',
+        tierModels: live().models.get(provider) ?? {},
+        tierModelOverrides: tierModelsEditable(provider) ? domain.global.get().tierModels?.[provider] ?? {} : {},
+        tierModelsEditable: tierModelsEditable(provider),
         metrics: ledger.provider(provider),
       })),
       routes: ROLES.map(role => routeFor(role, providerFor(role))),
@@ -1107,19 +1192,40 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // step. Running the steps one after another keeps overlapping changes from
   // starting at the same stored value and overwriting each other.
   let settingsQueue: Promise<unknown> = Promise.resolve()
-  const applySettings = async (request: ToranjaAgentModeRequest): Promise<ToranjaOrchestrationStatus> => {
+  const applySettings = async (
+    request: ToranjaSettingsRequest & { readonly mode?: ToranjaAgentMode },
+  ): Promise<ToranjaOrchestrationStatus> => {
     // Only the fields this request names join the stored overrides, so a field
     // the user never changed keeps following the deployment configuration.
+    const stored = domain.global.get()
+    // A named provider's table replaces what was stored for it, and an empty
+    // table drops it; providers the request does not name keep theirs.
+    const tierModels = request.tierModels === undefined
+      ? undefined
+      : Object.fromEntries(Object.entries({ ...stored.tierModels, ...parseTierModels(request.tierModels) })
+        .filter(([, table]) => Object.keys(table).length > 0))
+    const fallbackOrder = request.fallbackOrder === undefined || request.fallbackOrder.length === 0
+      ? undefined
+      : request.fallbackOrder.map((key, index, order) => {
+        const provider = RUN_PROVIDERS.find(candidate => candidate === key)
+        if (provider === undefined) throw new Error(`toranja-orchestrator: fallbackOrder names unknown provider ${JSON.stringify(key)}`)
+        if (order.indexOf(key) !== index) throw new Error(`toranja-orchestrator: fallbackOrder repeats ${provider}`)
+        return provider
+      })
+    if (request.teamSize !== undefined && positiveInteger('teamSize', request.teamSize) > maxTeamSize) {
+      throw new Error(`toranja-orchestrator: teamSize must not exceed ${maxTeamSize}, the deployment's maxTeamSize`)
+    }
     const next: ToranjaOrchestrationState = {
-      ...domain.global.get(),
-      mode: request.mode,
+      ...stored,
+      // The mode changes only when the request names one, so a setting changed
+      // from a stale snapshot cannot undo a mode chosen meanwhile.
+      ...request.mode === undefined ? {} : { mode: request.mode },
       ...request.profile === undefined ? {} : { profile: request.profile },
-      ...request.fallbackOrder === undefined || request.fallbackOrder.length === 0
-        ? {}
-        : { fallbackOrder: [...request.fallbackOrder] },
+      ...fallbackOrder === undefined ? {} : { fallbackOrder },
       ...request.roleProviders === undefined ? {} : { roleProviders: { ...request.roleProviders } },
       ...request.crossReview === undefined ? {} : { crossReview: request.crossReview },
       ...request.teamSize === undefined ? {} : { teamSize: positiveInteger('teamSize', request.teamSize) },
+      ...tierModels === undefined ? {} : { tierModels },
     }
     // Validate before storing. The live routing derives from the stored
     // value, so a failed write leaves the routing in force untouched.

@@ -34,22 +34,53 @@ export interface ToranjaRoleRoute {
   readonly effort?: string
 }
 
+/** Model and reasoning effort of one tier; an omitted field keeps the provider's native setting. */
+export interface ToranjaTierModel {
+  readonly model?: string | undefined
+  readonly effort?: string | undefined
+}
+
+/** Tier-to-model table of one provider. `max` uses the `advanced` entry when it has none. */
+export type ToranjaTierModels = Readonly<Partial<Record<ToranjaModelTier, ToranjaTierModel>>>
+
+/**
+ * How a provider keeps a `read-only` task from writing: `sandbox` and
+ * `permission-mode` block writes outside the model, `advisory` relies on the
+ * model following the provider's plan directive, and `none` means nothing
+ * prevents writing and only the working-tree check detects it afterwards.
+ */
+export type ToranjaReadOnlyEnforcement = 'sandbox' | 'permission-mode' | 'advisory' | 'none'
+
 /** Preferred provider per role; a role without an entry uses the built-in default. */
 export type ToranjaRoleProviders = Readonly<Partial<Record<ToranjaTaskRole, ToranjaProviderId>>>
 /** Lifecycle state of a delegated project task. */
 export type ToranjaTaskState = 'active' | 'completed' | 'failed'
 
-/** Request payload to change the active Toranja agent routing mode or execution profile. */
-export interface ToranjaAgentModeRequest {
-  readonly mode: ToranjaAgentMode
+/**
+ * Orchestration settings a request changes. Each omitted field keeps its
+ * stored value, so a request names only what the user changed.
+ */
+export interface ToranjaSettingsRequest {
   readonly profile?: ToranjaExecutionProfile
   readonly fallbackOrder?: readonly ToranjaProviderId[]
   /** Replaces the preferred provider per role used in Team mode. */
   readonly roleProviders?: ToranjaRoleProviders
   /** Whether the delivery-gate reviewer avoids the implementing provider. */
   readonly crossReview?: boolean
-  /** How many agents may work in one project at the same time. */
+  /** How many agents may work in one project at the same time, up to the deployment's `maxTeamSize`. */
   readonly teamSize?: number
+  /**
+   * Tier models the user sets, per provider. Each named provider's table
+   * replaces what the user set for it before: a tier it omits follows the
+   * deployment configuration, and an empty table drops the user's models for
+   * that provider. Providers not named keep theirs.
+   */
+  readonly tierModels?: Readonly<Partial<Record<ToranjaProviderId, ToranjaTierModels>>>
+}
+
+/** Request to change the routing mode, optionally together with other settings. */
+export interface ToranjaAgentModeRequest extends ToranjaSettingsRequest {
+  readonly mode: ToranjaAgentMode
 }
 
 /** Routing mode an earlier client version kept in browser storage. */
@@ -97,6 +128,14 @@ export interface ToranjaProviderStatus {
   readonly connection: ToranjaProviderConnection
   /** Executable the sign-in state was read from, when one is installed. */
   readonly executable?: string
+  /** How this provider keeps a `read-only` task from writing in this deployment. */
+  readonly readOnlyEnforcement: ToranjaReadOnlyEnforcement
+  /** Model and effort in force per tier: what the user set over the deployment configuration. */
+  readonly tierModels: ToranjaTierModels
+  /** Tiers the user set for this provider; the other tiers follow the deployment configuration. */
+  readonly tierModelOverrides: ToranjaTierModels
+  /** Whether tier models can be applied to this provider in this deployment. */
+  readonly tierModelsEditable: boolean
   readonly metrics: MetricSnapshot
 }
 
@@ -147,6 +186,8 @@ export interface ToranjaOrchestrationStatus {
     readonly maxConcurrentTotal: number
     readonly maxConcurrentPerProject: number
     readonly maxConcurrentPerProvider: number
+    /** Largest team size the deployment accepts. */
+    readonly maxTeamSize: number
     readonly allowParallelImplementation: boolean
   }
   readonly projects: readonly ToranjaProjectStatus[]

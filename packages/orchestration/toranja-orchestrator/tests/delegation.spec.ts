@@ -33,6 +33,8 @@ interface Harness {
   readonly tool: (name: string) => Tool
   readonly status: () => ToranjaOrchestrationStatus
   readonly setMode: (request: Record<string, unknown>) => Promise<ToranjaOrchestrationStatus>
+  /** Change settings without naming the routing mode. */
+  readonly update: (request: Record<string, unknown>) => Promise<ToranjaOrchestrationStatus>
   readonly adoptLegacyMode: (mode: string) => Promise<ToranjaOrchestrationStatus>
   /** Side effect each simulated agent performs in the project directory. */
   agentSideEffect: (cwd: string) => void
@@ -109,6 +111,7 @@ async function mount(
     },
     status: () => ctx.toranjaOrchestrator.status(),
     setMode: () => { throw new Error('controller not mounted') },
+    update: () => { throw new Error('controller not mounted') },
     adoptLegacyMode: () => { throw new Error('controller not mounted') },
     agentSideEffect: () => {},
     answer: 'TORANJA_GATE: PASS\nall criteria inspected',
@@ -216,6 +219,7 @@ async function mount(
     .toranjaOrchestrationController
   return Object.assign(harness, {
     setMode: (request: Record<string, unknown>) => Promise.resolve(controller.setMode(request as never)),
+    update: (request: Record<string, unknown>) => Promise.resolve(controller.updateSettings(request as never)),
     adoptLegacyMode: (mode: string) => controller.adoptLegacyMode({ mode: mode as never }),
     probe: () => controller.probeProviders(),
     connect: async (provider: string) => controller.connectProvider({ provider: provider as never }),
@@ -934,6 +938,131 @@ describe('Toranja routed delegation', () => {
     expect(result.activations).toEqual([expect.objectContaining({ providerName: 'codex', tier: 'light', access: 'read-only' })])
     expect(result.activations).toHaveLength(1)
     expect((result.activations as object[])[0]).not.toHaveProperty('model')
+  })
+
+  it('reports per provider the model of each tier, whether the user can change it, and how reading is enforced', async () => {
+    const harness = await mount({ routing: ROUTING, openrouterProvider: 'spawn' }, ['codex', 'antigravity', 'claude-code', 'spawn'])
+    const providers = Object.fromEntries(harness.status().providers.map(provider => [provider.id, provider]))
+    expect(providers.codex).toMatchObject({
+      readOnlyEnforcement: 'sandbox',
+      tierModelsEditable: true,
+      tierModelOverrides: {},
+      tierModels: {
+        light: { model: 'gpt-light', effort: 'low' },
+        advanced: { model: 'gpt-strong', effort: 'medium' },
+        max: { model: 'gpt-strong', effort: 'high' },
+      },
+    })
+    expect(providers.antigravity).toMatchObject({
+      readOnlyEnforcement: 'advisory',
+      tierModelsEditable: true,
+      tierModels: { light: { model: 'gemini-flash-low' }, advanced: { model: 'gemini-argon-medium' } },
+    })
+    // Toranja owns no Claude Code instance here, so it neither enforces reading nor applies a model.
+    expect(providers['claude-code']).toMatchObject({ readOnlyEnforcement: 'none', tierModelsEditable: false, tierModels: {} })
+    expect(providers.openrouter).toMatchObject({ readOnlyEnforcement: 'none', tierModelsEditable: true, tierModels: {} })
+  })
+
+  it('applies a model the user sets for a tier at once and after a restart, and restores the deployment model', async () => {
+    const disk = new MemoryMediaPool()
+    const codex = (harness: Harness) => harness.status().providers.find(provider => provider.id === 'codex')
+    const first = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    await first.setMode({ mode: 'codex', tierModels: { codex: { light: { model: 'gpt-tiny', effort: 'low' } } } })
+    expect(codex(first)).toMatchObject({
+      tierModelOverrides: { light: { model: 'gpt-tiny', effort: 'low' } },
+      tierModels: { light: { model: 'gpt-tiny', effort: 'low' }, advanced: { model: 'gpt-strong', effort: 'medium' } },
+    })
+    expect(codex(first)?.tierModelOverrides).not.toHaveProperty('advanced')
+    const reader = await delegate(first, { role: 'reader' })
+    expect(reader.activations).toEqual([expect.objectContaining({ provider: 'codex', model: 'gpt-tiny', effort: 'low' })])
+    await settled(first)
+
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(codex(restarted)).toMatchObject({
+      tierModelOverrides: { light: { model: 'gpt-tiny', effort: 'low' } },
+      tierModels: { light: { model: 'gpt-tiny', effort: 'low' } },
+    })
+    // An empty table for a provider drops what the user set for it.
+    await restarted.setMode({ mode: 'codex', tierModels: { codex: {} } })
+    expect(codex(restarted)).toMatchObject({ tierModelOverrides: {}, tierModels: { light: { model: 'gpt-light', effort: 'low' } } })
+    expect(codex(restarted)?.tierModelOverrides).toEqual({})
+  })
+
+  it('keeps the models of one provider when the user changes those of another', async () => {
+    const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity'])
+    await harness.setMode({ mode: 'team', tierModels: { codex: { max: { model: 'gpt-max', effort: 'high' } } } })
+    await harness.setMode({ mode: 'team', tierModels: { antigravity: { light: { model: 'gemini-flash-medium' } } } })
+    const providers = Object.fromEntries(harness.status().providers.map(provider => [provider.id, provider]))
+    expect(providers.codex?.tierModels).toMatchObject({ max: { model: 'gpt-max', effort: 'high' } })
+    expect(providers.antigravity?.tierModels).toMatchObject({ light: { model: 'gemini-flash-medium' }, advanced: { model: 'gemini-argon-medium' } })
+  })
+
+  it('lets the user route OpenRouter by setting its models, without a deployment table', async () => {
+    const harness = await mount({ routing: ROUTING, openrouterProvider: 'spawn' }, ['codex', 'antigravity', 'spawn'])
+    const openrouter = () => harness.status().providers.find(provider => provider.id === 'openrouter')
+    expect(openrouter()).toMatchObject({ available: false })
+    await harness.setMode({ mode: 'team', tierModels: { openrouter: { advanced: { model: 'meta/llama-large' } } } })
+    expect(openrouter()).toMatchObject({ available: true, tierModels: { advanced: { model: 'meta/llama-large' } } })
+    await delegate(harness, { role: 'implementer', provider: 'openrouter' })
+    expect(harness.requests.at(-1)).toEqual({ provider: 'spawn', agentOptions: { provider: 'openrouter', model: 'meta/llama-large' } })
+  })
+
+  it('rejects tier models the provider cannot apply and leaves the stored ones untouched', async () => {
+    const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity', 'claude-code'])
+    await harness.setMode({ mode: 'team', tierModels: { codex: { light: { model: 'gpt-tiny' } } } })
+    await expect(harness.setMode({ mode: 'team', tierModels: { 'claude-code': { light: { model: 'haiku' } } } }))
+      .rejects.toThrow('tierModels.claude-code cannot be set')
+    await expect(harness.setMode({ mode: 'team', tierModels: { codex: { turbo: { model: 'x' } } } }))
+      .rejects.toThrow('unknown tier "turbo"')
+    await expect(harness.setMode({ mode: 'team', tierModels: { codex: { light: { model: '  ' } } } }))
+      .rejects.toThrow('tierModels.codex.light.model must not be empty')
+    await expect(harness.setMode({ mode: 'team', tierModels: { gemini: { light: { model: 'x' } } } }))
+      .rejects.toThrow('unknown provider "gemini"')
+    expect(harness.status().providers.find(provider => provider.id === 'codex')?.tierModels).toMatchObject({ light: { model: 'gpt-tiny' } })
+  })
+
+  it('changes one setting without restating the mode, so a mode chosen meanwhile is kept', async () => {
+    const disk = new MemoryMediaPool()
+    const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    // Another window switched to Codex after this one last read the status.
+    await harness.setMode({ mode: 'codex' })
+    await harness.update({ crossReview: false })
+    await harness.update({ profile: 'economico' })
+    expect(harness.status()).toMatchObject({ mode: 'codex', crossReview: false, profile: 'economico' })
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(restarted.status()).toMatchObject({ mode: 'codex', crossReview: false, profile: 'economico' })
+  })
+
+  it('rejects a fallback order that repeats or misnames a provider', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await expect(harness.update({ fallbackOrder: ['codex', 'codex'] })).rejects.toThrow('fallbackOrder repeats codex')
+    await expect(harness.update({ fallbackOrder: ['codex', 'gemini'] })).rejects.toThrow('fallbackOrder names unknown provider "gemini"')
+    expect(harness.status().fallbackOrder).toEqual(['codex', 'antigravity', 'claude-code', 'openrouter'])
+    await harness.update({ fallbackOrder: ['antigravity', 'codex'] })
+    expect(harness.status().fallbackOrder).toEqual(['antigravity', 'codex'])
+  })
+
+  it('caps the team size at the deployment limit and reports that limit', async () => {
+    const harness = await mount({ routing: ROUTING, maxTeamSize: 4 })
+    expect(harness.status().limits).toMatchObject({ maxTeamSize: 4 })
+    await harness.update({ teamSize: 4 })
+    await expect(harness.update({ teamSize: 5 })).rejects.toThrow('teamSize must not exceed 4')
+    expect(harness.status().teamSize).toBe(4)
+    expect((await mount({ routing: ROUTING })).status().limits).toMatchObject({ maxTeamSize: 8 })
+  })
+
+  it('keeps a running task on the model it started with when the tier model changes', async () => {
+    const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity'])
+    await harness.setMode({ mode: 'codex' })
+    const release = Promise.withResolvers<undefined>()
+    harness.hold = release.promise
+    await delegate(harness, { role: 'reader' })
+    await harness.update({ tierModels: { codex: { light: { model: 'gpt-tiny', effort: 'low' } } } })
+    expect(harness.status().tasks.find(task => task.state === 'active')).toMatchObject({ model: 'gpt-light', effort: 'low' })
+    const next = await delegate(harness, { role: 'searcher' })
+    expect(next.activations).toEqual([expect.objectContaining({ model: 'gpt-tiny', effort: 'low' })])
+    release.resolve(undefined)
+    await settled(harness)
   })
 
   it('rejects routing that names unknown providers, tiers, roles, or invalid provider settings', async () => {

@@ -16,6 +16,8 @@ const role = z.enum([
   'release',
 ])
 
+const tierModel = z.object({ model: z.string().min(1).optional(), effort: z.string().min(1).optional() })
+
 /**
  * Stored orchestration state. Every field is optional: an absent field means
  * the user never changed it and the deployment default applies.
@@ -27,6 +29,7 @@ export const toranjaOrchestrationState = z.object({
   roleProviders: z.partialRecord(role, provider).optional(),
   crossReview: z.boolean().optional(),
   teamSize: z.number().int().positive().optional(),
+  tierModels: z.partialRecord(provider, z.partialRecord(z.enum(['light', 'advanced', 'max']), tierModel)).optional(),
 })
 
 /** Stored orchestration state inferred from {@link toranjaOrchestrationState}. */

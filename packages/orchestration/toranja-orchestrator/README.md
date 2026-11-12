@@ -18,14 +18,31 @@ delegations that omit an explicit provider:
 
 ## Stored choices
 
-The controller's `setMode` changes the mode, execution profile, fallback order,
-provider per role, cross-review setting, and team size. It stores the fields the request
-names in the `toranja_orchestration` storage domain and changes the live routing
-only after that write succeeds; a failed write rejects and leaves the routing in
-force. On restart each stored field replaces the matching `Config` default; a
-field the user never changed is not stored and keeps following the
-configuration. Model routing (`routing`) and concurrency
-limits stay configuration-only.
+The controller's `setMode` changes the routing mode, and `updateSettings`
+changes the execution profile, fallback order, provider per role, cross-review
+setting, team size, and tier models without naming the mode, so a client
+holding an older snapshot does not undo a mode chosen meanwhile. Both store the
+fields the request names in the `toranja_orchestration` storage domain and
+change the live routing only after that write succeeds; a failed write rejects
+and leaves the routing in force. On restart each stored field replaces the
+matching `Config` default; a field the user never changed is not stored and
+keeps following the configuration. A change applies to tasks started
+afterwards: a running task keeps the provider, model, and effort it started
+with. `fallbackOrder` rejects an unknown or repeated provider.
+
+`tierModels` sets the model and effort of a tier per provider. Each provider the
+request names has its table replaced: a tier it omits follows
+`routing.<provider>.models`, and an empty table drops what the user set for that
+provider. The request is validated against every provider instance the table
+can lead to before it is stored. It is accepted only for a provider whose tasks
+a model can reach: one with `routing.<provider>.base`, so Toranja owns its
+instances, and OpenRouter, which takes the model per task. Each provider reports
+the result under `providers[]`: `tierModels` is the table in force,
+`tierModelOverrides` the tiers the user set, `tierModelsEditable` whether the
+deployment allows setting them, and `readOnlyEnforcement` how a `read-only`
+task is kept from writing there (`none` when Toranja owns no instance of the
+provider). Provider instances (`routing.<provider>.base`), executables,
+credential references, and the concurrency limits stay configuration-only.
 
 ## Connected providers and team size
 
@@ -39,7 +56,7 @@ providers that are `connected` or `unknown`, which is every provider before the
 first probe. OpenRouter has no
 CLI: it is `connected` while the credential `openrouterKeyRef` (by default
 `OPENROUTER_API_KEY`) is stored, and it stays out of routing until
-`routing.openrouter.models` names a model. `probeOnStart` runs one probe when
+`routing.openrouter.models` or the user's `tierModels` names a model. `probeOnStart` runs one probe when
 the plugin starts.
 
 `connectProvider` opens the provider's official sign-in command in a terminal
@@ -50,9 +67,9 @@ account credentials. OpenRouter connects with an API key stored through
 Settings, so `connectProvider` rejects it.
 
 The team size is how many agents may work in one project at the same time. It
-defaults to `maxConcurrentPerProject`, the user changes it with `teamSize` on
-`setMode`, and it is stored like the other choices. The total and per-provider
-limits never fall below it. In `delegate_project_task`, provider `both` runs a
+defaults to `maxConcurrentPerProject`, the user changes it with `teamSize` up to
+`maxTeamSize` (8 by default, reported as `limits.maxTeamSize`), and it is stored
+like the other choices. The total and per-provider limits never fall below it. In `delegate_project_task`, provider `both` runs a
 task on the first two connected providers in `fallbackOrder` and `all` on every
 connected provider up to the team size.
 

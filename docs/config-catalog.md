@@ -4364,7 +4364,7 @@ export type ToolPresentationMode = 'native' | 'ptc'
 ## `@deepseek-ai/dsh-toranja-orchestrator`
 
 - `inject`: `storageDomain` · `subagents` · `subprocess` · `systemPrompt` · `tools` · `workspaceRegistry`
-- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:136`](../packages/orchestration/toranja-orchestrator/src/index.ts)
+- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:138`](../packages/orchestration/toranja-orchestrator/src/index.ts)
 
 ```ts config-catalog
 /** Product-owned orchestration settings. */
@@ -4383,6 +4383,8 @@ export interface Config {
   maxConcurrentTotal?: number
   /** Maximum active runs in one project lane. */
   maxConcurrentPerProject?: number
+  /** Largest team size the user may set; it bounds how far the team size raises the concurrency limits. */
+  maxTeamSize?: number
   /** Maximum active runs on one provider. */
   maxConcurrentPerProvider?: number
   /** Maximum length of one delegated task or gate input. */
