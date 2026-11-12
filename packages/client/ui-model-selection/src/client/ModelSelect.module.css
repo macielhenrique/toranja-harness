@@ -329,3 +329,49 @@
   height: 12px;
   color: var(--dsw-alias-menu-icon);
 }
+
+/* One model row: the selectable model and, when it has reasoning levels, the
+   arrow that opens them beside the row. */
+.modelRow {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+}
+
+.modelRow > .option {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.effortArrow {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.effortArrow:hover:not(:disabled),
+.effortArrow:focus-visible,
+.effortArrowOpen {
+  background: var(--dsh-color-fill-hover, rgba(127, 127, 127, 0.16));
+  opacity: 1;
+}
+
+.effortArrow:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.submenu {
+  position: fixed;
+  z-index: 1001;
+  min-width: 160px;
+  padding: 4px;
+}
