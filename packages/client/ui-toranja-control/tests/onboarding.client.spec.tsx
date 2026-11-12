@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /** The first-run setup over a scripted Host: when it shows, what each step sends, and how it ends. */
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type {
   ToranjaOrchestrationStatus,
@@ -127,10 +127,28 @@ describe('Toranja first-run setup', () => {
     fireEvent.click(within(dialog).getByRole('radio', { name: 'Só Codex' }))
     await waitFor(() => { expect(within(dialog).getByRole('radio', { name: 'Só Codex' }).getAttribute('aria-checked')).toBe('true') })
     // The check answers late, with the snapshot from before the choice.
-    check.resolve(status())
-    await new Promise((resolve) => { setTimeout(resolve, 20) })
+    // Awaited inside act, so the late answer is fully handled before the assertion.
+    await act(async () => {
+      check.resolve(status())
+      await check.promise
+    })
     expect(within(dialog).getByRole('radio', { name: 'Só Codex' }).getAttribute('aria-checked')).toBe('true')
     expect(host.setMode).toHaveBeenCalledTimes(1)
+  })
+
+  it('says why a change made in the second step was rejected, however late the answer comes', async () => {
+    const host = mount()
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Continuar' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Como você quer trabalhar' })
+    const slow = Promise.withResolvers<ToranjaOrchestrationStatus>()
+    host.updateSettings.mockReturnValueOnce(slow.promise)
+    fireEvent.click(within(within(dialog).getByRole('group', { name: 'Tamanho da equipe' })).getByRole('button', { name: 'Aumentar a equipe' }))
+    await waitFor(() => { expect(host.updateSettings).toHaveBeenCalledTimes(1) })
+    await act(async () => {
+      slow.reject(new Error('too late to matter'))
+      await slow.promise.catch(() => undefined)
+    })
+    expect((await within(dialog).findByRole('alert')).textContent).toContain('too late to matter')
   })
 
   it('shows the last known sign-in states when reading them fresh fails', async () => {

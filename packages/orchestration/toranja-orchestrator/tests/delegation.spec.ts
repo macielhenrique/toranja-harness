@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -1092,6 +1092,69 @@ describe('Toranja routed delegation', () => {
     expect(existsSync(marker)).toBe(false)
   })
 
+  /** A path beside the fixture repository that a planted command would create. */
+  const markerFor = (harness: Harness, name: string): string => {
+    const marker = join(harness.repo, '..', `toranja-${name}-${Date.now()}`).replaceAll('\\', '/')
+    repos.push(marker)
+    return marker
+  }
+  const gitIn = (cwd: string, ...args: string[]): void => { execFileSync('git', args, { cwd, stdio: 'ignore' }) }
+
+  it('does not read a working tree whose filter it cannot switch off', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await harness.setMode({ mode: 'codex' })
+    const marker = markerFor(harness, 'equals-filter')
+    // `-c filter.a=b.clean=` would be read as key `filter.a`, leaving this filter on.
+    gitIn(harness.repo, 'config', 'filter.a=b.clean', `touch "${marker}"; cat`)
+    writeFileSync(join(harness.repo, '.git', 'info', 'attributes'), 'tracked.txt filter=a=b\n')
+    writeFileSync(join(harness.repo, 'tracked.txt'), 'changed so Git must read it again\n')
+    const result = await runGate(harness)
+    expect(result.results[0]).toMatchObject({ verdict: 'invalid', diagnostic: 'access could not be verified: the working tree could not be read' })
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('switches off a filter defined in the per-worktree configuration', async () => {
+    const harness = await mount({ routing: ROUTING })
+    const marker = markerFor(harness, 'worktree-config-filter')
+    gitIn(harness.repo, 'config', 'extensions.worktreeConfig', 'true')
+    gitIn(harness.repo, 'config', '--worktree', 'filter.plant.clean', `touch "${marker}"; cat`)
+    writeFileSync(join(harness.repo, '.git', 'info', 'attributes'), 'tracked.txt filter=plant\n')
+    writeFileSync(join(harness.repo, 'tracked.txt'), 'changed so Git must read it again\n')
+    await delegate(harness, { role: 'reader', provider: 'codex' })
+    await settled(harness)
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('still reads a working tree whose filter is marked required, as Git LFS marks its own', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await harness.setMode({ mode: 'codex' })
+    gitIn(harness.repo, 'config', 'filter.lfs.clean', 'cat')
+    gitIn(harness.repo, 'config', 'filter.lfs.smudge', 'cat')
+    gitIn(harness.repo, 'config', 'filter.lfs.required', 'true')
+    writeFileSync(join(harness.repo, '.git', 'info', 'attributes'), 'tracked.txt filter=lfs\n')
+    expect(await runGate(harness)).toMatchObject({ passed: true })
+    // And a change is still seen with the filter off on both sides of the comparison.
+    harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), 'edited by the gate\n') }
+    expect((await runGate(harness)).results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'reviewer', verdict: 'invalid', diagnostic: 'read-only role changed tracked files' }),
+    ]))
+  })
+
+  it('catches a hidden file rewritten at the same size with its time put back', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await harness.setMode({ mode: 'codex' })
+    gitIn(harness.repo, 'update-index', '--skip-worktree', 'tracked.txt')
+    harness.agentSideEffect = (cwd) => {
+      const file = join(cwd, 'tracked.txt')
+      const { atime, mtime } = statSync(file)
+      writeFileSync(file, 'ORIGINAL\n')
+      utimesSync(file, atime, mtime)
+    }
+    await delegate(harness, { role: 'tester' })
+    const tasks = await settled(harness)
+    expect(tasks[0]).toMatchObject({ state: 'failed', error: 'execute role changed Git state that hides file changes' })
+  })
+
   it('catches an edit an agent hid from Git with an index flag', async () => {
     const harness = await mount({ routing: ROUTING })
     await harness.setMode({ mode: 'codex' })
@@ -1199,6 +1262,54 @@ describe('Toranja routed delegation', () => {
       await runGate(harness, { implementationTaskId: run?.taskId })
       expect(cwds.length).toBeGreaterThan(1)
       expect(new Set(cwds)).toEqual(new Set([run?.worktree]))
+    })
+
+    it('does not run a repository filter when it checks out an implementer worktree', async () => {
+      const { harness } = await isolated()
+      const marker = join(harness.repo, '..', `toranja-smudge-${Date.now()}`).replaceAll('\\', '/')
+      repos.push(marker)
+      execFileSync('git', ['config', 'filter.plant.smudge', `touch "${marker}"; cat`], { cwd: harness.repo, stdio: 'ignore' })
+      writeFileSync(join(harness.repo, '.git', 'info', 'attributes'), 'tracked.txt filter=plant\n')
+      const result = await delegate(harness, { role: 'implementer', provider: 'codex' })
+      expect(result.activations).toEqual([expect.objectContaining({ worktree: expect.any(String) as unknown })])
+      await settled(harness)
+      expect(existsSync(marker)).toBe(false)
+    })
+
+    it('does not trust the Git directory an implementer left in its worktree', async () => {
+      const { harness } = await isolated()
+      const marker = join(harness.repo, '..', `toranja-forged-${Date.now()}`).replaceAll('\\', '/')
+      repos.push(marker)
+      harness.agentSideEffect = (cwd) => {
+        // The implementer points its worktree at a Git directory of its own, with a filter that would run on the Host.
+        const forged = join(cwd, 'forged-git')
+        rmSync(join(cwd, '.git'), { force: true })
+        execFileSync('git', ['init', '-q', '--separate-git-dir', forged, cwd], { stdio: 'ignore' })
+        // Tracked in the forged index first, so a later status has to read the file through the filter.
+        execFileSync('git', ['add', 'tracked.txt'], { cwd, stdio: 'ignore' })
+        execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', 'commit', '-q', '-m', 'forged'], { cwd, stdio: 'ignore' })
+        execFileSync('git', ['config', 'filter.plant.clean', `touch "${marker}"; cat`], { cwd, stdio: 'ignore' })
+        writeFileSync(join(forged, 'info', 'attributes'), '* filter=plant\n')
+        writeFileSync(join(cwd, 'tracked.txt'), 'changed by the implementer\n')
+      }
+      await delegate(harness, { role: 'implementer', provider: 'codex' })
+      await settled(harness)
+      expect(existsSync(marker)).toBe(false)
+    })
+
+    it('keeps a worktree in which the implementer left only ignored files', async () => {
+      const { harness } = await isolated()
+      harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, '.env'), 'left by the implementer\n') }
+      const result = await delegate(harness, { role: 'implementer', provider: 'codex' })
+      const [run] = result.activations as { taskId: string; worktree: string }[]
+      const tasks = await settled(harness)
+      expect(readFileSync(join(run?.worktree ?? '', '.env'), 'utf8')).toBe('left by the implementer\n')
+      expect(tasks.find(task => task.id === run?.taskId)).toMatchObject({ worktree: run?.worktree })
+    })
+
+    it('rejects a worktree root that is not an absolute path', async () => {
+      await expect(mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot: 'relative/worktrees' }))
+        .rejects.toThrow('worktreeRoot must be an absolute path')
     })
 
     it('falls back to the shared tree, one implementer at a time, when no worktree can be created', async () => {

@@ -121,8 +121,8 @@ The check detects a change and does not revert it. Its limits:
 - An ignored directory is fingerprinted as one entry, so a change deep inside
   it, such as in `node_modules`, is not detected.
 - A directory that is not a Git work tree with a commit cannot be checked. A delegated task then runs unchecked; the delivery gate, which is strict, reports that access could not be verified and does not pass.
-- The repository belongs to the agents being checked, so the check runs nothing its Git configuration names: Git is resolved once from `PATH`, the file-system monitor is off, hooks are looked up in an empty directory the Host owns, external diff and textconv drivers are off, and every content filter (`filter.*.clean`, `smudge`, `process`) the repository defines is switched off for the check's commands.
-- A file Git was told to skip (`assume-unchanged` or `skip-worktree`) is invisible to `git diff`. The check compares those index flags, the size and time of each file under them, and the set of configured filters, and reports `changed Git state that hides file changes` when a non-writing role altered any of them.
+- The repository belongs to the agents being checked, so the check runs nothing its Git configuration names: Git is resolved once from `PATH`, the file-system monitor is off, hooks are looked up in an empty directory the Host owns, external diff and textconv drivers are off, submodules are not entered, and every content filter (`filter.*.clean`, `smudge`, `process`) defined in any configuration scope is switched off for the check's commands. `required` is switched off with it, so a Git LFS repository is still read; its files are then compared as stored, the same way before and after the run. A filter whose name contains `=` cannot be switched off from the command line, so such a tree counts as unreadable.
+- A file Git was told to skip (`assume-unchanged` or `skip-worktree`) is invisible to `git diff`. The check compares those index flags, the content of each file under them, and the set of configured filters, and reports `changed Git state that hides file changes` when a non-writing role altered any of them.
 - Untracked and ignored files are compared by path, size, and modification time, not content: a same-size rewrite that restores the modification time is not seen.
 
 ## Implementer worktrees
@@ -136,9 +136,14 @@ project) instead of the project's working tree:
   `both` or `all` gives each provider its own worktree. An isolated implementer
   does not hold the project's tree, so readers running meanwhile are still
   checked.
-- The activation reports `worktree` and `branch`. A worktree with changes or
-  commits is kept for review and merge, and its task keeps both fields in the
-  status; one the implementer left untouched is removed with its branch.
+- The activation reports `worktree` and `branch`. A worktree with changes,
+  commits, or files Git ignores is kept for review and merge, and its task
+  keeps both fields in the status; one the implementer left untouched is
+  removed with its branch, also when the plugin stops while it is running.
+- The checkout runs with the repository's content filters off, so a Git LFS
+  file is its pointer in the worktree. The worktree is later inspected through
+  the Git directory recorded when it was created, not through the `.git` entry
+  the implementer could have replaced. `worktreeRoot` must be absolute.
 - `run_delivery_gate` with that task's `implementationTaskId` runs the reviewer
   and tester in the worktree.
 - Uncommitted changes in the project's tree are not in the worktree: it starts

@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { stat } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -482,6 +482,8 @@ interface IsolatedLane {
   readonly branch: string
   /** Commit the worktree started from. */
   readonly base: string
+  /** Git directory of the worktree, read before any agent ran in it. */
+  readonly gitDir: string
 }
 
 interface StartedRun {
@@ -826,19 +828,50 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     return hash.digest('hex')
   }
+  /**
+   * Overrides that switch off every content filter Git would apply in a
+   * repository, read from all configuration scopes (repository, per-worktree,
+   * includes, and the user's own). Reading the configuration runs nothing. A
+   * clean, smudge, or process filter would otherwise run on the Host whenever
+   * Git reads or checks out a file. A filter stays usable by the repository:
+   * `required` is switched off too, so Git does not abort on the emptied
+   * command, as it would for Git LFS.
+   * @param scope - Git arguments selecting the repository, placed before the command.
+   * @returns The overrides and the filter names, or undefined when the
+   *   configuration cannot be read or names a filter `-c` cannot override.
+   */
+  const filtersOff = async (
+    cwd: string,
+    scope: readonly string[] = [],
+  ): Promise<{ readonly overrides: readonly string[]; readonly names: readonly string[] } | undefined> => {
+    const listed = await gitOutput(cwd, [...scope, 'config', '--includes', '--null', '--list'])
+    if (listed === undefined) return undefined
+    const names = new Set<string>()
+    for (const entry of listed.toString('utf8').split('\0')) {
+      const key = entry.split('\n', 1)[0] ?? ''
+      const name = /^filter\.(.+)\.(?:clean|smudge|process|required)$/u.exec(key)?.[1]
+      if (name === undefined) continue
+      // `-c key=value` splits at the first `=`, so such a filter could not be
+      // switched off; the tree is then treated as unreadable.
+      if (name.includes('=')) return undefined
+      names.add(name)
+    }
+    const sorted = [...names].sort()
+    return {
+      names: sorted,
+      overrides: sorted.flatMap(name => [
+        `filter.${name}.clean=`, `filter.${name}.smudge=`, `filter.${name}.process=`, `filter.${name}.required=false`,
+      ]),
+    }
+  }
   const fingerprint = async (cwd: string): Promise<WorkspaceFingerprint | undefined> => {
     try {
-      // Reading the configuration runs nothing. Every content filter it
-      // defines is then switched off for the commands below: a clean or
-      // process filter would otherwise run on the Host when Git reads a file.
-      const local = await gitOutput(cwd, ['config', '--local', '--includes', '--null', '--list'])
-      if (local === undefined) return undefined
-      const filters = local.toString('utf8').split('\0')
-        .map(entry => entry.split('\n', 1)[0] ?? '')
-        .filter(key => /^filter\..+\.(?:clean|smudge|process)$/u.test(key))
-      const off = [...new Set(filters)].map(key => `${key}=`)
+      const filters = await filtersOff(cwd)
+      if (filters === undefined) return undefined
+      const off = filters.overrides
       const [tracked, untracked, ignored, index] = await Promise.all([
-        gitOutput(cwd, ['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--binary'], off),
+        // A submodule would be inspected with its own configuration, which is not read here.
+        gitOutput(cwd, ['diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', 'HEAD', '--binary'], off),
         gitOutput(cwd, ['ls-files', '--others', '--exclude-standard', '-z'], off),
         gitOutput(cwd, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], off),
         gitOutput(cwd, ['ls-files', '-v', '-z'], off),
@@ -846,15 +879,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (tracked === undefined || untracked === undefined || ignored === undefined || index === undefined) return undefined
       // `ls-files -v` tags a file Git was told to skip with a lowercase letter
       // (assume-unchanged) or `S` (skip-worktree). The diff above does not see
-      // such a file, so its flag and its content facts are compared here.
+      // such a file, so its flag and its content are compared here.
       const hidden = index.toString('utf8').split('\0').filter(entry => /^[a-zS] /u.test(entry))
-      const state = createHash('sha256').update(filters.sort().join('\0')).update('\0\0')
+      const state = createHash('sha256').update(filters.names.join('\0')).update('\0\0')
       for (const entry of hidden) {
-        const facts = await stat(join(cwd, entry.slice(2))).then(
-          file => `${file.size}:${file.mtimeMs}`,
+        const content = await readFile(join(cwd, entry.slice(2))).then(
+          bytes => createHash('sha256').update(bytes).digest('hex'),
           () => 'missing',
         )
-        state.update(`${entry}\0${facts}\0`)
+        state.update(`${entry}\0${content}\0`)
       }
       return {
         tracked: createHash('sha256').update(tracked).digest('hex'),
@@ -956,7 +989,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   })
 
   const implementerWorktrees = config.implementerWorktrees ?? false
+  const worktreeRoot = config.worktreeRoot
+  if (worktreeRoot !== undefined && !isAbsolute(worktreeRoot)) {
+    throw new Error('toranja-orchestrator: worktreeRoot must be an absolute path')
+  }
   let laneSequence = 0
+  // Worktrees whose implementer has not settled. When the plugin stops, the
+  // ones left untouched are removed; one with work in it is kept.
+  const lanes = new Set<IsolatedLane>()
+  ctx.effect(() => async () => {
+    for (const lane of [...lanes]) await releaseLane(lane)
+  }, 'toranja-orchestrator.worktrees')
   /**
    * Create a worktree and branch of the project's current commit for one
    * implementer. Returns undefined when the project is not a Git work tree
@@ -966,13 +1009,24 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const isolate = async (project: ResolvedProject): Promise<IsolatedLane | undefined> => {
     if (!implementerWorktrees) return undefined
     const name = `${Date.now().toString(36)}-${(++laneSequence).toString(36)}`
-    const path = join(config.worktreeRoot ?? join(dirname(project.path), '.toranja-worktrees'), project.id, name)
+    const path = join(worktreeRoot ?? join(dirname(project.path), '.toranja-worktrees'), project.id, name)
     const branch = `toranja/${name}`
     try {
       const head = await gitOutput(project.path, ['rev-parse', 'HEAD'])
-      if (head === undefined) return undefined
-      if (await gitOutput(project.path, ['worktree', 'add', '-q', '-b', branch, path, 'HEAD']) === undefined) return undefined
-      return { project, path, branch, base: head.toString('utf8').trim() }
+      // The checkout would run the repository's smudge filters on the Host.
+      const filters = await filtersOff(project.path)
+      if (head === undefined || filters === undefined) return undefined
+      const added = await gitOutput(project.path, ['worktree', 'add', '-q', '-b', branch, path, 'HEAD'], filters.overrides)
+      const gitDir = added === undefined ? undefined : await gitOutput(path, ['rev-parse', '--absolute-git-dir'])
+      if (gitDir === undefined) {
+        // A refused or half-made worktree must not stay registered.
+        await gitOutput(project.path, ['worktree', 'remove', '--force', path])
+        await gitOutput(project.path, ['branch', '-D', branch])
+        return undefined
+      }
+      const lane = { project, path, branch, base: head.toString('utf8').trim(), gitDir: gitDir.toString('utf8').trim() }
+      lanes.add(lane)
+      return lane
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: worktree for project ${project.id} could not be created: ${String(error)}`)
       return undefined
@@ -980,14 +1034,21 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
   /**
    * Remove the worktree and branch of an implementer that left nothing
-   * behind. One with changes or commits is kept for review and merge.
+   * behind. One with changes, commits, or files Git ignores is kept for
+   * review and merge. The worktree is inspected through the Git directory
+   * recorded when it was created, never through the `.git` entry the
+   * implementer could have replaced, and with the repository's filters off.
    * @returns Whether the worktree was removed.
    */
   const releaseLane = async (lane: IsolatedLane): Promise<boolean> => {
+    lanes.delete(lane)
     try {
+      const scope = [`--git-dir=${lane.gitDir}`, `--work-tree=${lane.path}`]
+      const filters = await filtersOff(lane.project.path, scope)
+      if (filters === undefined) return false
       const [changes, head] = await Promise.all([
-        gitOutput(lane.path, ['status', '--porcelain']),
-        gitOutput(lane.path, ['rev-parse', 'HEAD']),
+        gitOutput(lane.project.path, [...scope, 'status', '--porcelain', '--ignored'], filters.overrides),
+        gitOutput(lane.project.path, [...scope, 'rev-parse', 'HEAD']),
       ])
       if (changes === undefined || head === undefined) return false
       if (changes.length > 0 || head.toString('utf8').trim() !== lane.base) return false
