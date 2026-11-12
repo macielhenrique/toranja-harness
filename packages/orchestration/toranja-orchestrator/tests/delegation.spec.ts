@@ -767,6 +767,7 @@ describe('Toranja routed delegation', () => {
     expect(harness.status().routes.map(route => route.provider)).toEqual(Array.from({ length: 9 }, () => 'codex'))
     const result = await delegate(harness, { role: 'reader' })
     expect(result.activations).toEqual([expect.objectContaining({ provider: 'codex' })])
+    expect(result.activations).toHaveLength(1)
     expect((result.activations as object[])[0]).not.toHaveProperty('fallbackFrom')
   })
 
@@ -931,6 +932,7 @@ describe('Toranja routed delegation', () => {
     const harness = await mount({})
     const result = await delegate(harness, { role: 'reader', provider: 'codex' })
     expect(result.activations).toEqual([expect.objectContaining({ providerName: 'codex', tier: 'light', access: 'read-only' })])
+    expect(result.activations).toHaveLength(1)
     expect((result.activations as object[])[0]).not.toHaveProperty('model')
   })
 

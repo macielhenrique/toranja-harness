@@ -155,6 +155,10 @@ export function apply(ctx: ClientContext): void {
           if (selection === undefined) {
             throw new Error('this provider\'s catalog failed to load — pick a model from a loaded group')
           }
+          // The row of the model in use carries the effort in use, so picking
+          // it changes nothing and sends nothing.
+          const current = directory.store.getSnapshot().current
+          if (current?.provider === selection.provider && current.model === selection.model) return
           const result = await directory.select(selection)
           if (!result.ok) {
             if (result.error.code === 'session/writer-held') throw new Error(t('error.sessionInUse'))

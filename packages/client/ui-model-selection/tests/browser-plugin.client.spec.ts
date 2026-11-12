@@ -210,7 +210,8 @@ describe('ui-model-selection dual entry', () => {
     const input = projection('owned')
     const options = await b.popup().options(input, new AbortController().signal)
     b.rejectSelection()
-    await expect(b.popup().onSelect(options[0]!, input)).rejects.toThrow(zh['error.sessionInUse'])
+    // options[0] is the model in use, which sends nothing; a real change is what the writer rejects.
+    await expect(b.popup().onSelect(options[1]!, input)).rejects.toThrow(zh['error.sessionInUse'])
     expect(b.ctx.modelDirectories.directoryFor(sid('owned')).store.getSnapshot()).toMatchObject({
       status: 'error', pending: null, error: 'session/writer-held: writer held',
     })
@@ -282,6 +283,34 @@ describe('ui-model-selection dual entry', () => {
     // The POPUP's next options pass reflects it without a seat-side reload.
     const options = await b.popup().options(projection('s1'), new AbortController().signal)
     expect(options.find((o: SelectOption) => o.label === 'DeepSeek-V4-Pro')).toMatchObject({ active: true })
+  })
+
+  it('a popup pick of the model and effort already in use sends nothing, so a retired model id stays saved', async () => {
+    const levels = {
+      efforts: [{ id: 'low', name: 'Low' }, { id: 'medium', name: 'Medium' }, { id: 'high', name: 'High' }],
+      defaultEffort: 'medium',
+    }
+    const b = await bench()
+    b.setGroups([{
+      id: 'antigravity-local',
+      name: 'Antigravity',
+      models: [
+        { id: 'gemini-4-argon', name: 'Gemini 4 Argon', description: 'Family.', reasoning: levels },
+        { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', description: 'Family.', reasoning: levels },
+      ],
+    }])
+    b.remote.emit('llm/adapters-updated', [])
+    b.mint('s1')
+    const saved = { provider: 'antigravity-local', model: 'gemini-4-argon-high' }
+    b.setProjected(sid('s1'), { lastUsed: saved, next: saved })
+    const options = await b.popup().options(projection('s1'), new AbortController().signal)
+    const argon = options.find((o: SelectOption) => o.label === 'Gemini 4 Argon')!
+    expect(argon).toMatchObject({ active: true })
+    await b.popup().onSelect(argon, projection('s1'))
+    expect(b.calls.select).toBe(0)
+    await b.popup().onSelect(options.find((o: SelectOption) => o.label === 'Gemini 3.8 Flash')!, projection('s1'))
+    expect(b.calls.select).toBe(1)
+    expect(b.hostCurrent()).toEqual({ provider: 'antigravity-local', model: 'gemini-3.8-flash', reasoningEffort: 'medium' })
   })
 
   it('a popup selection lands on the seat store — the reverse direction of the same state', async () => {

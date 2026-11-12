@@ -23,6 +23,12 @@ const catalog = (defaultModel = 'default'): ModelCatalog => ({
       // A listed id that also reads as `<model>-<level>` stays a model of its own.
       { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon Low Edition' },
     ],
+  }, {
+    // Another provider whose model ids are opaque: `foo-high` was a model of
+    // its own there, never `foo` at the `high` level.
+    id: 'fixture',
+    name: 'Fixture',
+    models: [{ id: 'foo', name: 'Foo', reasoning: levels }],
   }],
   failures: [],
 })
@@ -64,6 +70,12 @@ describe('ModelDirectory with a selection saved under a per-level model id', () 
       current: { provider: 'antigravity-local', model: 'gemini-4-argon-max' },
       routable: false,
     })
+    const opaque = await directoryFor({ provider: 'fixture', model: 'foo-high' })
+    expect(opaque.store.getSnapshot()).toMatchObject({
+      current: { provider: 'fixture', model: 'foo-high' },
+      routable: false,
+    })
+    expect(opaque.store.getSnapshot().current).not.toHaveProperty('reasoningEffort')
     const otherProvider = await directoryFor({ provider: 'codex-local', model: 'gemini-4-argon-high' })
     expect(otherProvider.store.getSnapshot()).toMatchObject({
       current: { provider: 'codex-local', model: 'gemini-4-argon-high' },
