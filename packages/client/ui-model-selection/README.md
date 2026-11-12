@@ -49,7 +49,7 @@ The composer replaces the model and effort text with the Models icon when the ex
 
 ### Unroutable sessions
 
-Catalog availability does not block sending with a saved selection; request execution reports missing credentials or unavailable models. Refreshes and refresh failures retain the last displayed selection and groups. A Host reset clears that display. Sign-out hides the account provider from the picker while preserving the saved provider/model ID and reasoning effort. Signing in restores the catalog name when that model is available again. Existing session logs remain unchanged.
+Catalog availability does not block sending with a saved selection; request execution reports missing credentials or unavailable models. Refreshes and refresh failures retain the last displayed selection and groups. A Host reset clears that display. Sign-out hides the account provider from the picker while preserving the saved provider/model ID and reasoning effort. Signing in restores the catalog name when that model is available again. A saved model ID the catalog no longer lists, but which names a listed model and one of its reasoning efforts as `<model>-<effort>`, displays as that model and effort; this keeps sessions saved before an adapter folded per-effort model IDs into one model (as the Antigravity adapter did) on their model in the selector, while the saved ID keeps running until another selection is made. Existing session logs remain unchanged.
 
 ### Selection failures
 

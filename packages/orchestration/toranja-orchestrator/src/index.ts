@@ -494,7 +494,10 @@ function parseRouting(config: Config): Map<RunProvider, ProviderRouting> {
       if (tier === undefined) throw new Error(`toranja-orchestrator: routing.${key}.models names unknown tier ${JSON.stringify(tierKey)}`)
       models[tier] = model
     }
-    if (value.base !== undefined && (typeof value.base !== 'object' || value.base === null || Array.isArray(value.base))) {
+    // `base` reaches here unvalidated (the schema accepts any value), so its
+    // declared type is not trusted.
+    const base: unknown = value.base
+    if (base !== undefined && (typeof base !== 'object' || base === null || Array.isArray(base))) {
       throw new Error(`toranja-orchestrator: routing.${key}.base must be a mapping`)
     }
     if (value.base !== undefined && !isVariantProvider(provider)) {
@@ -1219,7 +1222,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const providerChoice = args.provider ?? providerFor(role)
       // `both` and `all` fan the task out over connected providers in fallback
       // order: two for `both`, and as many as the team size allows for `all`.
-      const connected = live().fallbackOrder.filter(provider => availableRunProviders().has(provider))
+      // A provider that may not take the role stays out of the fan-out.
+      const available = availableRunProviders()
+      const connected = live().fallbackOrder.filter(provider => available.has(provider) && canRun(provider, role))
       const selected: readonly RunProvider[] = providerChoice === 'both'
         ? connected.slice(0, 2)
         : providerChoice === 'all'

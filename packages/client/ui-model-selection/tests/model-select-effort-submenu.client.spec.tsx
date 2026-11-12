@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import type { ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
@@ -163,6 +163,49 @@ describe('ModelSelect reasoning effort submenu', () => {
     fireEvent.mouseDown(document.body)
     expect(screen.queryByRole('menu', { name: /Reasoning effort for/ })).toBeNull()
     expect(screen.queryByRole('menuitemradio', { name: 'Gemini 4 Argon' })).toBeNull()
+  })
+
+  it('closes the submenu and keeps the keyboard in the menu when a reload drops its model', () => {
+    const { directory } = mount()
+    const model = screen.getByRole('menuitemradio', { name: 'Gemini 3.8 Flash' })
+    model.focus()
+    fireEvent.keyDown(model, { key: 'ArrowRight' })
+    expect(submenu('Gemini 3.8 Flash')).toBeTruthy()
+    const group = state().groups[0]!
+    act(() => {
+      directory.set(state({ groups: [{ ...group, models: group.models.filter(entry => entry.id !== 'gemini-3.8-flash') }] }))
+    })
+    expect(screen.queryByRole('menu', { name: /Reasoning effort for/ })).toBeNull()
+    const argon = screen.getByRole('menuitemradio', { name: 'Gemini 4 Argon' })
+    expect(document.activeElement).toBe(argon)
+    // The model list owns the keyboard again: arrows walk its rows.
+    fireEvent.keyDown(argon, { key: 'ArrowUp' })
+    expect(document.activeElement).toBe(screen.getByRole('menuitemradio', { name: 'Automatic' }))
+    // The arrow of a model that is still listed opens its levels as before.
+    fireEvent.click(arrow('Gemini 4 Argon'))
+    expect(submenu('Gemini 4 Argon')).toBeTruthy()
+  })
+
+  it('closes the submenu when a reload leaves its model without reasoning levels', () => {
+    const { directory } = mount()
+    fireEvent.click(arrow('Gemini 3.8 Flash'))
+    expect(submenu('Gemini 3.8 Flash')).toBeTruthy()
+    const group = state().groups[0]!
+    act(() => {
+      directory.set(state({
+        groups: [{
+          ...group,
+          models: group.models.map(entry => entry.id === 'gemini-3.8-flash' ? { id: entry.id, name: entry.name } : entry),
+        }],
+      }))
+    })
+    expect(screen.queryByRole('menu', { name: /Reasoning effort for/ })).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: 'Reasoning effort for Gemini 3.8 Flash' })).toBeNull()
+    // Escape now backs out of the model list instead of a submenu that is gone.
+    const flash = screen.getByRole('menuitemradio', { name: 'Gemini 3.8 Flash' })
+    flash.focus()
+    fireEvent.keyDown(flash, { key: 'Escape' })
+    expect(screen.queryByRole('menuitemradio', { name: 'Gemini 3.8 Flash' })).toBeNull()
   })
 
   it('opens the levels of the highlighted model from the search box in a large catalog', () => {

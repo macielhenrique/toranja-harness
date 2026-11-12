@@ -275,11 +275,31 @@ export function ModelSelect(
     ;(rows.find(row => row.getAttribute('aria-checked') === 'true') ?? rows[0])?.focus()
   }, [effortFor])
 
-  if (!available) return null
-
   const effortGroup = effortFor === null ? undefined : groups.find(group => group.id === effortFor.provider)
   const effortModel = effortGroup?.models.find(model => model.id === effortFor?.model)
   const effortLevels = effortModel?.reasoning?.efforts ?? []
+  // The submenu is open only while its model is listed with levels to show.
+  const effortOpen = open && effortLevels.length > 0
+
+  // A catalog reload can drop the model whose levels are open, or its levels.
+  // The submenu then closes, and a keyboard it held lands back in the menu:
+  // on the row it opened from when that row is still there, else on the value
+  // in use or the first row.
+  useLayoutEffect(() => {
+    if (effortFor === null || effortLevels.length > 0) return
+    setEffortFor(null)
+    const focused = document.activeElement
+    if (focused !== null && focused !== document.body && focused.isConnected) return
+    const origin = effortOrigin.current
+    const checked = menuRef.current?.querySelector<HTMLElement>('[role="menuitemradio"][aria-checked="true"]:not([disabled])')
+    const target = origin?.isConnected === true
+      ? origin
+      : checked ?? itemRefs.current.find(item => item !== null && !item.disabled)
+    ;(target ?? triggerRef.current)?.focus()
+  }, [effortFor, effortLevels.length])
+
+  if (!available) return null
+
   const effortInUse = effortFor !== null
     && state.current?.provider === effortFor.provider && state.current.model === effortFor.model
     ? effectiveEffort
@@ -358,7 +378,7 @@ export function ModelSelect(
 
   const onRootKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     if (event.nativeEvent.isComposing) return
-    if (open && effortFor !== null) {
+    if (effortOpen) {
       // The submenu owns the keyboard while it is open: arrows walk its
       // levels, and Escape, ArrowLeft, or Shift+Tab return to the model row.
       const rows = submenuItemRefs.current.filter((item): item is HTMLButtonElement => item !== null)
@@ -774,7 +794,7 @@ export function ModelSelect(
         </MenuSurface>,
         document.body,
       )}
-      {open && effortFor !== null && effortModel !== undefined && createPortal(
+      {effortOpen && effortFor !== null && effortModel !== undefined && createPortal(
         <MenuSurface
           ref={submenuRef}
           id={`${id}-effort-menu`}

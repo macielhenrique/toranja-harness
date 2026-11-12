@@ -128,12 +128,12 @@ describe('provider routing mode', () => {
   })
 
   it('keeps solo modes exclusive and permits cross-provider work only in team mode', () => {
-    expect(() => assertProvidersAllowed('antigravity', ['codex'])).toThrow(/select Team/u)
-    expect(() => assertProvidersAllowed('codex', ['antigravity'])).toThrow(/select Team/u)
-    expect(() => assertProvidersAllowed('claude-code', ['openrouter'])).toThrow(/select Team/u)
-    expect(() => assertProvidersAllowed('antigravity', ['antigravity'])).not.toThrow()
-    expect(() => assertProvidersAllowed('openrouter', ['openrouter'])).not.toThrow()
-    expect(() => assertProvidersAllowed('team', ['codex', 'antigravity', 'claude-code', 'openrouter'])).not.toThrow()
+    expect(() => { assertProvidersAllowed('antigravity', ['codex']) }).toThrow(/select Team/u)
+    expect(() => { assertProvidersAllowed('codex', ['antigravity']) }).toThrow(/select Team/u)
+    expect(() => { assertProvidersAllowed('claude-code', ['openrouter']) }).toThrow(/select Team/u)
+    expect(() => { assertProvidersAllowed('antigravity', ['antigravity']) }).not.toThrow()
+    expect(() => { assertProvidersAllowed('openrouter', ['openrouter']) }).not.toThrow()
+    expect(() => { assertProvidersAllowed('team', ['codex', 'antigravity', 'claude-code', 'openrouter']) }).not.toThrow()
   })
 
   it('resolves dynamic fallback provider when preferred provider is exhausted or unavailable', () => {

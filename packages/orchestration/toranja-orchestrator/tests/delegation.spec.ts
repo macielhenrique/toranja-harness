@@ -185,7 +185,7 @@ async function mount(
       // every other provider settles with the configured answer.
       if (provider !== undefined && start.provider.startsWith('antigravity')) {
         const run = await provider.start({ ...start.request, signal: new AbortController().signal })
-        void run.result.finally(() => run.dispose())
+        void run.result.finally(() => { void run.dispose() })
         return { childId: `child-${harness.started.length}`, result: run.result }
       }
       harness.agentSideEffect(start.request.cwd)
@@ -208,10 +208,9 @@ async function mount(
     create: () => Promise.resolve({ title: 'Demo', setTitle: () => Promise.resolve() }),
   } as never)
 
-  await ctx.plugin(orchestrator, orchestrator.Config({
+  await ctx.plugin(orchestrator, orchestrator.Config(Object.assign({
     projects: [{ id: 'demo', title: 'Demo', path: repo }],
-    ...config,
-  }))
+  }, config)))
   mounted.push(ctx)
   const controller = (ctx as Context & { toranjaOrchestrationController: orchestrator.ToranjaOrchestrationController })
     .toranjaOrchestrationController
@@ -768,7 +767,7 @@ describe('Toranja routed delegation', () => {
     expect(harness.status().routes.map(route => route.provider)).toEqual(Array.from({ length: 9 }, () => 'codex'))
     const result = await delegate(harness, { role: 'reader' })
     expect(result.activations).toEqual([expect.objectContaining({ provider: 'codex' })])
-    expect(result.activations).toEqual([expect.not.objectContaining({ fallbackFrom: expect.anything() })])
+    expect((result.activations as object[])[0]).not.toHaveProperty('fallbackFrom')
   })
 
   it('lets the user set how many agents work at once, and keeps it after a restart', async () => {
@@ -881,6 +880,22 @@ describe('Toranja routed delegation', () => {
     expect(implemented.activations).toEqual([expect.objectContaining({ provider: 'openrouter' })])
   })
 
+  it('leaves OpenRouter out when a non-writing task fans out over both or all providers', async () => {
+    const routing = { ...ROUTING, openrouter: { models: { light: { model: 'meta/llama-small' }, advanced: { model: 'meta/llama-large' } } } }
+    const harness = await mount({
+      routing,
+      openrouterProvider: 'spawn',
+      fallbackOrder: ['openrouter', 'codex', 'antigravity'],
+    }, ['codex', 'antigravity', 'spawn'])
+    await harness.setMode({ mode: 'team', teamSize: 3 })
+    const both = await delegate(harness, { role: 'reviewer', provider: 'both' })
+    expect((both.activations as { provider: string }[]).map(run => run.provider)).toEqual(['codex', 'antigravity'])
+    await settled(harness)
+    const all = await delegate(harness, { role: 'reader', provider: 'all' })
+    expect((all.activations as { provider: string }[]).map(run => run.provider)).toEqual(['codex', 'antigravity'])
+    expect(harness.requests.filter(request => request.provider === 'spawn')).toEqual([])
+  })
+
   it('treats a provider whose status command could not run as unusable', async () => {
     const bin = installed('codex', 'claude')
     const harness = await mount({
@@ -916,7 +931,7 @@ describe('Toranja routed delegation', () => {
     const harness = await mount({})
     const result = await delegate(harness, { role: 'reader', provider: 'codex' })
     expect(result.activations).toEqual([expect.objectContaining({ providerName: 'codex', tier: 'light', access: 'read-only' })])
-    expect(result.activations).toEqual([expect.not.objectContaining({ model: expect.anything() })])
+    expect((result.activations as object[])[0]).not.toHaveProperty('model')
   })
 
   it('rejects routing that names unknown providers, tiers, roles, or invalid provider settings', async () => {
