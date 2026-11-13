@@ -6,7 +6,7 @@ import { PassThrough } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
 import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MemoryMediaPool, MemoryStorageBackend } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
 import * as orchestrator from '../src/index.ts'
 import type { ToranjaOrchestrationStatus } from '../src/index.ts'
@@ -1471,10 +1471,50 @@ describe('Toranja routed delegation', () => {
 
       it('leaves alone a worktree whose owner is still running', async () => {
         const { harness, left, toranjaBranches } = await restarted([process.pid])
-        // In use by a running Toranja, so neither removed nor reported as left behind.
-        expect(await swept(harness)).toEqual([])
+        // In use by a running Toranja: never removed, and reported as such so nothing stays out of sight.
+        expect(await swept(harness)).toEqual([{ ...left[0], inUse: true }])
         expect(existsSync(left[0]?.worktree ?? '')).toBe(true)
         expect(toranjaBranches()).toEqual([left[0]?.branch])
+      })
+
+      it('does not take a lock that names no real process for a running owner', async () => {
+        // Process id 0 answers a liveness probe on every system without naming any process.
+        const { harness, left } = await restarted([0])
+        expect(await swept(harness)).toEqual(left)
+        expect(existsSync(left[0]?.worktree ?? '')).toBe(true)
+      })
+
+      it('leaves a worktree another process already has at the same place when its own cannot be created', async () => {
+        const { harness, worktreeRoot } = await isolated()
+        const now = Date.now()
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(now)
+        try {
+          const name = `${now.toString(36)}-1p${process.pid.toString(36)}`
+          const taken = join(worktreeRoot, 'demo', name)
+          execFileSync('git', ['worktree', 'add', '-q', '--lock', '-b', `toranja/${name}`, taken, 'HEAD'], { cwd: harness.repo, stdio: 'ignore' })
+          writeFileSync(join(taken, 'tracked.txt'), 'work of the other process\n')
+          const result = await delegate(harness, { role: 'implementer', provider: 'codex' })
+          expect(result.activations).toEqual([expect.not.objectContaining({ worktree: expect.anything() as unknown })])
+          expect(readFileSync(join(taken, 'tracked.txt'), 'utf8')).toBe('work of the other process\n')
+        } finally {
+          clock.mockRestore()
+        }
+        await settled(harness)
+      })
+
+      it('does not remove through a link the implementer left in place of its worktree', async () => {
+        const { harness } = await isolated()
+        const moved = join(mkdtempSync(join(tmpdir(), 'toranja-moved-')), 'tree')
+        repos.push(dirname(moved))
+        harness.agentSideEffect = (cwd) => {
+          renameSync(cwd, moved)
+          symlinkSync(moved, cwd, 'junction')
+        }
+        const result = await delegate(harness, { role: 'implementer', provider: 'codex' })
+        const [run] = result.activations as { taskId: string; worktree: string }[]
+        const tasks = await settled(harness)
+        expect(existsSync(join(moved, 'tracked.txt'))).toBe(true)
+        expect(tasks.find(task => task.id === run?.taskId)).toMatchObject({ worktree: run?.worktree })
       })
 
       it('keeps and reports an untouched worktree no run is known to own', async () => {

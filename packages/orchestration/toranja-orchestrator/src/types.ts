@@ -219,4 +219,6 @@ export interface ToranjaLeftoverWorktree {
   readonly project: string
   readonly worktree: string
   readonly branch: string
+  /** Set when the worktree's lock names a process still running on this machine. */
+  readonly inUse?: true
 }

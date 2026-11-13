@@ -150,12 +150,15 @@ project) instead of the project's working tree:
 - When the plugin starts with isolation on, it looks in each project for
   worktrees an earlier run left under the worktree root on a `toranja/*`
   branch. One whose lock names a process still running on this machine is in
-  use and is left alone. One whose owning process is gone and that holds no
+  use: it is left alone and listed with `inUse`. One whose owning process is gone and that holds no
   work is removed with its branch: no changes, and a commit some branch or tag
   outside `toranja/*` also holds. Every other one is kept, unlocked, and listed
   in the status as `leftoverWorktrees`, for review, merge, or
   `git worktree remove` by hand: it holds work, it carries no lock from this
   machine, or it or its Git directory is reached through a link.
+- The change time also moves when another program renames a file or changes
+  its permissions, so such a change made during a `read-only` or `execute`
+  task to a file compared without reading it counts against that task.
 - A process id can be reused: a leftover whose old owner's id now belongs to
   another process counts as in use until that process ends.
 - The checkout runs with the repository's content filters off, so a Git LFS

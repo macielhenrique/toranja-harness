@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
-import { readFile, realpath, stat } from 'node:fs/promises'
+import { lstat, readFile, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -484,7 +484,7 @@ interface RoutedRequest {
 /** Worktree names this plugin creates: creation time and a sequence number, both in base 36. */
 const LANE_NAME = /^[a-z0-9]+-[a-z0-9]+$/u
 /** Lock reason of a worktree whose implementer is running: the machine and process that own it. */
-const LANE_OWNER = /^toranja-orchestrator host=(\S+) pid=(\d+)$/u
+const LANE_OWNER = /^toranja-orchestrator host=(\S+) pid=([1-9]\d*)$/u
 
 interface IsolatedLane {
   readonly project: ResolvedProject
@@ -1038,7 +1038,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     join(worktreeRoot ?? join(dirname(project.path), '.toranja-worktrees'), project.id)
   const isolate = async (project: ResolvedProject): Promise<IsolatedLane | undefined> => {
     if (!implementerWorktrees) return undefined
-    const name = `${Date.now().toString(36)}-${(++laneSequence).toString(36)}`
+    // The process id keeps two Toranja processes from ever choosing the same name.
+    const name = `${Date.now().toString(36)}-${(++laneSequence).toString(36)}p${process.pid.toString(36)}`
     const path = join(laneRoot(project), name)
     const branch = `toranja/${name}`
     try {
@@ -1053,14 +1054,20 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         ['worktree', 'add', '-q', '--lock', '--reason', owner, '-b', branch, path, 'HEAD'],
         filters.overrides,
       )
-      const gitDir = added === undefined ? undefined : await gitOutput(path, ['rev-parse', '--absolute-git-dir'])
+      // When Git refused, whatever is at that place was not made here and is left alone.
+      if (added === undefined) return undefined
+      const base = head.toString('utf8').trim()
+      const gitDir = await gitOutput(path, ['rev-parse', '--absolute-git-dir'])
       if (gitDir === undefined) {
-        // A refused or half-made worktree must not stay registered.
-        await gitOutput(project.path, ['worktree', 'remove', '--force', '--force', path])
-        await gitOutput(project.path, ['branch', '-D', branch])
+        // A worktree made here that cannot be used must not stay registered.
+        // No agent has run in it, and it is removed as any other: without
+        // force, and its branch only while it points at the starting commit.
+        await gitOutput(project.path, ['worktree', 'unlock', path])
+        await gitOutput(project.path, ['worktree', 'remove', path], filters.overrides)
+        await gitOutput(project.path, ['update-ref', '-d', `refs/heads/${branch}`, base])
         return undefined
       }
-      return { project, path, branch, base: head.toString('utf8').trim(), gitDir: gitDir.toString('utf8').trim() }
+      return { project, path, branch, base, gitDir: gitDir.toString('utf8').trim() }
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: worktree for project ${project.id} could not be created: ${String(error)}`)
       return undefined
@@ -1119,6 +1126,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       } else if (commit !== lane.base) {
         return false
       }
+      // Looked at last, right before removal: a link put in place of the
+      // worktree would send the removal to wherever it points.
+      const place = await lstat(lane.path)
+      if (!place.isDirectory() || place.isSymbolicLink()) return false
       await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
       // Without --force Git itself refuses a worktree that gained a change
       // since the inspection above, and the branch is deleted only while it
@@ -1173,7 +1184,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (real === undefined || real !== await canonical(listed)) continue
       const owner = LANE_OWNER.exec(fields.find(field => field.startsWith('locked '))?.slice('locked '.length) ?? '')
       const local = owner?.[1] === hostname()
-      if (local && running(Number(owner[2]))) continue
+      if (local && running(Number(owner[2]))) {
+        // Reported, not hidden: the lock is a file the implementer could have written.
+        kept.push({ project: project.id, worktree: path, branch, inUse: true })
+        continue
+      }
       // The implementer could write both the directory holding its worktree
       // and the repository, so neither the worktree nor its Git directory may
       // be reached through a link: each must be the plain directory at the
@@ -1196,7 +1211,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }))).then((found) => {
       leftoverWorktrees = found.flat()
       for (const left of leftoverWorktrees) {
-        ctx.logger.info(`toranja-orchestrator: kept worktree ${left.worktree} (${left.branch}) of project ${left.project} from an earlier run`)
+        ctx.logger.info(`toranja-orchestrator: kept worktree ${left.worktree} (${left.branch}) of project ${left.project}${left.inUse === true ? ', in use by a running process' : ' from an earlier run'}`)
       }
     })
   }
