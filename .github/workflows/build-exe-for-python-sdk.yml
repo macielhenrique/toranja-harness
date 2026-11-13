@@ -378,9 +378,12 @@ jobs:
             Pop-Location
           }
 
+      # Only the upstream repository holds the real API key; elsewhere the
+      # keyless installed-wheel black-box test above is the last check.
       - name: Preflight installed-wheel real API test (POSIX)
         if: >-
           inputs.ci
+          && github.repository == 'deepseek-harness/deepseek-harness'
           && runner.os != 'Windows'
           && (github.event_name != 'pull_request'
               || !(github.event.pull_request.head.repo.fork
@@ -397,6 +400,7 @@ jobs:
       - name: Preflight installed-wheel real API test (Windows)
         if: >-
           inputs.ci
+          && github.repository == 'deepseek-harness/deepseek-harness'
           && runner.os == 'Windows'
           && (github.event_name != 'pull_request'
               || !(github.event.pull_request.head.repo.fork
@@ -412,6 +416,7 @@ jobs:
       - name: Run installed-wheel real API black-box test (POSIX)
         if: >-
           inputs.ci
+          && github.repository == 'deepseek-harness/deepseek-harness'
           && runner.os != 'Windows'
           && (github.event_name != 'pull_request'
               || !(github.event.pull_request.head.repo.fork
@@ -432,6 +437,7 @@ jobs:
       - name: Run installed-wheel real API black-box test (Windows)
         if: >-
           inputs.ci
+          && github.repository == 'deepseek-harness/deepseek-harness'
           && runner.os == 'Windows'
           && (github.event_name != 'pull_request'
               || !(github.event.pull_request.head.repo.fork
