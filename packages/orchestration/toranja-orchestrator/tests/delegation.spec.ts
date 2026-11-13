@@ -441,8 +441,10 @@ describe('Toranja routed delegation', () => {
       acceptanceCriteria: 'tests pass',
     }, { agent: {}, signal: new AbortController().signal }).then(text => JSON.parse(text) as Record<string, unknown>)
     expect(await gate()).toMatchObject({ passed: true, decision: 'ready' })
-    expect(harness.started).toEqual(['codex~ro~gpt-strong~medium', 'codex~rw~gpt-strong~medium'])
-    harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), 'edited by the gate\n') }
+    expect([...harness.started].sort()).toEqual(['codex~ro~gpt-strong~medium', 'codex~rw~gpt-strong~medium'])
+    // The gate's agents run at the same time: each writes its own content, so each one's edit shows whatever the order.
+    let edits = 0
+    harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), `edited by the gate ${++edits}\n`) }
     const failed = await gate()
     expect(failed).toMatchObject({ passed: false, decision: 'not-ready' })
     expect(failed.results).toEqual(expect.arrayContaining([
@@ -1138,7 +1140,9 @@ describe('Toranja routed delegation', () => {
     writeFileSync(join(harness.repo, '.git', 'info', 'attributes'), 'tracked.txt filter=lfs\n')
     expect(await runGate(harness)).toMatchObject({ passed: true })
     // And a change is still seen with the filter off on both sides of the comparison.
-    harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), 'edited by the gate\n') }
+    // The gate's agents run at the same time: each writes its own content, so each one's edit shows whatever the order.
+    let edits = 0
+    harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), `edited by the gate ${++edits}\n`) }
     expect((await runGate(harness)).results).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: 'reviewer', verdict: 'invalid', diagnostic: 'read-only role changed tracked files' }),
     ]))
