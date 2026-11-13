@@ -49,6 +49,12 @@ export const CLAUDE_CODE_PERMISSION_MODES = [
   'bypassPermissions',
 ] as const satisfies readonly NonNullable<Options['permissionMode']>[]
 
+/** Reasoning effort levels the Claude Agent SDK accepts by name. */
+export const CLAUDE_CODE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+
+/** Profile-selectable Claude Code reasoning effort. */
+export type ClaudeCodeEffort = typeof CLAUDE_CODE_EFFORTS[number]
+
 /** Profile-selectable non-interactive Claude Code permission mode. */
 export type ClaudeCodePermissionMode = typeof CLAUDE_CODE_PERMISSION_MODES[number]
 
@@ -152,6 +158,8 @@ export interface ClaudeCodeRunSpec {
   readonly cwd: string
   /** Profile-selected native model; omitted to preserve Claude settings. */
   readonly model?: string
+  /** Profile-selected reasoning effort; omitted to preserve Claude settings. */
+  readonly effort?: ClaudeCodeEffort
   /** Profile-selected native non-interactive permission mode. */
   readonly permissionMode: ClaudeCodePermissionMode
   /** Explicit deployment/test environment layered after shared scrubbing. */
@@ -326,6 +334,7 @@ export function claudeQueryOptions(
     abortController: controller,
     cwd: spec.cwd,
     ...spec.model === undefined ? {} : { model: spec.model },
+    ...spec.effort === undefined ? {} : { effort: spec.effort },
     env: { ...scrubbedParentEnv(), ...spec.env },
     persistSession: false,
     disallowedTools: spec.permissionMode === 'plan'

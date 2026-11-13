@@ -11,6 +11,7 @@
     { "path": "../ui-conversation/tsconfig.client.json" },
     { "path": "../ui-primitives" },
     { "path": "../ui-renderer" },
+    { "path": "../ui-settings/tsconfig.client.json" },
     { "path": "../ui-slots" },
     { "path": "../../orchestration/toranja-orchestrator" }
   ]

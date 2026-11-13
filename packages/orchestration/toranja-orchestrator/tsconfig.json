@@ -21,10 +21,28 @@
       "path": "../../core/tools"
     },
     {
+      "path": "../../credentials/credentials"
+    },
+    {
       "path": "../../llm/llm"
     },
     {
+      "path": "../../storage/storage-domain"
+    },
+    {
       "path": "../../subagent/subagent"
+    },
+    {
+      "path": "../../subagent/subagent-antigravity"
+    },
+    {
+      "path": "../../subagent/subagent-claude-code"
+    },
+    {
+      "path": "../../subagent/subagent-codex"
+    },
+    {
+      "path": "../../subprocess/subprocess"
     },
     {
       "path": "../../typert/protocol"

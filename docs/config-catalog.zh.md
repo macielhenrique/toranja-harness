@@ -774,6 +774,23 @@ export interface Config {
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-cordis-host-runner -->
 
+<!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-credentials-codex-import -->
+<a id="deepseek-aidsh-credentials-codex-import"></a>
+
+## `@deepseek-ai/dsh-credentials-codex-import`
+
+- `inject`: `credentials`
+- `source`: [`packages/credentials/credentials-codex-import/src/index.ts:10`](../packages/credentials/credentials-codex-import/src/index.ts)
+
+```ts config-catalog
+/** Configuration for the local Codex credential importer plugin. */
+export interface Config {
+  /** Optional override path to the Codex `auth.json` file. */
+  authPath?: string
+}
+```
+<!-- END GENERATED config-catalog:@deepseek-ai/dsh-credentials-codex-import -->
+
 <!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-credentials-local -->
 <a id="deepseek-aidsh-credentials-local"></a>
 
@@ -1725,6 +1742,44 @@ export interface Config {
 }
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-jobs-local -->
+
+<!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-llm-antigravity-cli -->
+<a id="deepseek-aidsh-llm-antigravity-cli"></a>
+
+## `@deepseek-ai/dsh-llm-antigravity-cli`
+
+- `inject`: `agents` · `llm` · `sessions` · `subprocess` · `toranjaOrchestrator` · `workingDirectory`
+- `source`: [`packages/llm/llm-antigravity-cli/src/index.ts:85`](../packages/llm/llm-antigravity-cli/src/index.ts)
+
+```ts config-catalog
+/** Configuration for the direct Antigravity CLI LLM adapter. */
+export interface Config {
+  /** Antigravity CLI executable resolved through `PATH` or an absolute path. */
+  executable?: string
+  /** Time limit of one CLI turn in milliseconds. */
+  timeoutMs?: number
+  /** Run the CLI with its own terminal sandbox enabled. */
+  sandbox?: boolean
+  /** Auto-approve headless tool prompts; requires `sandbox`. */
+  autoApproveTools?: boolean
+  /** Antigravity execution mode of the session. */
+  mode?: 'accept-edits' | 'auto' | 'plan'
+  /** Model passed to the CLI; omitted to keep the model selected in the chat. */
+  model?: string
+  /** Reasoning effort passed to the CLI; omitted to keep the CLI default. */
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  /** Upper bound of Codex delegations one primary turn may request. */
+  maxCodexDelegationsPerTurn?: number
+  /** Explicit environment entries layered over the scrubbed parent environment. */
+  env?: Record<string, string>
+  /**
+   * How long a conversation stays on the quota fallback model before the
+   * selected model is tried again, in milliseconds.
+   */
+  quotaFallbackRetryMs?: number
+}
+```
+<!-- END GENERATED config-catalog:@deepseek-ai/dsh-llm-antigravity-cli -->
 
 <!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-llm-deepseek-account -->
 <a id="deepseek-aidsh-llm-deepseek-account"></a>
@@ -3386,13 +3441,57 @@ export type PermissionPolicy = 'allow' | 'reject'
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-subagent-acp -->
 
+<!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-subagent-antigravity -->
+<a id="deepseek-aidsh-subagent-antigravity"></a>
+
+## `@deepseek-ai/dsh-subagent-antigravity`
+
+- `inject`: `subagents` · `subprocess`
+- `source`: [`packages/subagent/subagent-antigravity/src/index.ts:45`](../packages/subagent/subagent-antigravity/src/index.ts)
+
+```ts config-catalog
+/** Deployment-owned Antigravity CLI settings. */
+export interface Config {
+  /** Registry name on `ctx.subagents`; each mounted instance needs a unique value. */
+  providerName?: string
+  /** Antigravity CLI executable resolved through `PATH` or an absolute path. */
+  executable?: string
+  /** Time limit of one delegated run in milliseconds. */
+  timeoutMs?: number
+  /** Run the CLI with its own terminal sandbox enabled. */
+  sandbox?: boolean
+  /** Auto-approve headless tool prompts. Accepted only while sandbox is enabled. */
+  autoApproveTools?: boolean
+  /**
+   * `plan` returns a plan without changing files. The CLI implements it through
+   * slash-command expansion, so it requires `disableSlashCommands: false`.
+   */
+  mode?: AntigravityMode
+  /** Pass `--disable-slash-commands`; the CLI then ignores `mode: plan`. */
+  disableSlashCommands?: boolean
+  /** Model fixed for this instance; omitted to inherit the CLI setting. */
+  model?: string
+  /** Reasoning effort fixed for this instance; omitted to inherit the CLI setting. */
+  effort?: AntigravityEffort
+  /** Explicit environment entries layered over the scrubbed parent environment. */
+  env?: Record<string, string>
+  /** Grace in milliseconds between process termination tiers. */
+  disposeGraceMs?: number
+}
+
+type AntigravityMode = typeof MODES[number]
+
+type AntigravityEffort = typeof EFFORTS[number]
+```
+<!-- END GENERATED config-catalog:@deepseek-ai/dsh-subagent-antigravity -->
+
 <!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-subagent-claude-code -->
 <a id="deepseek-aidsh-subagent-claude-code"></a>
 
 ## `@deepseek-ai/dsh-subagent-claude-code`
 
 - `inject`: `subagents` · `subprocess`
-- `source`: [`packages/subagent/subagent-claude-code/src/index.ts:38`](../packages/subagent/subagent-claude-code/src/index.ts)
+- `source`: [`packages/subagent/subagent-claude-code/src/index.ts:40`](../packages/subagent/subagent-claude-code/src/index.ts)
 
 ```ts config-catalog
 /** Deployment-owned model, permission, environment, and process-release settings. */
@@ -3401,6 +3500,8 @@ export interface Config {
   providerName?: string
   /** Native Claude model fixed for this instance; omitted to inherit Claude settings. */
   model?: string
+  /** Reasoning effort fixed for this instance; omitted to inherit Claude settings. */
+  effort?: ClaudeCodeEffort
   /**
    * Explicit environment entries layered over the subprocess seam's
    * credential-scrubbed parent environment.
@@ -3416,6 +3517,9 @@ export interface Config {
   /** Grace in milliseconds between Claude Code managed-range termination tiers. */
   disposeGraceMs?: number
 }
+
+/** Profile-selectable Claude Code reasoning effort. */
+export type ClaudeCodeEffort = typeof CLAUDE_CODE_EFFORTS[number]
 
 /** Profile-selectable non-interactive Claude Code permission mode. */
 export type ClaudeCodePermissionMode = typeof CLAUDE_CODE_PERMISSION_MODES[number]
@@ -3437,6 +3541,8 @@ export interface Config {
   providerName?: string
   /** Native Codex model fixed for this instance; omitted to inherit Codex settings. */
   model?: string
+  /** Reasoning effort fixed for this instance's turns; omitted to inherit Codex settings. */
+  effort?: string
   /**
    * Explicit environment entries layered over the subprocess seam's
    * credential-scrubbed parent environment.
@@ -3451,6 +3557,7 @@ export interface Config {
 /** Profile-selectable non-interactive Codex permission mode. */
 export type CodexPermissionMode =
   | 'never'
+  | 'read-only'
   | 'approve-for-me'
   | 'dangerously-bypass-approvals-and-sandbox'
 ```
@@ -4253,6 +4360,129 @@ export type ToolPresentationMode = 'native' | 'ptc'
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-tools -->
 
+<!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-toranja-orchestrator -->
+<a id="deepseek-aidsh-toranja-orchestrator"></a>
+
+## `@deepseek-ai/dsh-toranja-orchestrator`
+
+- `inject`: `storageDomain` · `subagents` · `subprocess` · `systemPrompt` · `tools` · `workspaceRegistry`
+- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:141`](../packages/orchestration/toranja-orchestrator/src/index.ts)
+
+```ts config-catalog
+/** Product-owned orchestration settings. */
+export interface Config {
+  /** Static project lanes added to the registered Workspaces. */
+  projects?: ProjectConfig[]
+  /** Registry name of the unrouted Codex provider. */
+  codexProvider?: string
+  /** Registry name of the unrouted Antigravity provider. */
+  antigravityProvider?: string
+  /** Registry name of the unrouted Claude Code provider. */
+  claudeCodeProvider?: string
+  /** Registry name of the unrouted OpenRouter provider. */
+  openrouterProvider?: string
+  /** Maximum Toranja-owned runs active at once. */
+  maxConcurrentTotal?: number
+  /** Maximum active runs in one project lane. */
+  maxConcurrentPerProject?: number
+  /** Largest team size the user may set; it bounds how far the team size raises the concurrency limits. */
+  maxTeamSize?: number
+  /**
+   * Run each implementer in a Git worktree and branch of its own instead of
+   * the project's working tree, so implementers can work at the same time and
+   * a change waits on its branch for review. Off by default.
+   */
+  implementerWorktrees?: boolean
+  /** Directory the implementer worktrees are created under; by default `.toranja-worktrees` beside each project. */
+  worktreeRoot?: string
+  /** Maximum active runs on one provider. */
+  maxConcurrentPerProvider?: number
+  /** Maximum length of one delegated task or gate input. */
+  maxTaskChars?: number
+  /** Allow more than one implementer in the same project directory. */
+  allowParallelImplementation?: boolean
+  /** Routing mode in force until the controller changes it. */
+  defaultMode?: ToranjaAgentMode
+  /** Execution profile in force until the controller changes it. */
+  defaultProfile?: ToranjaExecutionProfile
+  /** Order in which registered providers replace an unavailable preferred one. */
+  fallbackOrder?: ToranjaProviderId[]
+  /** Per-provider model routing, keyed by provider id. */
+  routing?: Record<string, ProviderRoutingConfig>
+  /** Preferred provider per role in Team mode, keyed by role. */
+  roleProviders?: Record<string, ToranjaProviderId>
+  /**
+   * Route the delivery-gate reviewer to a provider other than the one that
+   * implemented the change whenever another provider is connected.
+   */
+  crossReview?: boolean
+  /**
+   * When a delivery gate returns an explicit `FAIL`, start a planner with the
+   * gate evidence so the change returns to planning.
+   */
+  replanOnGateFailure?: boolean
+  /**
+   * Executable of each CLI provider (`codex`, `antigravity`, `claude-code`),
+   * as a command name searched in `PATH` or an absolute path.
+   */
+  executables?: Record<string, string>
+  /** Probe the provider CLIs once when the plugin starts. */
+  probeOnStart?: boolean
+  /** Time limit of one provider status command, in milliseconds. */
+  probeTimeoutMs?: number
+  /** LLM provider id that OpenRouter tasks select on the internal agent. */
+  openrouterLlmProvider?: string
+  /** Credential reference holding the OpenRouter API key. */
+  openrouterKeyRef?: string
+  /**
+   * Let OpenRouter run `read-only` and `execute` roles. The internal agent it
+   * runs on has no mode that prevents writing, so by default it takes only the
+   * `write` role; with this set, the working-tree check is the only safeguard.
+   */
+  openrouterUnenforcedAccess?: boolean
+}
+
+/** One stable product lane backed by a local project directory. */
+export interface ProjectConfig {
+  /** Stable lane identifier matching `^[a-z][a-z0-9-]{1,31}$`. */
+  id: string
+  /** Human-readable lane title. */
+  title: string
+  /** Absolute project directory. */
+  path: string
+}
+
+/** Active agent routing mode (solo provider or `team`). */
+export type ToranjaAgentMode = ToranjaProviderId | 'team'
+
+/** Dynamic cost/quality execution profile from the Toranja architecture blueprint. */
+export type ToranjaExecutionProfile = 'economico' | 'equilibrado' | 'qualidade'
+
+/** Identifier for a supported Toranja agent provider. */
+export type ToranjaProviderId = 'codex' | 'antigravity' | 'claude-code' | 'openrouter'
+
+/** Model routing of one provider. */
+export interface ProviderRoutingConfig {
+  /**
+   * Base configuration of the provider plugin. When present, Toranja starts its
+   * own provider instances per route and applies the model, effort, and access
+   * below; when absent, delegations use the deployment's unrouted instance.
+   */
+  base?: Record<string, unknown>
+  /** Model and reasoning effort per tier (`light`, `advanced`, `max`). */
+  models?: Record<string, TierModelConfig>
+}
+
+/** Model and reasoning effort of one tier. */
+export interface TierModelConfig {
+  /** Provider model id; omitted to keep the provider's default model. */
+  model?: string
+  /** Provider reasoning effort; omitted to keep the provider's default effort. */
+  effort?: string
+}
+```
+<!-- END GENERATED config-catalog:@deepseek-ai/dsh-toranja-orchestrator -->
+
 <!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-typert-loader -->
 <a id="deepseek-aidsh-typert-loader"></a>
 
@@ -4572,12 +4802,14 @@ export interface Config {
 | `@deepseek-ai/dsh-browser-use` | — | [`packages/browser-use/browser-use/src/index.ts`](../packages/browser-use/browser-use/src/index.ts) |
 | `@deepseek-ai/dsh-client-file-upload` | `agents` · `attachments` · `commands` · `connection` | [`packages/client/file-upload/src/index.ts`](../packages/client/file-upload/src/index.ts) |
 | `@deepseek-ai/dsh-client-locale` | — | [`packages/client/locale/src/index.ts`](../packages/client/locale/src/index.ts) |
+| `@deepseek-ai/dsh-client-locale-pt-br` | — | [`packages/client/locale-pt-br/src/index.ts`](../packages/client/locale-pt-br/src/index.ts) |
 | `@deepseek-ai/dsh-client-modules` | `loader` | [`packages/client/modules/src/index.ts`](../packages/client/modules/src/index.ts) |
 | `@deepseek-ai/dsh-client-resources` | — | [`packages/client/resources/src/index.ts`](../packages/client/resources/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-agent-preset` | — | [`packages/client/ui-agent-preset/src/index.ts`](../packages/client/ui-agent-preset/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-approval` | — | [`packages/client/ui-approval/src/index.ts`](../packages/client/ui-approval/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-attachment` | — | [`packages/client/ui-attachment/src/index.ts`](../packages/client/ui-attachment/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-brand-official` | — | [`packages/client/ui-brand-official/src/index.ts`](../packages/client/ui-brand-official/src/index.ts) |
+| `@deepseek-ai/dsh-client-ui-brand-toranja` | — | [`packages/client/ui-brand-toranja/src/index.ts`](../packages/client/ui-brand-toranja/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-chat` | — | [`packages/client/ui-chat/src/index.ts`](../packages/client/ui-chat/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-commands` | — | [`packages/client/ui-commands/src/index.ts`](../packages/client/ui-commands/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-conversation` | — | [`packages/client/ui-conversation/src/index.ts`](../packages/client/ui-conversation/src/index.ts) |
@@ -4618,6 +4850,7 @@ export interface Config {
 | `@deepseek-ai/dsh-client-ui-skill` | — | [`packages/client/ui-skill/src/index.ts`](../packages/client/ui-skill/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-subagent` | — | [`packages/client/ui-subagent/src/index.ts`](../packages/client/ui-subagent/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-tool` | — | [`packages/client/ui-tool/src/index.ts`](../packages/client/ui-tool/src/index.ts) |
+| `@deepseek-ai/dsh-client-ui-toranja-control` | — | [`packages/client/ui-toranja-control/src/index.ts`](../packages/client/ui-toranja-control/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-trajectory` | — | [`packages/client/ui-trajectory/src/index.ts`](../packages/client/ui-trajectory/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-user-questions` | — | [`packages/client/ui-user-questions/src/index.ts`](../packages/client/ui-user-questions/src/index.ts) |
 | `@deepseek-ai/dsh-client-ui-workflow-run` | — | [`packages/client/ui-workflow-run/src/index.ts`](../packages/client/ui-workflow-run/src/index.ts) |
@@ -4761,6 +4994,7 @@ export interface Config {
 | `@deepseek-ai/dsh-session-title-llm` | — | [`packages/session/session-title-llm/src/index.ts`](../packages/session/session-title-llm/src/index.ts) |
 | `@deepseek-ai/dsh-ssh-helper-runtime` | — | [`packages/ssh/ssh-helper-runtime/src/index.ts`](../packages/ssh/ssh-helper-runtime/src/index.ts) |
 | `@deepseek-ai/dsh-timeout` | — | [`packages/util/timeout/src/index.ts`](../packages/util/timeout/src/index.ts) |
+| `@deepseek-ai/dsh-toranja-harness-bundle` | — | [`packages/bundle/toranja-harness/src/index.ts`](../packages/bundle/toranja-harness/src/index.ts) |
 | `@deepseek-ai/dsh-typert-generator` | — | [`packages/typert/generator/src/index.ts`](../packages/typert/generator/src/index.ts) |
 | `@deepseek-ai/dsh-typert-protocol` | — | [`packages/typert/protocol/src/index.ts`](../packages/typert/protocol/src/index.ts) |
 | `@deepseek-ai/dsh-typert-registry` | — | [`packages/typert/registry/src/index.ts`](../packages/typert/registry/src/index.ts) |

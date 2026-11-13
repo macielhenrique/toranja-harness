@@ -158,7 +158,8 @@ export class ModelDirectory {
     if (this.disposed) return
     const catalog = this.catalog.store.getSnapshot()
     const projected = modelSelectionProjection(this.projected.getSnapshot())
-    const intended = projected?.next ?? catalog.value?.default
+    const saved = projected?.next ?? catalog.value?.default
+    const intended = saved === undefined || catalog.value === null ? saved : listedSelection(catalog.value.groups, saved)
     const reasoning = intended === undefined ? undefined : this.catalog.reasoningFor(intended)
     const effort = intended?.reasoningEffort ?? reasoning?.defaultEffort
     const retainedEffort = effort === undefined ? undefined
@@ -176,7 +177,7 @@ export class ModelDirectory {
       })
       return
     }
-    const selection = projected.next ?? catalog.value.default
+    const selection = listedSelection(catalog.value.groups, projected.next ?? catalog.value.default)
     const routable = catalog.value.groups.some(group => group.id === selection.provider
       && group.models.some(model => model.id === selection.model))
     this.store.set({
@@ -192,6 +193,37 @@ export class ModelDirectory {
       error: null,
     })
   }
+}
+
+/**
+ * Provider routes whose adapter runs a model at a reasoning level under the id
+ * `<model>-<level>`, and once listed each of those ids as a model of its own.
+ * Model ids are opaque everywhere else, so only these routes are read this way.
+ */
+const PER_LEVEL_ID_PROVIDERS: ReadonlySet<string> = new Set(['antigravity-local'])
+
+/**
+ * Map a saved selection whose model id the catalog no longer lists onto the
+ * listed model and reasoning level that id names as `<model>-<level>`, for the
+ * provider routes in {@link PER_LEVEL_ID_PROVIDERS}. Sessions and defaults
+ * saved before such an adapter folded its per-level ids into one model with
+ * reasoning levels keep their model and level in the selector; the adapter
+ * still runs the saved id until the user picks another model or level. A
+ * listed id, an id of any other provider, or one that names no single listed
+ * model and level, is returned unchanged.
+ * @param groups - provider groups of the loaded catalog.
+ * @param selection - the saved selection.
+ * @returns the selection to display and compare against the catalog.
+ */
+function listedSelection(groups: readonly ModelProviderGroup[], selection: ModelSelection): ModelSelection {
+  if (!PER_LEVEL_ID_PROVIDERS.has(selection.provider)) return selection
+  const group = groups.find(candidate => candidate.id === selection.provider)
+  if (group === undefined || group.models.some(model => model.id === selection.model)) return selection
+  const named = group.models.flatMap(model => (model.reasoning?.efforts ?? [])
+    .filter(effort => `${model.id}-${effort.id}` === selection.model)
+    .map(effort => ({ provider: group.id, model: model.id, reasoningEffort: effort.id })))
+  const [only, ...others] = named
+  return only !== undefined && others.length === 0 ? only : selection
 }
 
 function modelSelectionProjection(value: unknown): ModelSelectionProjection | undefined {

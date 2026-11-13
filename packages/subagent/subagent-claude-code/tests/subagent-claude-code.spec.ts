@@ -508,6 +508,7 @@ describe('task admission and package contracts', () => {
     const safeFiber = await ctx.plugin(claudeCode, {
       providerName: 'claude-safe',
       model: 'claude-safe-model',
+      effort: 'low',
       env: { DSH_CLAUDE_INSTANCE: 'safe' },
       permissionMode: 'dontAsk',
       disposeGraceMs: 11,
@@ -545,10 +546,11 @@ describe('task admission and package contracts', () => {
     expect(queryOptions.map(options => ({
       instance: options.env?.DSH_CLAUDE_INSTANCE,
       model: options.model,
+      effort: options.effort,
       permissionMode: options.permissionMode,
     }))).toEqual([
-      { instance: 'safe', model: 'claude-safe-model', permissionMode: 'dontAsk' },
-      { instance: 'bypass', model: 'claude-bypass-model', permissionMode: 'bypassPermissions' },
+      { instance: 'safe', model: 'claude-safe-model', effort: 'low', permissionMode: 'dontAsk' },
+      { instance: 'bypass', model: 'claude-bypass-model', effort: undefined, permissionMode: 'bypassPermissions' },
     ])
     expect(spawnSpecs.map(spec => ({
       instance: spec.env?.DSH_CLAUDE_INSTANCE,
@@ -596,6 +598,8 @@ describe('task admission and package contracts', () => {
     expect(() => claudeCode.Config({ providerName: '' })).toThrow()
     expect(claudeCode.Config({ model: 'claude-opus' }).model).toBe('claude-opus')
     expect(() => claudeCode.Config({ model: '' })).toThrow()
+    expect(claudeCode.Config({ effort: 'high' }).effort).toBe('high')
+    expect(() => claudeCode.Config({ effort: 'turbo' } as never)).toThrow()
     expect(claudeCode.Config({}).permissionMode)
       .toBe(DEFAULT_CLAUDE_CODE_PERMISSION_MODE)
     for (const permissionMode of CLAUDE_CODE_PERMISSION_MODES) {

@@ -43,6 +43,7 @@ function fixture(): { adapter: LlmAdapter; specs: SubprocessSpawnSpec[] } {
         return () => undefined
       },
     },
+    logger: { warn: () => undefined },
     sessions: { get: () => undefined },
     subprocess,
     toranjaOrchestrator: {
@@ -57,41 +58,69 @@ function fixture(): { adapter: LlmAdapter; specs: SubprocessSpawnSpec[] } {
 }
 
 describe('AntigravityCliAdapter', () => {
-  it('publishes the local Antigravity model catalog in Portuguese', async () => {
+  it('lists each model family once, without one entry per reasoning level', async () => {
     const { adapter } = fixture()
     const models = await adapter.listModels('antigravity-local')
 
-    expect(models.map(model => model.id)).toEqual(expect.arrayContaining([
-      'default',
-      'gemini-3.8-flash-low',
-      'gemini-3.8-flash-medium',
-      'gemini-3.8-flash-high',
-      'claude-opus-5-5-medium',
-      'claude-sonnet-5-5-medium',
-      'gpt-oss-120b-medium',
-    ]))
-    expect(models.find(model => model.id === 'gemini-3.8-flash-medium')?.name)
-      .toBe('Gemini 3.8 Flash (Médio)')
+    expect(models.map(model => [model.id, model.name])).toEqual([
+      ['default', 'Antigravity — automático'],
+      ['gemini-4-argon', 'Gemini 4 Argon'],
+      ['gemini-3.8-flash', 'Gemini 3.8 Flash'],
+      ['claude-opus-5-5', 'Claude Opus 5.5'],
+      ['claude-sonnet-5-5', 'Claude Sonnet 5.5'],
+      ['gpt-oss-120b', 'GPT-OSS 120B'],
+    ])
   })
 
-  it('routes the selected catalog id to agy --model', async () => {
+  it('offers the reasoning levels of a family as a separate choice', async () => {
+    const { adapter } = fixture()
+    const argon = await adapter.resolveModel('antigravity-local', 'gemini-4-argon')
+    expect(argon.reasoning).toEqual({
+      efforts: [{ id: 'low', name: 'Baixo' }, { id: 'medium', name: 'Médio' }, { id: 'high', name: 'Alto' }],
+      defaultEffort: 'medium',
+    })
+    const oss = await adapter.resolveModel('antigravity-local', 'gpt-oss-120b')
+    expect(oss.reasoning).toEqual({ efforts: [{ id: 'medium', name: 'Médio' }], defaultEffort: 'medium' })
+    expect((await adapter.resolveModel('antigravity-local', 'default')).reasoning).toBeUndefined()
+  })
+
+  it.each([
+    ['gemini-3.8-flash', 'high', 'gemini-3.8-flash-high'],
+    ['gemini-3.8-flash', undefined, 'gemini-3.8-flash-medium'],
+    ['claude-opus-5-5', 'low', 'claude-opus-5-5-low'],
+    ['gemini-3.8-flash-medium', undefined, 'gemini-3.8-flash-medium'],
+  ] as const)('starts agy for %s at level %s on %s', async (model, reasoningEffort, expected) => {
     const { adapter, specs } = fixture()
-    const request: GenerateOptions = {
+    const request = {
       provider: 'antigravity-local',
-      model: 'gemini-3.8-flash-medium',
+      model,
+      ...reasoningEffort === undefined ? {} : { reasoningEffort },
       messages: [{ role: 'user', content: [{ type: 'text', text: 'responda diretamente' }] }],
-    }
+    } as never as GenerateOptions
 
     for await (const _chunk of adapter.stream(request)) {
       // Consume the complete stream so the one-shot subprocess is closed.
     }
 
     expect(specs).toHaveLength(1)
-    expect(specs[0]?.argv).toEqual(expect.arrayContaining([
-      '--model',
-      'gemini-3.8-flash-medium',
-    ]))
-    expect(specs[0]?.argv).not.toContain('--effort')
+    const argv = specs[0]?.argv ?? []
+    expect(argv[argv.indexOf('--model') + 1]).toBe(expected)
+    expect(argv).not.toContain('--effort')
+  })
+
+  it('rejects a reasoning level the family does not offer', async () => {
+    const { adapter } = fixture()
+    const request = {
+      provider: 'antigravity-local',
+      model: 'gpt-oss-120b',
+      reasoningEffort: 'high',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'oi' }] }],
+    } as never as GenerateOptions
+    await expect((async () => {
+      for await (const _chunk of adapter.stream(request)) {
+        // Drain.
+      }
+    })()).rejects.toThrow('gpt-oss-120b does not offer reasoning level high')
   })
 
   it('identifies quota and capacity exhaustion errors', () => {
@@ -155,6 +184,7 @@ describe('AntigravityCliAdapter', () => {
           return () => undefined
         },
       },
+      logger: { warn: () => undefined },
       sessions: { get: () => undefined },
       subprocess,
       toranjaOrchestrator: {

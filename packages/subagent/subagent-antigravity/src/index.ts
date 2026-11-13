@@ -43,16 +43,30 @@ type AntigravityEffort = typeof EFFORTS[number]
 
 /** Deployment-owned Antigravity CLI settings. */
 export interface Config {
+  /** Registry name on `ctx.subagents`; each mounted instance needs a unique value. */
   providerName?: string
+  /** Antigravity CLI executable resolved through `PATH` or an absolute path. */
   executable?: string
+  /** Time limit of one delegated run in milliseconds. */
   timeoutMs?: number
+  /** Run the CLI with its own terminal sandbox enabled. */
   sandbox?: boolean
   /** Auto-approve headless tool prompts. Accepted only while sandbox is enabled. */
   autoApproveTools?: boolean
+  /**
+   * `plan` returns a plan without changing files. The CLI implements it through
+   * slash-command expansion, so it requires `disableSlashCommands: false`.
+   */
   mode?: AntigravityMode
+  /** Pass `--disable-slash-commands`; the CLI then ignores `mode: plan`. */
+  disableSlashCommands?: boolean
+  /** Model fixed for this instance; omitted to inherit the CLI setting. */
   model?: string
+  /** Reasoning effort fixed for this instance; omitted to inherit the CLI setting. */
   effort?: AntigravityEffort
+  /** Explicit environment entries layered over the scrubbed parent environment. */
   env?: Record<string, string>
+  /** Grace in milliseconds between process termination tiers. */
   disposeGraceMs?: number
 }
 
@@ -63,6 +77,7 @@ export const Config: z<Config> = z.object({
   sandbox: z.boolean().default(true),
   autoApproveTools: z.boolean().default(false),
   mode: z.union([...MODES]).default('accept-edits'),
+  disableSlashCommands: z.boolean().default(true),
   model: z.string().min(1),
   effort: z.union([...EFFORTS]),
   env: z.dict(z.string()).default({}),
@@ -185,9 +200,9 @@ class AntigravityProvider implements SubagentProvider {
       '-p', taskText(request.prompt),
       '--output-format', 'json',
       '--print-timeout', `${this.config.timeoutMs}ms`,
-      '--disable-slash-commands',
       '--mode', this.config.mode,
     ]
+    if (this.config.disableSlashCommands) argv.push('--disable-slash-commands')
     if (this.config.sandbox) argv.push('--sandbox')
     if (this.config.autoApproveTools) argv.push('--dangerously-skip-permissions')
     if (this.config.model !== undefined) argv.push('--model', this.config.model)
@@ -271,6 +286,7 @@ export function apply(ctx: Context, config: Config): void {
     sandbox: config.sandbox ?? true,
     autoApproveTools: config.autoApproveTools ?? false,
     mode: config.mode ?? 'accept-edits',
+    disableSlashCommands: config.disableSlashCommands ?? true,
     ...config.model === undefined ? {} : { model: config.model },
     ...config.effort === undefined ? {} : { effort: config.effort },
     env: config.env ?? {},
@@ -280,6 +296,12 @@ export function apply(ctx: Context, config: Config): void {
   assertPositiveFinite('subagent-antigravity', 'disposeGraceMs', resolved.disposeGraceMs)
   if (resolved.autoApproveTools && !resolved.sandbox) {
     throw new Error('subagent-antigravity: autoApproveTools requires sandbox=true')
+  }
+  if (resolved.mode === 'plan' && resolved.disableSlashCommands) {
+    throw new Error('subagent-antigravity: mode=plan requires disableSlashCommands=false; the CLI ignores plan mode otherwise')
+  }
+  if (resolved.mode === 'plan' && resolved.autoApproveTools) {
+    throw new Error('subagent-antigravity: mode=plan cannot be combined with autoApproveTools')
   }
   if (resolved.timeoutMs > MAX_TIMER_DELAY_MS || resolved.disposeGraceMs > MAX_TIMER_DELAY_MS) {
     throw new Error(`subagent-antigravity: timeout values must be <= ${MAX_TIMER_DELAY_MS}`)

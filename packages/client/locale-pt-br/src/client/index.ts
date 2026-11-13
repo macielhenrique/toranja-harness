@@ -107,7 +107,7 @@ const dictionaries: Record<string, Record<string, string>> = {
     'trigger.aria': 'Modelo do Codex, atual: {model}',
     'trigger.ariaEffort': 'Modelo do Codex: {model}; raciocínio: {effort}',
     'menu.aria': 'Modelo líder do Codex e nível de raciocínio', 'menu.model': 'Modelo do Codex',
-    'menu.effort': 'Raciocínio', 'effort.providerDefault': 'Padrão',
+    'menu.effort': 'Raciocínio', 'menu.effortFor': 'Nível de raciocínio de {model}', 'effort.providerDefault': 'Padrão',
     'status.loading': 'Atualizando modelos…', 'error.action': 'Falha na operação do modelo: {message}',
     'action.reload': 'Recarregar', 'warning.groupLoad': 'Falha ao carregar {name}: {message}',
     'search.placeholder': 'Pesquisar agentes e modelos…', 'search.clear': 'Limpar pesquisa',

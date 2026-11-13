@@ -20,7 +20,9 @@ working directory. The default mode accepts workspace edits while Antigravity's
 own sandbox remains enabled.
 
 Configuration supports `executable`, `timeoutMs`, `sandbox`,
-`autoApproveTools`, `mode`, `model`, `effort`, `env`, and `disposeGraceMs`.
+`autoApproveTools`, `mode`, `disableSlashCommands`, `model`, `effort`, `env`, and `disposeGraceMs`.
+
+`mode: plan` returns a plan without changing files. The CLI implements it through slash-command expansion and ignores it under `--disable-slash-commands`, so the plugin rejects `mode: plan` unless `disableSlashCommands` is `false`, and rejects it together with `autoApproveTools`. Plan mode is a directive to the model, not a sandbox.
 Headless Antigravity cannot display permission prompts; `autoApproveTools`
 passes its non-interactive approval flag and is therefore accepted only while
 the Antigravity sandbox remains enabled. Omitting `model` and `effort`

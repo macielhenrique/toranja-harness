@@ -38,3 +38,11 @@ limites.
 O modo selecionado no painel **Agentes** é uma trava de execução. Em **Só
 Antigravity**, o adaptador nunca inicia Codex. Em **Equipe**, o Antigravity pode
 liderar e delegar ao Codex; o resultado volta para ele revisar e consolidar.
+
+## Catálogo de modelos
+
+O catálogo lista cada família de modelo uma única vez (por exemplo `gemini-4-argon`) e publica os níveis de raciocínio da família como efforts selecionáveis (`low`, `medium`, `high`, com `medium` como padrão). O CLI nomeia um modelo por família e nível, então o adaptador combina os dois em `--model <família>-<nível>` e rejeita um nível que a família não oferece. Um identificador completo gravado por uma versão anterior, como `gemini-4-argon-high`, continua aceito e é repassado sem alteração.
+
+## Esgotamento de cota
+
+Quando um modelo Gemini Argon responde com esgotamento de cota, a conversa continua no `gemini-3.8-flash-high` com effort `high`. O novo processo recebe o histórico recente da conversa, porque começa sem contexto. A conversa permanece no modelo alternativo por `quotaFallbackRetryMs` (padrão de 15 minutos) ou até outro modelo ser selecionado; depois disso o modelo selecionado é tentado de novo.

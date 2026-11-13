@@ -4,9 +4,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import {
   LlmAdapter,
+  ReasoningEffortId,
   type GenerateOptions,
   type LlmModelInfo,
   type LlmProviderInfo,
+  type LlmResolvedModelInfo,
   type RequestMessage,
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
@@ -23,21 +25,23 @@ export const inject = ['agents', 'llm', 'sessions', 'subprocess', 'toranjaOrches
 
 const PROVIDER = 'antigravity-local'
 const MODEL = 'default'
-const NAMED_MODELS: readonly (readonly [id: string, name: string])[] = [
-  ['gemini-4-argon-medium', 'Gemini 4 Argon (Médio)'],
-  ['gemini-4-argon-high', 'Gemini 4 Argon (Alto)'],
-  ['gemini-4-argon-low', 'Gemini 4 Argon (Baixo)'],
-  ['gemini-3.8-flash-high', 'Gemini 3.8 Flash (Alto)'],
-  ['gemini-3.8-flash-medium', 'Gemini 3.8 Flash (Médio)'],
-  ['gemini-3.8-flash-low', 'Gemini 3.8 Flash (Baixo)'],
-  ['claude-opus-5-5-low', 'Claude Opus 5.5 (Baixo)'],
-  ['claude-opus-5-5-medium', 'Claude Opus 5.5 (Médio)'],
-  ['claude-opus-5-5-high', 'Claude Opus 5.5 (Alto)'],
-  ['claude-sonnet-5-5-low', 'Claude Sonnet 5.5 (Baixo)'],
-  ['claude-sonnet-5-5-medium', 'Claude Sonnet 5.5 (Médio)'],
-  ['claude-sonnet-5-5-high', 'Claude Sonnet 5.5 (Alto)'],
-  ['gpt-oss-120b-medium', 'GPT-OSS 120B (Médio)'],
+/** Model and effort a Gemini Argon conversation continues on when its quota is exhausted. */
+const QUOTA_FALLBACK = { model: 'gemini-3.8-flash-high', effort: 'high' } as const
+const EFFORT_NAMES = { low: 'Baixo', medium: 'Médio', high: 'Alto' } as const
+type FamilyEffort = keyof typeof EFFORT_NAMES
+/**
+ * Model families of the Antigravity CLI. The CLI names one model per family
+ * and reasoning level (`<family>-<level>`); the catalog lists each family once
+ * and offers the levels as its reasoning efforts.
+ */
+const MODEL_FAMILIES: readonly (readonly [id: string, name: string, efforts: readonly FamilyEffort[]])[] = [
+  ['gemini-4-argon', 'Gemini 4 Argon', ['low', 'medium', 'high']],
+  ['gemini-3.8-flash', 'Gemini 3.8 Flash', ['low', 'medium', 'high']],
+  ['claude-opus-5-5', 'Claude Opus 5.5', ['low', 'medium', 'high']],
+  ['claude-sonnet-5-5', 'Claude Sonnet 5.5', ['low', 'medium', 'high']],
+  ['gpt-oss-120b', 'GPT-OSS 120B', ['medium']],
 ]
+const DEFAULT_FAMILY_EFFORT: FamilyEffort = 'medium'
 const MODELS: readonly LlmModelInfo[] = [
   {
     provider: PROVIDER,
@@ -46,7 +50,7 @@ const MODELS: readonly LlmModelInfo[] = [
     description: 'Usa o modelo padrão selecionado na conta local do Antigravity.',
     inputModalities: ['text'],
   },
-  ...NAMED_MODELS.map(([id, name]) => ({
+  ...MODEL_FAMILIES.map(([id, name]) => ({
     provider: PROVIDER,
     id,
     name,
@@ -54,21 +58,54 @@ const MODELS: readonly LlmModelInfo[] = [
     inputModalities: ['text'] as const,
   })),
 ]
+
+/**
+ * Resolve the CLI model id for a catalog selection. A family combines with the
+ * requested reasoning level; any other id, such as a `<family>-<level>` id
+ * stored by an earlier version, passes through unchanged.
+ * @param model - Selected catalog model id.
+ * @param effort - Requested reasoning level, when one was selected.
+ * @returns Model id accepted by `agy --model`.
+ */
+function cliModelId(model: string, effort: string | undefined): string {
+  const family = MODEL_FAMILIES.find(([id]) => id === model)
+  if (family === undefined) return model
+  const level = effort ?? DEFAULT_FAMILY_EFFORT
+  if (!family[2].some(candidate => candidate === level)) {
+    throw new Error(`llm-antigravity-cli: ${model} does not offer reasoning level ${level}`)
+  }
+  return `${model}-${level}`
+}
+
 // Switching providers needs enough recent context to continue coherently, but
 // replaying an entire long Codex conversation wastes Antigravity credits.
 const MAX_HANDOFF_CHARS = 16_000
 
 /** Configuration for the direct Antigravity CLI LLM adapter. */
 export interface Config {
+  /** Antigravity CLI executable resolved through `PATH` or an absolute path. */
   executable?: string
+  /** Time limit of one CLI turn in milliseconds. */
   timeoutMs?: number
+  /** Run the CLI with its own terminal sandbox enabled. */
   sandbox?: boolean
+  /** Auto-approve headless tool prompts; requires `sandbox`. */
   autoApproveTools?: boolean
+  /** Antigravity execution mode of the session. */
   mode?: 'accept-edits' | 'auto' | 'plan'
+  /** Model passed to the CLI; omitted to keep the model selected in the chat. */
   model?: string
+  /** Reasoning effort passed to the CLI; omitted to keep the CLI default. */
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  /** Upper bound of Codex delegations one primary turn may request. */
   maxCodexDelegationsPerTurn?: number
+  /** Explicit environment entries layered over the scrubbed parent environment. */
   env?: Record<string, string>
+  /**
+   * How long a conversation stays on the quota fallback model before the
+   * selected model is tried again, in milliseconds.
+   */
+  quotaFallbackRetryMs?: number
 }
 
 /** Schema for {@link Config}. */
@@ -82,6 +119,7 @@ export const Config: z<Config> = z.object({
   effort: z.union(['low', 'medium', 'high', 'xhigh', 'max'] as const),
   maxCodexDelegationsPerTurn: z.number().default(3),
   env: z.dict(z.string()).default({}),
+  quotaFallbackRetryMs: z.number().default(900_000),
 })
 
 function blockText(message: RequestMessage): string {
@@ -176,6 +214,12 @@ export function isQuotaExhaustedError(error: unknown): boolean {
 
 class AntigravityCliAdapter extends LlmAdapter {
   private readonly sessions = new Map<string, AgySession>()
+  /** Selected model a conversation left for quota, and until when it stays away. */
+  private readonly quotaFallbacks = new Map<string, {
+    readonly model: AgySessionConfig['model']
+    readonly effort: AgySessionConfig['effort']
+    readonly until: number
+  }>()
 
   constructor(
     private readonly ctx: Context,
@@ -190,9 +234,25 @@ class AntigravityCliAdapter extends LlmAdapter {
     return Promise.resolve(MODELS)
   }
 
-  private agyConfig(model: string): AgySessionConfig {
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    const family = MODEL_FAMILIES.find(([id]) => id === model)
+    const listed = MODELS.find(candidate => candidate.id === model)
+    return Promise.resolve({
+      ...listed ?? { provider, id: model, name: model },
+      ...family === undefined
+        ? {}
+        : {
+          reasoning: {
+            efforts: family[2].map(effort => ({ id: ReasoningEffortId(effort), name: EFFORT_NAMES[effort] })),
+            defaultEffort: ReasoningEffortId(DEFAULT_FAMILY_EFFORT),
+          },
+        },
+    })
+  }
+
+  private agyConfig(model: string, effort: string | undefined): AgySessionConfig {
     const configuredModel = this.config.model
-    const selectedModel = configuredModel ?? (model === MODEL ? undefined : model)
+    const selectedModel = configuredModel ?? (model === MODEL ? undefined : cliModelId(model, effort))
     const selectedEffort = configuredModel !== undefined || model === MODEL ? this.config.effort : undefined
     return {
       executable: this.config.executable,
@@ -220,7 +280,18 @@ class AntigravityCliAdapter extends LlmAdapter {
     const cwd = this.cwd(options)
     const key = this.sessionKey(options)
     const priorProvider = lastAssistantProvider(options.messages)
-    const agyConfig = this.agyConfig(options.model)
+    const selectedConfig = this.agyConfig(options.model, options.reasoningEffort)
+    // A conversation that fell back for quota stays on the fallback model until
+    // the retry interval passes or the user selects another model.
+    const fallback = key === undefined ? undefined : this.quotaFallbacks.get(key)
+    const onFallback = fallback !== undefined
+      && fallback.model === selectedConfig.model
+      && fallback.effort === selectedConfig.effort
+      && Date.now() < fallback.until
+    if (key !== undefined && fallback !== undefined && !onFallback) this.quotaFallbacks.delete(key)
+    const agyConfig: AgySessionConfig = onFallback
+      ? { ...selectedConfig, ...QUOTA_FALLBACK }
+      : selectedConfig
     let driver = key === undefined ? undefined : this.sessions.get(key)
     const needsHandoff = driver === undefined
       || driver.cwd !== cwd
@@ -247,18 +318,27 @@ class AntigravityCliAdapter extends LlmAdapter {
           try {
             return await activeDriver.ask(nextPrompt, options.signal)
           } catch (error: unknown) {
-            const isArgon = agyConfig.model?.includes('argon') === true || options.model.includes('argon')
+            const isArgon = agyConfig.model?.includes('argon') === true
             if (isArgon && isQuotaExhaustedError(error)) {
+              this.ctx.logger.warn(`llm-antigravity-cli: quota exhausted on ${String(agyConfig.model)}; continuing on ${QUOTA_FALLBACK.model}`)
               activeDriver.close()
-              const fallbackConfig: AgySessionConfig = {
-                ...agyConfig,
-                model: 'gemini-3.8-flash-high',
-                effort: 'high',
+              const fallbackDriver = new AgySession(cwd, this.ctx, { ...agyConfig, ...QUOTA_FALLBACK })
+              if (key !== undefined) {
+                this.sessions.set(key, fallbackDriver)
+                this.quotaFallbacks.set(key, {
+                  model: selectedConfig.model,
+                  effort: selectedConfig.effort,
+                  until: Date.now() + this.config.quotaFallbackRetryMs,
+                })
               }
-              const fallbackDriver = new AgySession(cwd, this.ctx, fallbackConfig)
-              if (key !== undefined) this.sessions.set(key, fallbackDriver)
               activeDriver = fallbackDriver
-              return await fallbackDriver.ask(nextPrompt, options.signal)
+              // The fallback process starts without history, so it receives the
+              // conversation so far; a mid-turn follow-up is appended to it.
+              const transcript = recentTranscript(options.messages, cwd, this.ctx)
+              return await fallbackDriver.ask(
+                nextPrompt === prompt ? transcript : `${transcript}\n\n${nextPrompt}`,
+                options.signal,
+              )
             }
             throw error
           }
@@ -308,6 +388,10 @@ export function apply(ctx: Context, config: Config): void {
     ...config.effort === undefined ? {} : { effort: config.effort },
     maxCodexDelegationsPerTurn: config.maxCodexDelegationsPerTurn ?? 3,
     env: config.env ?? {},
+    quotaFallbackRetryMs: config.quotaFallbackRetryMs ?? 900_000,
+  }
+  if (!Number.isFinite(resolved.quotaFallbackRetryMs) || resolved.quotaFallbackRetryMs < 0) {
+    throw new Error('llm-antigravity-cli: quotaFallbackRetryMs deve ser um número não negativo')
   }
   if (!Number.isSafeInteger(resolved.timeoutMs) || resolved.timeoutMs < 1) {
     throw new Error('llm-antigravity-cli: timeoutMs deve ser um inteiro positivo')

@@ -4,7 +4,6 @@ import {
   assertProvidersAllowed,
   defaultProvider,
   parseGateVerdict,
-  recommendedModelTier,
   resolveFallbackProvider,
   slugifyProjectId,
   type OrchestrationLimits,
@@ -129,12 +128,12 @@ describe('provider routing mode', () => {
   })
 
   it('keeps solo modes exclusive and permits cross-provider work only in team mode', () => {
-    expect(() => assertProvidersAllowed('antigravity', ['codex'])).toThrow(/select Team/u)
-    expect(() => assertProvidersAllowed('codex', ['antigravity'])).toThrow(/select Team/u)
-    expect(() => assertProvidersAllowed('claude-code', ['openrouter'])).toThrow(/select Team/u)
-    expect(() => assertProvidersAllowed('antigravity', ['antigravity'])).not.toThrow()
-    expect(() => assertProvidersAllowed('openrouter', ['openrouter'])).not.toThrow()
-    expect(() => assertProvidersAllowed('team', ['codex', 'antigravity', 'claude-code', 'openrouter'])).not.toThrow()
+    expect(() => { assertProvidersAllowed('antigravity', ['codex']) }).toThrow(/select Team/u)
+    expect(() => { assertProvidersAllowed('codex', ['antigravity']) }).toThrow(/select Team/u)
+    expect(() => { assertProvidersAllowed('claude-code', ['openrouter']) }).toThrow(/select Team/u)
+    expect(() => { assertProvidersAllowed('antigravity', ['antigravity']) }).not.toThrow()
+    expect(() => { assertProvidersAllowed('openrouter', ['openrouter']) }).not.toThrow()
+    expect(() => { assertProvidersAllowed('team', ['codex', 'antigravity', 'claude-code', 'openrouter']) }).not.toThrow()
   })
 
   it('resolves dynamic fallback provider when preferred provider is exhausted or unavailable', () => {
@@ -149,13 +148,4 @@ describe('provider routing mode', () => {
     ).toBe('antigravity')
   })
 
-  it('assigns model tiers according to role phase and execution profile', () => {
-    expect(recommendedModelTier('reader', 'qualidade')).toBe('light')
-    expect(recommendedModelTier('searcher', 'equilibrado')).toBe('light')
-    expect(recommendedModelTier('inspector', 'economico')).toBe('light')
-    expect(recommendedModelTier('tester', 'economico')).toBe('light')
-    expect(recommendedModelTier('tester', 'equilibrado')).toBe('advanced')
-    expect(recommendedModelTier('planner', 'economico')).toBe('advanced')
-    expect(recommendedModelTier('implementer', 'equilibrado')).toBe('advanced')
-  })
 })

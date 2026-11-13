@@ -483,6 +483,7 @@ describe('task admission and package contracts', () => {
     const safeFiber = await ctx.plugin(codex, {
       providerName: 'codex-safe',
       model: 'codex-safe-model',
+      effort: 'low',
       env: { DSH_CODEX_INSTANCE: 'safe' },
       permissionMode: 'never',
       disposeGraceMs: 11,
@@ -528,6 +529,8 @@ describe('task admission and package contracts', () => {
 
     const safeTurn = await safeChild.peer.nextMethod('turn/start')
     const bypassTurn = await bypassChild.peer.nextMethod('turn/start')
+    expect(safeTurn.params).toMatchObject({ effort: 'low' })
+    expect(bypassTurn.params).not.toHaveProperty('effort')
     safeChild.peer.respond(safeTurn, { turn: { id: 'turn-safe' } })
     bypassChild.peer.send(
       { id: bypassTurn.id, result: { turn: { id: 'turn-bypass' } } },
@@ -589,6 +592,8 @@ describe('task admission and package contracts', () => {
     expect(() => codex.Config({ providerName: '' })).toThrow()
     expect(codex.Config({ model: 'gpt-codex' }).model).toBe('gpt-codex')
     expect(() => codex.Config({ model: '' })).toThrow()
+    expect(codex.Config({ effort: 'high' }).effort).toBe('high')
+    expect(() => codex.Config({ effort: '' })).toThrow()
     expect(codex.Config({}).permissionMode).toBe(DEFAULT_CODEX_PERMISSION_MODE)
     for (const permissionMode of CODEX_PERMISSION_MODES) {
       expect(codex.Config({ permissionMode }).permissionMode).toBe(permissionMode)
@@ -632,6 +637,7 @@ describe('task admission and package contracts', () => {
 
   it.each([
     ['never', { approvalPolicy: 'never' }],
+    ['read-only', { approvalPolicy: 'never', sandbox: 'read-only' }],
     ['approve-for-me', {
       approvalPolicy: 'on-request',
       approvalsReviewer: 'auto_review',

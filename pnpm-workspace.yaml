@@ -18,6 +18,9 @@ overrides:
   'extract-zip>yauzl': '3.4.0'
   '@deepseek-ai/cosmokit': 'link:vendor/cosmokit'
   '@deepseek-ai/schemastery': 'link:vendor/schemastery'
+  # The Python runtime deploy resolves these at build time; newer releases are absent from the lock.
+  '@swc/helpers': '0.5.23'
+  '@swc/helpers>tslib': '2.8.1'
 
 peerDependencyRules:
   allowedVersions:

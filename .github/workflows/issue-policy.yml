@@ -14,6 +14,9 @@ permissions:
 jobs:
   policy:
     name: Issue policy
+    # The policy reads the issues, pull requests, and Project of the upstream
+    # repository. There it runs for every pull request; elsewhere it has nothing to read.
+    if: github.repository == 'deepseek-harness/deepseek-harness'
     runs-on: ubuntu-latest
     steps:
       - name: Check out trusted policy
