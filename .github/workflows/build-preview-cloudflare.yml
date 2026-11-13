@@ -34,6 +34,8 @@ jobs:
   preview:
     runs-on: ubuntu-24.04
     name: cloudflare pages preview
+    # The Cloudflare Pages project and its credentials belong to the upstream repository.
+    if: github.repository == 'deepseek-harness/deepseek-harness'
     steps:
       - uses: actions/checkout@v7.0.1
         with:
