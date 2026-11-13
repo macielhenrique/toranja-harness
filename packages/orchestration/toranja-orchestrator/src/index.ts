@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -65,6 +65,7 @@ import type {
   ToranjaSettingsRequest,
   ToranjaConnectRequest,
   ToranjaConnectResult,
+  ToranjaLeftoverWorktree,
   ToranjaLegacyModeRequest,
   ToranjaExecutionProfile,
   ToranjaOrchestrationStatus,
@@ -480,12 +481,17 @@ interface RoutedRequest {
 }
 
 /** Git worktree and branch created for one implementer. */
+/** Age past which a worktree no run of this process created counts as left behind. */
+const LEFTOVER_AGE_MS = 24 * 60 * 60 * 1000
+/** Worktree names this plugin creates: creation time and a sequence number, both in base 36. */
+const LANE_NAME = /^([a-z0-9]+)-[a-z0-9]+$/u
+
 interface IsolatedLane {
   readonly project: ResolvedProject
   readonly path: string
   readonly branch: string
-  /** Commit the worktree started from. */
-  readonly base: string
+  /** Commit the worktree started from; unknown for one found at start. */
+  readonly base: string | undefined
   /** Git directory of the worktree, read before any agent ran in it. */
   readonly gitDir: string
 }
@@ -1027,10 +1033,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * with a commit or Git refuses, and the implementer then runs in the
    * project's own tree under the one-implementer-at-a-time rule.
    */
+  const laneRoot = (project: ResolvedProject): string =>
+    join(worktreeRoot ?? join(dirname(project.path), '.toranja-worktrees'), project.id)
   const isolate = async (project: ResolvedProject): Promise<IsolatedLane | undefined> => {
     if (!implementerWorktrees) return undefined
     const name = `${Date.now().toString(36)}-${(++laneSequence).toString(36)}`
-    const path = join(worktreeRoot ?? join(dirname(project.path), '.toranja-worktrees'), project.id, name)
+    const path = join(laneRoot(project), name)
     const branch = `toranja/${name}`
     try {
       const head = await gitOutput(project.path, ['rev-parse', 'HEAD'])
@@ -1085,7 +1093,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // A file Git was told to skip is invisible to the status above, so it may hold work.
       if (flags.toString('utf8').split('\0').some(entry => /^[a-zS] /u.test(entry))) return false
       if (changes.length > 0 || index.toString('utf8').split('\0').some(entry => entry.startsWith('160000 '))) return false
-      if (head.toString('utf8').trim() !== lane.base || tip.toString('utf8').trim() !== lane.base) return false
+      const commit = tip.toString('utf8').trim()
+      if (head.toString('utf8').trim() !== commit) return false
+      if (lane.base === undefined) {
+        // Where the branch started is not known for a worktree found at start,
+        // so its commit must be held by a branch or tag outside Toranja's own.
+        const holders = await gitOutput(lane.project.path, [
+          'for-each-ref', '--format=%(refname)', `--contains=${commit}`, 'refs/heads', 'refs/remotes', 'refs/tags',
+        ])
+        if (holders === undefined) return false
+        if (!holders.toString('utf8').split('\n').some(ref => ref.length > 0 && !ref.startsWith('refs/heads/toranja/'))) return false
+      } else if (commit !== lane.base) {
+        return false
+      }
       if (await gitOutput(lane.project.path, ['worktree', 'remove', '--force', lane.path]) === undefined) return false
       await gitOutput(lane.project.path, ['branch', '-D', lane.branch])
       return true
@@ -1093,6 +1113,55 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ctx.logger.warn(`toranja-orchestrator: worktree ${lane.path} could not be inspected: ${String(error)}`)
       return false
     }
+  }
+
+  /** Canonical form of a path for comparison, or undefined when nothing is there. */
+  const canonical = async (path: string): Promise<string | undefined> => await realpath(path).catch(() => undefined)
+  /**
+   * Find the implementer worktrees of one project an interrupted run left
+   * behind. An untouched one older than a day is removed with its branch; the
+   * others are returned. A younger one may belong to another running Toranja
+   * and is never removed. Only a worktree under this deployment's root, on a
+   * branch named as this plugin names them, is considered.
+   */
+  const sweepProject = async (project: ResolvedProject): Promise<ToranjaLeftoverWorktree[]> => {
+    const [listing, common] = await Promise.all([
+      gitOutput(project.path, ['worktree', 'list', '--porcelain', '-z']),
+      gitOutput(project.path, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
+    ])
+    if (listing === undefined || common === undefined) return []
+    const kept: ToranjaLeftoverWorktree[] = []
+    for (const record of listing.toString('utf8').split('\0\0')) {
+      const fields = record.split('\0')
+      const listed = fields.find(field => field.startsWith('worktree '))?.slice('worktree '.length)
+      const branch = fields.find(field => field.startsWith('branch refs/heads/toranja/'))?.slice('branch refs/heads/'.length)
+      const name = branch?.slice('toranja/'.length)
+      const stamp = name === undefined ? undefined : LANE_NAME.exec(name)?.[1]
+      if (listed === undefined || branch === undefined || name === undefined || stamp === undefined) continue
+      const path = join(laneRoot(project), name)
+      const real = await canonical(path)
+      if (real === undefined || real !== await canonical(listed)) continue
+      const leftover = { project: project.id, worktree: path, branch }
+      // The Git directory is taken from the repository, never from the `.git`
+      // entry inside the worktree, and must name this worktree back.
+      const gitDir = join(common.toString('utf8').trim(), 'worktrees', name)
+      const back = await readFile(join(gitDir, 'gitdir'), 'utf8').then(text => canonical(dirname(text.trim())), () => undefined)
+      const old = Date.now() - Number.parseInt(stamp, 36) > LEFTOVER_AGE_MS
+      if (back !== real || !old || !await releaseLane({ project, path, branch, base: undefined, gitDir })) kept.push(leftover)
+    }
+    return kept
+  }
+  let leftoverWorktrees: readonly ToranjaLeftoverWorktree[] | undefined = implementerWorktrees ? undefined : []
+  if (implementerWorktrees) {
+    void Promise.all(configuredProjects.map(async project => await sweepProject(project).catch((error: unknown) => {
+      ctx.logger.warn(`toranja-orchestrator: leftover worktrees of project ${project.id} could not be listed: ${String(error)}`)
+      return []
+    }))).then((found) => {
+      leftoverWorktrees = found.flat()
+      for (const left of leftoverWorktrees) {
+        ctx.logger.info(`toranja-orchestrator: kept worktree ${left.worktree} (${left.branch}) of project ${left.project} from an earlier run`)
+      }
+    })
   }
 
   /**
@@ -1368,6 +1437,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       })),
       routes: ROLES.map(role => routeFor(role, providerFor(role))),
       tasks: ledger.tasks(),
+      ...leftoverWorktrees === undefined ? {} : { leftoverWorktrees },
     }
   }
   const validateAssignment = (request: {

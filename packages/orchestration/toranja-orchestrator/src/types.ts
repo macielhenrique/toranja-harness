@@ -206,4 +206,17 @@ export interface ToranjaOrchestrationStatus {
   readonly routes: readonly ToranjaRoleRoute[]
   /** Newest first; bounded in memory by the orchestration ledger. */
   readonly tasks: readonly ToranjaTaskStatus[]
+  /**
+   * Implementer worktrees an earlier run left behind that were kept when this
+   * one started, because they hold work or are too recent to judge. Absent
+   * until the search at start has finished.
+   */
+  readonly leftoverWorktrees?: readonly ToranjaLeftoverWorktree[]
+}
+
+/** An implementer worktree left by an earlier run, waiting for review, merge, or removal by hand. */
+export interface ToranjaLeftoverWorktree {
+  readonly project: string
+  readonly worktree: string
+  readonly branch: string
 }

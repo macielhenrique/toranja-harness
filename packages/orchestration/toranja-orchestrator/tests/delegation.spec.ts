@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
 import Storage from '@deepseek-ai/dsh-storage'
@@ -1389,6 +1389,87 @@ describe('Toranja routed delegation', () => {
       const [run] = result.activations as { taskId: string; worktree: string }[]
       await settled(harness)
       expect(existsSync(join(run?.worktree ?? '', 'new-file.txt'))).toBe(true)
+    })
+
+    describe('left by an earlier run', () => {
+      const DAY = 24 * 60 * 60 * 1000
+      /** A repository with implementer worktrees an interrupted run left behind, then the orchestrator started over it. */
+      const restarted = async (
+        ages: readonly number[],
+        dirty: (worktree: string, index: number) => void = () => {},
+        config: orchestrator.Config = { implementerWorktrees: true },
+      ) => {
+        const repo = gitRepo()
+        const worktreeRoot = mkdtempSync(join(tmpdir(), 'toranja-worktrees-'))
+        repos.push(worktreeRoot)
+        const left = ages.map((age, index) => {
+          const name = `${(Date.now() - age).toString(36)}-${(index + 1).toString(36)}`
+          const path = join(worktreeRoot, 'demo', name)
+          execFileSync('git', ['worktree', 'add', '-q', '-b', `toranja/${name}`, path, 'HEAD'], { cwd: repo, stdio: 'ignore' })
+          dirty(path, index)
+          return { project: 'demo', worktree: path, branch: `toranja/${name}` }
+        })
+        const harness = await mount(Object.assign({ routing: ROUTING, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] }, config))
+        const toranjaBranches = (): string[] =>
+          execFileSync('git', ['branch', '--list', 'toranja/*', '--format=%(refname:short)'], { cwd: repo })
+            .toString().split('\n').filter(Boolean)
+        return { harness, repo, left, toranjaBranches }
+      }
+      const swept = async (harness: Harness): Promise<ToranjaOrchestrationStatus['leftoverWorktrees']> => {
+        await expect.poll(() => harness.status().leftoverWorktrees).toBeDefined()
+        return harness.status().leftoverWorktrees
+      }
+
+      it('removes an untouched worktree and its branch when the orchestrator starts', async () => {
+        const { harness, left, toranjaBranches } = await restarted([2 * DAY])
+        expect(await swept(harness)).toEqual([])
+        expect(existsSync(left[0]?.worktree ?? '')).toBe(false)
+        expect(toranjaBranches()).toEqual([])
+      })
+
+      it('keeps and reports a worktree that holds uncommitted work', async () => {
+        const { harness, left } = await restarted([2 * DAY], (worktree) => {
+          writeFileSync(join(worktree, 'tracked.txt'), 'half done\n')
+        })
+        expect(await swept(harness)).toEqual(left)
+        expect(readFileSync(join(left[0]?.worktree ?? '', 'tracked.txt'), 'utf8')).toBe('half done\n')
+      })
+
+      it('keeps and reports a worktree whose branch holds a commit no other branch has', async () => {
+        const { harness, left, toranjaBranches } = await restarted([2 * DAY], (worktree) => {
+          writeFileSync(join(worktree, 'tracked.txt'), 'committed\n')
+          execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', 'commit', '-q', '-am', 'work'], { cwd: worktree, stdio: 'ignore' })
+        })
+        expect(await swept(harness)).toEqual(left)
+        expect(toranjaBranches()).toEqual([left[0]?.branch])
+      })
+
+      it('leaves alone a worktree younger than a day, which another running Toranja may be using', async () => {
+        const { harness, left } = await restarted([2 * DAY, 60_000])
+        expect(await swept(harness)).toEqual([left[1]])
+        expect(existsSync(left[0]?.worktree ?? '')).toBe(false)
+        expect(existsSync(left[1]?.worktree ?? '')).toBe(true)
+      })
+
+      it('touches only worktrees under its own root', async () => {
+        const { harness, repo, toranjaBranches } = await restarted([])
+        expect(await swept(harness)).toEqual([])
+        const elsewhere = mkdtempSync(join(tmpdir(), 'toranja-elsewhere-'))
+        repos.push(elsewhere)
+        const name = `${(Date.now() - 2 * DAY).toString(36)}-1`
+        execFileSync('git', ['worktree', 'add', '-q', '-b', `toranja/${name}`, join(elsewhere, name), 'HEAD'], { cwd: repo, stdio: 'ignore' })
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot: dirname(elsewhere) + '-none', projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        expect(await swept(again)).toEqual([])
+        expect(existsSync(join(elsewhere, name))).toBe(true)
+        expect(toranjaBranches()).toEqual([`toranja/${name}`])
+      })
+
+      it('does not look for leftovers while isolation is off', async () => {
+        const { harness, left } = await restarted([2 * DAY], () => {}, { implementerWorktrees: false })
+        expect(await swept(harness)).toEqual([])
+        expect(existsSync(left[0]?.worktree ?? '')).toBe(true)
+        expect(harness.gitRuns.some(args => args.includes('worktree'))).toBe(false)
+      })
     })
 
     it('rejects a worktree root that is not an absolute path', async () => {

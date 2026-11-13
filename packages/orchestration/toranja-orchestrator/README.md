@@ -143,7 +143,14 @@ project) instead of the project's working tree:
   keeps both fields in the status; one the implementer left untouched is
   removed with its branch once the implementer settles. When the plugin stops
   while an implementer is running, its worktree is left in place, never removed
-  under it; such a leftover is removed by hand with `git worktree remove`.
+  under it.
+- When the plugin starts with isolation on, it looks in each project for
+  worktrees an earlier run left under the worktree root on a `toranja/*`
+  branch. One older than a day that holds no work is removed with its branch:
+  no changes, and a commit some branch or tag outside `toranja/*` also holds.
+  Every other one is kept and listed in the status as `leftoverWorktrees`,
+  for review, merge, or `git worktree remove` by hand. A worktree younger than
+  a day is never removed, since another running Toranja may be using it.
 - The checkout runs with the repository's content filters off, so a Git LFS
   file is its pointer in the worktree. The worktree is later inspected through
   the Git directory recorded when it was created, not through the `.git` entry
