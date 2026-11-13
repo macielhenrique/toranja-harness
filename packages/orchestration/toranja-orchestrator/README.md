@@ -123,7 +123,7 @@ The check detects a change and does not revert it. Its limits:
 - A directory that is not a Git work tree with a commit cannot be checked. A delegated task then runs unchecked; the delivery gate, which is strict, reports that access could not be verified and does not pass.
 - The repository belongs to the agents being checked, so the check runs nothing its Git configuration names: Git is resolved once from `PATH`, the file-system monitor is off, hooks are looked up in an empty directory the Host owns, external diff and textconv drivers are off, submodules are not entered, and every content filter (`filter.*.clean`, `smudge`, `process`) defined in any configuration scope is switched off for the check's commands. `required` is switched off with it, so a Git LFS repository is still read; its files are then compared as stored, the same way before and after the run. A filter whose name contains `=` cannot be switched off from the command line, so such a tree counts as unreadable.
 - A file Git was told to skip (`assume-unchanged` or `skip-worktree`) is invisible to `git diff`. The check compares those index flags, the content of each regular file under them, and the set of configured filters, and reports `changed Git state that hides file changes` when a non-writing role altered any of them.
-- Untracked files are compared by content, up to 5 MB each and 64 MB in one reading, in path order. Ignored files and directories, and larger untracked files, are compared by path, size, and modification time: there a same-size rewrite that restores the modification time is not seen, and a change deep inside an ignored directory is not either.
+- Untracked files are compared by content, up to 5 MB each and 64 MB in one reading, in path order. Ignored files and directories, and untracked files past either limit, are compared by path, size, modification time, and change time. The change time moves on every write and is not restored with the modification time, so a same-size rewrite is seen wherever the file system records it; a change deep inside an ignored directory is not seen.
 - A reading that fails is tried once more before the check counts as unreadable, since Git can refuse for a moment while another command changes the repository.
 
 ## Implementer worktrees
@@ -144,13 +144,20 @@ project) instead of the project's working tree:
   removed with its branch once the implementer settles. When the plugin stops
   while an implementer is running, its worktree is left in place, never removed
   under it.
+- A worktree is locked (`git worktree lock`) while its implementer runs, with
+  a reason naming the machine and process that own it. It is unlocked when the
+  implementer settles.
 - When the plugin starts with isolation on, it looks in each project for
   worktrees an earlier run left under the worktree root on a `toranja/*`
-  branch. One older than a day that holds no work is removed with its branch:
-  no changes, and a commit some branch or tag outside `toranja/*` also holds.
-  Every other one is kept and listed in the status as `leftoverWorktrees`,
-  for review, merge, or `git worktree remove` by hand. A worktree younger than
-  a day is never removed, since another running Toranja may be using it.
+  branch. One whose lock names a process still running on this machine is in
+  use and is left alone. One whose owning process is gone and that holds no
+  work is removed with its branch: no changes, and a commit some branch or tag
+  outside `toranja/*` also holds. Every other one is kept, unlocked, and listed
+  in the status as `leftoverWorktrees`, for review, merge, or
+  `git worktree remove` by hand: it holds work, it carries no lock from this
+  machine, or it or its Git directory is reached through a link.
+- A process id can be reused: a leftover whose old owner's id now belongs to
+  another process counts as in use until that process ends.
 - The checkout runs with the repository's content filters off, so a Git LFS
   file is its pointer in the worktree. The worktree is later inspected through
   the Git directory recorded when it was created, not through the `.git` entry

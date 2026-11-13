@@ -1,6 +1,6 @@
-import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { hostname, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
@@ -1159,6 +1159,20 @@ describe('Toranja routed delegation', () => {
     expect(tasks[0]).toMatchObject({ state: 'failed', error: 'execute role changed Git state that hides file changes' })
   })
 
+  it('catches a file Git ignores rewritten at the same size with its time put back', async () => {
+    const harness = await mount({ routing: ROUTING })
+    const secrets = join(harness.repo, '.env')
+    writeFileSync(secrets, 'KEY=one\n')
+    harness.agentSideEffect = () => {
+      const { atime, mtime } = statSync(secrets)
+      writeFileSync(secrets, 'KEY=two\n')
+      utimesSync(secrets, atime, mtime)
+    }
+    await delegate(harness, { role: 'reader', provider: 'codex' })
+    const tasks = await settled(harness)
+    expect(tasks[0]).toMatchObject({ state: 'failed', error: 'read-only role created, removed, or changed untracked files' })
+  })
+
   it('catches an untracked file rewritten at the same size with its time put back', async () => {
     const harness = await mount({ routing: ROUTING })
     const notes = join(harness.repo, 'notes.txt')
@@ -1392,20 +1406,27 @@ describe('Toranja routed delegation', () => {
     })
 
     describe('left by an earlier run', () => {
-      const DAY = 24 * 60 * 60 * 1000
-      /** A repository with implementer worktrees an interrupted run left behind, then the orchestrator started over it. */
+      /** Process id of a process that has already exited. */
+      const deadPid = (): number => spawnSync(process.execPath, ['-e', '']).pid
+      const ownedBy = (pid: number): string => `toranja-orchestrator host=${hostname()} pid=${pid}`
+      /**
+       * A repository with implementer worktrees an earlier run left behind,
+       * then the orchestrator started over it. Each owner is the process id in
+       * the worktree's lock, or undefined for a worktree left unlocked.
+       */
       const restarted = async (
-        ages: readonly number[],
+        owners: readonly (number | undefined)[],
         dirty: (worktree: string, index: number) => void = () => {},
         config: orchestrator.Config = { implementerWorktrees: true },
       ) => {
         const repo = gitRepo()
         const worktreeRoot = mkdtempSync(join(tmpdir(), 'toranja-worktrees-'))
         repos.push(worktreeRoot)
-        const left = ages.map((age, index) => {
-          const name = `${(Date.now() - age).toString(36)}-${(index + 1).toString(36)}`
+        const left = owners.map((owner, index) => {
+          const name = `${Date.now().toString(36)}-${(index + 1).toString(36)}`
           const path = join(worktreeRoot, 'demo', name)
-          execFileSync('git', ['worktree', 'add', '-q', '-b', `toranja/${name}`, path, 'HEAD'], { cwd: repo, stdio: 'ignore' })
+          const lock = owner === undefined ? [] : ['--lock', '--reason', ownedBy(owner)]
+          execFileSync('git', ['worktree', 'add', '-q', ...lock, '-b', `toranja/${name}`, path, 'HEAD'], { cwd: repo, stdio: 'ignore' })
           dirty(path, index)
           return { project: 'demo', worktree: path, branch: `toranja/${name}` }
         })
@@ -1413,22 +1434,22 @@ describe('Toranja routed delegation', () => {
         const toranjaBranches = (): string[] =>
           execFileSync('git', ['branch', '--list', 'toranja/*', '--format=%(refname:short)'], { cwd: repo })
             .toString().split('\n').filter(Boolean)
-        return { harness, repo, left, toranjaBranches }
+        return { harness, repo, worktreeRoot, left, toranjaBranches }
       }
       const swept = async (harness: Harness): Promise<ToranjaOrchestrationStatus['leftoverWorktrees']> => {
         await expect.poll(() => harness.status().leftoverWorktrees).toBeDefined()
         return harness.status().leftoverWorktrees
       }
 
-      it('removes an untouched worktree and its branch when the orchestrator starts', async () => {
-        const { harness, left, toranjaBranches } = await restarted([2 * DAY])
+      it('removes an untouched worktree and its branch when the run that owned it is gone', async () => {
+        const { harness, left, toranjaBranches } = await restarted([deadPid()])
         expect(await swept(harness)).toEqual([])
         expect(existsSync(left[0]?.worktree ?? '')).toBe(false)
         expect(toranjaBranches()).toEqual([])
       })
 
       it('keeps and reports a worktree that holds uncommitted work', async () => {
-        const { harness, left } = await restarted([2 * DAY], (worktree) => {
+        const { harness, left } = await restarted([deadPid()], (worktree) => {
           writeFileSync(join(worktree, 'tracked.txt'), 'half done\n')
         })
         expect(await swept(harness)).toEqual(left)
@@ -1436,7 +1457,7 @@ describe('Toranja routed delegation', () => {
       })
 
       it('keeps and reports a worktree whose branch holds a commit no other branch has', async () => {
-        const { harness, left, toranjaBranches } = await restarted([2 * DAY], (worktree) => {
+        const { harness, left, toranjaBranches } = await restarted([deadPid()], (worktree) => {
           writeFileSync(join(worktree, 'tracked.txt'), 'committed\n')
           execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', 'commit', '-q', '-am', 'work'], { cwd: worktree, stdio: 'ignore' })
         })
@@ -1444,11 +1465,50 @@ describe('Toranja routed delegation', () => {
         expect(toranjaBranches()).toEqual([left[0]?.branch])
       })
 
-      it('leaves alone a worktree younger than a day, which another running Toranja may be using', async () => {
-        const { harness, left } = await restarted([2 * DAY, 60_000])
-        expect(await swept(harness)).toEqual([left[1]])
-        expect(existsSync(left[0]?.worktree ?? '')).toBe(false)
-        expect(existsSync(left[1]?.worktree ?? '')).toBe(true)
+      it('leaves alone a worktree whose owner is still running', async () => {
+        const { harness, left, toranjaBranches } = await restarted([process.pid])
+        // In use by a running Toranja, so neither removed nor reported as left behind.
+        expect(await swept(harness)).toEqual([])
+        expect(existsSync(left[0]?.worktree ?? '')).toBe(true)
+        expect(toranjaBranches()).toEqual([left[0]?.branch])
+      })
+
+      it('keeps and reports an untouched worktree no run is known to own', async () => {
+        const { harness, left } = await restarted([undefined])
+        expect(await swept(harness)).toEqual(left)
+        expect(existsSync(left[0]?.worktree ?? '')).toBe(true)
+      })
+
+      it('locks the worktree of a running implementer under this process, and unlocks one it keeps', async () => {
+        const { harness } = await isolated()
+        const locks = (): string[] => execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: harness.repo })
+          .toString().split('\n').filter(line => line.startsWith('locked'))
+        const release = Promise.withResolvers<undefined>()
+        harness.hold = release.promise
+        harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), 'written by the implementer\n') }
+        await delegate(harness, { role: 'implementer', provider: 'codex' })
+        expect(locks()).toEqual([`locked ${ownedBy(process.pid)}`])
+        release.resolve(undefined)
+        await settled(harness)
+        await expect.poll(locks).toEqual([])
+      })
+
+      it('does not follow a link put in place of the worktree', async () => {
+        const { harness, worktreeRoot, left } = await restarted([])
+        expect(await swept(harness)).toEqual([])
+        const repo = gitRepo()
+        const name = `${Date.now().toString(36)}-1`
+        const path = join(worktreeRoot, 'demo', name)
+        execFileSync('git', ['worktree', 'add', '-q', '--lock', '--reason', ownedBy(deadPid()), '-b', `toranja/${name}`, path, 'HEAD'], { cwd: repo, stdio: 'ignore' })
+        // The implementer moved its worktree away and left a link to it.
+        const moved = join(mkdtempSync(join(tmpdir(), 'toranja-moved-')), 'tree')
+        repos.push(dirname(moved))
+        renameSync(path, moved)
+        symlinkSync(moved, path, 'junction')
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        expect(await swept(again)).toEqual([{ project: 'demo', worktree: path, branch: `toranja/${name}` }])
+        expect(existsSync(join(moved, 'tracked.txt'))).toBe(true)
+        expect(left).toEqual([])
       })
 
       it('touches only worktrees under its own root', async () => {
@@ -1456,8 +1516,8 @@ describe('Toranja routed delegation', () => {
         expect(await swept(harness)).toEqual([])
         const elsewhere = mkdtempSync(join(tmpdir(), 'toranja-elsewhere-'))
         repos.push(elsewhere)
-        const name = `${(Date.now() - 2 * DAY).toString(36)}-1`
-        execFileSync('git', ['worktree', 'add', '-q', '-b', `toranja/${name}`, join(elsewhere, name), 'HEAD'], { cwd: repo, stdio: 'ignore' })
+        const name = `${Date.now().toString(36)}-1`
+        execFileSync('git', ['worktree', 'add', '-q', '--lock', '--reason', ownedBy(deadPid()), '-b', `toranja/${name}`, join(elsewhere, name), 'HEAD'], { cwd: repo, stdio: 'ignore' })
         const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot: dirname(elsewhere) + '-none', projects: [{ id: 'demo', title: 'Demo', path: repo }] })
         expect(await swept(again)).toEqual([])
         expect(existsSync(join(elsewhere, name))).toBe(true)
@@ -1465,7 +1525,7 @@ describe('Toranja routed delegation', () => {
       })
 
       it('does not look for leftovers while isolation is off', async () => {
-        const { harness, left } = await restarted([2 * DAY], () => {}, { implementerWorktrees: false })
+        const { harness, left } = await restarted([deadPid()], () => {}, { implementerWorktrees: false })
         expect(await swept(harness)).toEqual([])
         expect(existsSync(left[0]?.worktree ?? '')).toBe(true)
         expect(harness.gitRuns.some(args => args.includes('worktree'))).toBe(false)

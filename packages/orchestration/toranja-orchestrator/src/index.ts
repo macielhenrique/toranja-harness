@@ -6,7 +6,7 @@
 
 import { createHash } from 'node:crypto'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { hostname, tmpdir } from 'node:os'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -481,10 +481,10 @@ interface RoutedRequest {
 }
 
 /** Git worktree and branch created for one implementer. */
-/** Age past which a worktree no run of this process created counts as left behind. */
-const LEFTOVER_AGE_MS = 24 * 60 * 60 * 1000
 /** Worktree names this plugin creates: creation time and a sequence number, both in base 36. */
-const LANE_NAME = /^([a-z0-9]+)-[a-z0-9]+$/u
+const LANE_NAME = /^[a-z0-9]+-[a-z0-9]+$/u
+/** Lock reason of a worktree whose implementer is running: the machine and process that own it. */
+const LANE_OWNER = /^toranja-orchestrator host=(\S+) pid=(\d+)$/u
 
 interface IsolatedLane {
   readonly project: ResolvedProject
@@ -838,7 +838,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         const facts = await stat(join(cwd, path)).then(
           async (entry) => {
             if (!byContent || !entry.isFile() || entry.size > UNTRACKED_CONTENT_LIMIT || entry.size > budget) {
-              return `${entry.size}:${entry.mtimeMs}`
+              // The change time moves on every write and cannot be put back as the modification time can.
+              return `${entry.size}:${entry.mtimeMs}:${entry.ctimeMs}`
             }
             budget -= entry.size
             return createHash('sha256').update(await readFile(join(cwd, path))).digest('hex')
@@ -1045,11 +1046,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // The checkout would run the repository's smudge filters on the Host.
       const filters = await filtersOff(project.path)
       if (head === undefined || filters === undefined) return undefined
-      const added = await gitOutput(project.path, ['worktree', 'add', '-q', '-b', branch, path, 'HEAD'], filters.overrides)
+      // The lock names this process, so a later start can tell a worktree in use from one left behind.
+      const owner = `toranja-orchestrator host=${hostname()} pid=${process.pid}`
+      const added = await gitOutput(
+        project.path,
+        ['worktree', 'add', '-q', '--lock', '--reason', owner, '-b', branch, path, 'HEAD'],
+        filters.overrides,
+      )
       const gitDir = added === undefined ? undefined : await gitOutput(path, ['rev-parse', '--absolute-git-dir'])
       if (gitDir === undefined) {
         // A refused or half-made worktree must not stay registered.
-        await gitOutput(project.path, ['worktree', 'remove', '--force', path])
+        await gitOutput(project.path, ['worktree', 'remove', '--force', '--force', path])
         await gitOutput(project.path, ['branch', '-D', branch])
         return undefined
       }
@@ -1068,6 +1075,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * @returns Whether the worktree was removed.
    */
   const releaseLane = async (lane: IsolatedLane): Promise<boolean> => {
+    const removed = await removeUntouched(lane)
+    // A worktree that is kept is no longer in use, so the user can manage it with plain Git commands.
+    if (!removed) await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
+    return removed
+  }
+  const removeUntouched = async (lane: IsolatedLane): Promise<boolean> => {
     try {
       const scope = [`--git-dir=${lane.gitDir}`, `--work-tree=${lane.path}`]
       const filters = await filtersOff(lane.project.path, scope)
@@ -1106,8 +1119,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       } else if (commit !== lane.base) {
         return false
       }
-      if (await gitOutput(lane.project.path, ['worktree', 'remove', '--force', lane.path]) === undefined) return false
-      await gitOutput(lane.project.path, ['branch', '-D', lane.branch])
+      await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
+      // Without --force Git itself refuses a worktree that gained a change
+      // since the inspection above, and the branch is deleted only while it
+      // still points at the commit inspected.
+      if (await gitOutput(lane.project.path, ['worktree', 'remove', lane.path], filters.overrides) === undefined) return false
+      await gitOutput(lane.project.path, ['update-ref', '-d', `refs/heads/${lane.branch}`, commit])
       return true
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: worktree ${lane.path} could not be inspected: ${String(error)}`)
@@ -1117,12 +1134,23 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   /** Canonical form of a path for comparison, or undefined when nothing is there. */
   const canonical = async (path: string): Promise<string | undefined> => await realpath(path).catch(() => undefined)
+  /** Whether a process with this id exists on this machine. */
+  const running = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error: unknown) {
+      // The process exists but belongs to someone else.
+      return error instanceof Error && 'code' in error && error.code === 'EPERM'
+    }
+  }
   /**
-   * Find the implementer worktrees of one project an interrupted run left
-   * behind. An untouched one older than a day is removed with its branch; the
-   * others are returned. A younger one may belong to another running Toranja
-   * and is never removed. Only a worktree under this deployment's root, on a
-   * branch named as this plugin names them, is considered.
+   * Find the implementer worktrees of one project an earlier run left behind.
+   * Only a worktree under this deployment's root, on a branch named as this
+   * plugin names them, is considered. One whose lock names a process still
+   * running on this machine is in use and is skipped. One whose owner is gone
+   * is removed with its branch when it holds no work. Every other one is
+   * returned: it holds work, or no run on this machine is known to own it.
    */
   const sweepProject = async (project: ResolvedProject): Promise<ToranjaLeftoverWorktree[]> => {
     const [listing, common] = await Promise.all([
@@ -1130,24 +1158,33 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       gitOutput(project.path, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
     ])
     if (listing === undefined || common === undefined) return []
+    const [realRoot, realCommon] = await Promise.all([canonical(laneRoot(project)), canonical(common.toString('utf8').trim())])
+    if (realRoot === undefined || realCommon === undefined) return []
     const kept: ToranjaLeftoverWorktree[] = []
     for (const record of listing.toString('utf8').split('\0\0')) {
       const fields = record.split('\0')
       const listed = fields.find(field => field.startsWith('worktree '))?.slice('worktree '.length)
       const branch = fields.find(field => field.startsWith('branch refs/heads/toranja/'))?.slice('branch refs/heads/'.length)
       const name = branch?.slice('toranja/'.length)
-      const stamp = name === undefined ? undefined : LANE_NAME.exec(name)?.[1]
-      if (listed === undefined || branch === undefined || name === undefined || stamp === undefined) continue
+      if (listed === undefined || branch === undefined || name === undefined || !LANE_NAME.test(name)) continue
       const path = join(laneRoot(project), name)
       const real = await canonical(path)
+      // A worktree elsewhere is not this plugin's; one whose directory is gone is Git's to prune.
       if (real === undefined || real !== await canonical(listed)) continue
-      const leftover = { project: project.id, worktree: path, branch }
-      // The Git directory is taken from the repository, never from the `.git`
-      // entry inside the worktree, and must name this worktree back.
-      const gitDir = join(common.toString('utf8').trim(), 'worktrees', name)
+      const owner = LANE_OWNER.exec(fields.find(field => field.startsWith('locked '))?.slice('locked '.length) ?? '')
+      const local = owner?.[1] === hostname()
+      if (local && running(Number(owner[2]))) continue
+      // The implementer could write both the directory holding its worktree
+      // and the repository, so neither the worktree nor its Git directory may
+      // be reached through a link: each must be the plain directory at the
+      // place this plugin and Git put it, and the Git directory must name the
+      // worktree back.
+      const gitDir = join(realCommon, 'worktrees', name)
       const back = await readFile(join(gitDir, 'gitdir'), 'utf8').then(text => canonical(dirname(text.trim())), () => undefined)
-      const old = Date.now() - Number.parseInt(stamp, 36) > LEFTOVER_AGE_MS
-      if (back !== real || !old || !await releaseLane({ project, path, branch, base: undefined, gitDir })) kept.push(leftover)
+      const plain = real === join(realRoot, name) && await canonical(gitDir) === gitDir && back === real
+      if (!local || !plain || !await releaseLane({ project, path, branch, base: undefined, gitDir })) {
+        kept.push({ project: project.id, worktree: path, branch })
+      }
     }
     return kept
   }
