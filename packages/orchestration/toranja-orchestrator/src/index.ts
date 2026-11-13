@@ -1036,6 +1036,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    */
   const laneRoot = (project: ResolvedProject): string =>
     join(worktreeRoot ?? join(dirname(project.path), '.toranja-worktrees'), project.id)
+  /**
+   * Unlock and remove a worktree, without force: Git itself refuses one that
+   * holds a change. The place is looked at last, right before removal, since
+   * a link put there would send the removal to wherever it points.
+   * @returns Whether the worktree was removed.
+   */
+  const removeWorktree = async (project: ResolvedProject, path: string, overrides: readonly string[]): Promise<boolean> => {
+    const place = await lstat(path).catch(() => undefined)
+    if (place === undefined || !place.isDirectory() || place.isSymbolicLink()) return false
+    await gitOutput(project.path, ['worktree', 'unlock', path])
+    return await gitOutput(project.path, ['worktree', 'remove', path], overrides) !== undefined
+  }
   const isolate = async (project: ResolvedProject): Promise<IsolatedLane | undefined> => {
     if (!implementerWorktrees) return undefined
     // The process id keeps two Toranja processes from ever choosing the same name.
@@ -1060,11 +1072,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const gitDir = await gitOutput(path, ['rev-parse', '--absolute-git-dir'])
       if (gitDir === undefined) {
         // A worktree made here that cannot be used must not stay registered.
-        // No agent has run in it, and it is removed as any other: without
-        // force, and its branch only while it points at the starting commit.
-        await gitOutput(project.path, ['worktree', 'unlock', path])
-        await gitOutput(project.path, ['worktree', 'remove', path], filters.overrides)
-        await gitOutput(project.path, ['update-ref', '-d', `refs/heads/${branch}`, base])
+        // No agent has run in it, and it is removed as any other; its branch
+        // goes only with it, and only while it points at the starting commit.
+        if (await removeWorktree(project, path, filters.overrides)) {
+          await gitOutput(project.path, ['update-ref', '-d', `refs/heads/${branch}`, base])
+        }
         return undefined
       }
       return { project, path, branch, base, gitDir: gitDir.toString('utf8').trim() }
@@ -1126,15 +1138,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       } else if (commit !== lane.base) {
         return false
       }
-      // Looked at last, right before removal: a link put in place of the
-      // worktree would send the removal to wherever it points.
-      const place = await lstat(lane.path)
-      if (!place.isDirectory() || place.isSymbolicLink()) return false
-      await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
-      // Without --force Git itself refuses a worktree that gained a change
-      // since the inspection above, and the branch is deleted only while it
-      // still points at the commit inspected.
-      if (await gitOutput(lane.project.path, ['worktree', 'remove', lane.path], filters.overrides) === undefined) return false
+      // Git refuses a worktree that gained a change since the inspection
+      // above, and the branch is deleted only while it still points at the
+      // commit inspected.
+      if (!await removeWorktree(lane.project, lane.path, filters.overrides)) return false
       await gitOutput(lane.project.path, ['update-ref', '-d', `refs/heads/${lane.branch}`, commit])
       return true
     } catch (error: unknown) {
