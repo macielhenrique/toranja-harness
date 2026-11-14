@@ -1132,12 +1132,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // such a file, so its flag and its content are compared here.
       const hidden = index.toString('utf8').split('\0').filter(entry => /^[a-zS] /u.test(entry))
       const state = createHash('sha256').update(filters.names.join('\0')).update('\0\0')
-      for (const entry of hidden) {
-        // Only a regular file up to the size limit is read: a pipe put in its place would hold the Host.
-        const read = await readEntry(join(cwd, entry.slice(2)), UNTRACKED_CONTENT_LIMIT)
-        const content = read === undefined ? 'missing' : read.hash ?? `not-read:${read.entry.size}:${read.entry.mtimeMs}:${read.entry.ctimeMs}`
-        state.update(`${entry}\0${content}\0`)
-      }
+      const facts = await entryFacts(cwd, [[hidden.map(entry => entry.slice(2)), true]])
+      for (const [index, entry] of hidden.entries()) state.update(`${entry}\0${facts[index]?.[1] ?? ''}\0`)
       return {
         tracked: createHash('sha256').update(tracked).digest('hex'),
         untracked: await untrackedHash(cwd, untracked, ignored),
@@ -1219,23 +1215,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   /** Lane branches in use: their own write-scope check has not read them yet, so their own run answers for them. */
   const lanesInUse = new Set<string>()
   /**
-   * Lane branches no longer in use: the tip their own check read (`undefined`
-   * when the branch was gone), where the lane started, and when it ended on
-   * {@link laneClock}. Kept while a check that began before it is still running.
+   * Lane branches no longer in use: the tip their lane ended at (`undefined`
+   * when the branch was gone), whether the Host removed the branch, and when
+   * that was on {@link laneClock}. Kept while a check that began before it is still running.
    */
-  const laneTips = new Map<string, { readonly tip: string | undefined; readonly base: string | undefined; readonly ended: number }>()
+  const laneTips = new Map<string, { readonly tip: string | undefined; readonly removed: boolean; readonly ended: number }>()
   /** Write-scope checks not yet made or dropped, with when each began on {@link laneClock}. */
   const checksRunning = new Map<object, number>()
   let laneClock = 0
-  const endLane = (ref: string, tip: string | undefined, base: string | undefined): void => {
+  const endLane = (ref: string, tip: string | undefined, removed = false): void => {
     lanesInUse.delete(ref)
-    laneTips.set(ref, { tip, base, ended: ++laneClock })
+    laneTips.set(ref, { tip, removed, ended: ++laneClock })
   }
-  /** End a lane its own check never read, at the tip its branch has now. */
-  const endUnchecked = async (project: ResolvedProject, ref: string, base: string | undefined): Promise<void> => {
-    if (!lanesInUse.has(ref)) return
-    const tip = await gitOutput(project.path, ['rev-parse', '--verify', '-q', ref])
-    if (lanesInUse.has(ref)) endLane(ref, tip?.toString('utf8').trim(), base)
+  /**
+   * Read the tip a lane's branch has now and, when its own check never read
+   * it, end the lane there.
+   * @returns The tip, or undefined when the branch is gone or Git fails.
+   */
+  const endUnchecked = async (project: ResolvedProject, ref: string): Promise<string | undefined> => {
+    const tip = (await gitOutput(project.path, ['rev-parse', '--verify', '-q', ref]))?.toString('utf8').trim()
+    if (lanesInUse.has(ref)) endLane(ref, tip)
+    return tip
   }
   /** Forget a check that was made or will never be, and every ended lane no running check began before. */
   const endCheck = (check: object): void => {
@@ -1246,15 +1246,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   /**
    * Whether a check that began at `since` blames its run for a changed ref
    * whose final value is `now`. A lane in use answers for its own
-   * branch; one that ended during the check, only up to the tip its own
-   * check read, or for its removal when that tip is where it started, as the
-   * Host then deletes it; one that ended before, never.
+   * branch; one that ended during the check, only up to the tip it ended at,
+   * or for its removal when the Host removed it; one that ended before, never.
    */
   const laneBlames = (ref: string, now: string | undefined, since: number): boolean => {
     if (lanesInUse.has(ref)) return false
     const lane = laneTips.get(ref)
     if (lane === undefined || lane.ended <= since) return true
-    return now !== lane.tip && !(now === undefined && lane.tip === lane.base)
+    return now !== lane.tip && !(now === undefined && lane.removed)
   }
   /**
    * Read what a write-scope check compares, with the same precautions as the
@@ -1390,7 +1389,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (lane !== undefined) {
         // From here another run that moves this lane's branch answers for it.
         const own = `refs/heads/${lane.branch}`
-        endLane(own, after.refs.get(own), lane.base)
+        const tip = after.refs.get(own)
+        endLane(own, tip)
+        // A move made while the lane was still in use is blamed on no one, so
+        // the branch must still be where it was read, at a commit checked below.
+        const now = await gitOutput(cwd, [...scope, 'for-each-ref', '--format=%(objectname)', own])
+        if (now === undefined) return unreadable
+        if (tip === undefined || !after.commits.includes(tip) || now.toString('utf8').trim() !== tip) {
+          return `${role} branch changed while it was being checked`
+        }
       }
       const gitState = changedKeys(before.gitFiles, after.gitFiles)
       if (gitState.length > 0) return `${role} changed Git configuration or hooks: ${listed(gitState)}`
@@ -1603,7 +1610,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ctx.logger.warn(`toranja-orchestrator: worktree for project ${project.id} could not be created: ${String(error)}`)
       return undefined
     } finally {
-      if (lane === undefined) await endUnchecked(project, `refs/heads/${branch}`, undefined)
+      if (lane === undefined) await endUnchecked(project, `refs/heads/${branch}`)
     }
   }
   /**
@@ -1615,13 +1622,20 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * @returns Whether the worktree was removed.
    */
   const releaseLane = async (lane: IsolatedLane): Promise<boolean> => {
-    const removed = await removeUntouched(lane)
+    const ref = `refs/heads/${lane.branch}`
+    // Ended before anything below exposes the lane, so whoever moves its branch from here answers for it.
+    const tip = await endUnchecked(lane.project, ref)
+    // Its own check may have ended the lane earlier, at the tip it read.
+    const removed = await removeUntouched(lane, laneTips.get(ref)?.tip ?? tip)
     // A worktree that is kept is no longer in use, so the user can manage it with plain Git commands.
     if (!removed) await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
-    await endUnchecked(lane.project, `refs/heads/${lane.branch}`, lane.base)
     return removed
   }
-  const removeUntouched = async (lane: IsolatedLane): Promise<boolean> => {
+  /**
+   * Remove a worktree and its branch when they hold no work and the branch is
+   * still at `expected`, the tip its lane ended at.
+   */
+  const removeUntouched = async (lane: IsolatedLane, expected: string | undefined): Promise<boolean> => {
     try {
       const scope = [`--git-dir=${lane.gitDir}`, `--work-tree=${lane.path}`]
       const filters = await filtersOff(lane.project.path, scope)
@@ -1648,7 +1662,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (flags.toString('utf8').split('\0').some(entry => /^[a-zS] /u.test(entry))) return false
       if (changes.length > 0 || index.toString('utf8').split('\0').some(entry => entry.startsWith('160000 '))) return false
       const commit = tip.toString('utf8').trim()
-      if (head.toString('utf8').trim() !== commit) return false
+      if (commit !== expected || head.toString('utf8').trim() !== commit) return false
       if (lane.base === undefined) {
         // Where the branch started is not known for a worktree found at start,
         // so its commit must be held by a branch or tag outside Toranja's own.
@@ -1664,7 +1678,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // above, and the branch is deleted only while it still points at the
       // commit inspected.
       if (!await removeWorktree(lane.project, lane.path, filters.overrides)) return false
-      await gitOutput(lane.project.path, ['update-ref', '-d', `refs/heads/${lane.branch}`, commit])
+      const ref = `refs/heads/${lane.branch}`
+      // Recorded on both sides, so neither a check that ends during the deletion nor one that begins during it blames its run for it.
+      endLane(ref, commit, true)
+      await gitOutput(lane.project.path, ['update-ref', '-d', ref, commit])
+      endLane(ref, commit, true)
       return true
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: worktree ${lane.path} could not be inspected: ${String(error)}`)

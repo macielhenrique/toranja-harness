@@ -890,6 +890,29 @@ describe('Toranja routed delegation', () => {
     }
   })
 
+  it('reads hidden files by content only up to the total budget of one fingerprint', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await harness.setMode({ mode: 'codex' })
+    // Sixteen files of the 5 MiB read by content add up to more than the 64 MiB one fingerprint reads.
+    const size = 5 * 1024 * 1024
+    const names = Array.from({ length: 16 }, (_, index) => `hidden-${index}.bin`)
+    for (const name of names) writeFileSync(join(harness.repo, name), Buffer.alloc(size, 'a'))
+    gitIn(harness.repo, 'add', ...names)
+    gitIn(harness.repo, 'commit', '-q', '-m', 'hidden')
+    gitIn(harness.repo, 'update-index', '--skip-worktree', ...names)
+    const alloc = vi.spyOn(Buffer, 'alloc')
+    try {
+      await delegate(harness, { role: 'tester' })
+      expect((await settled(harness))[0]).toMatchObject({ state: 'completed' })
+      // One fingerprint before the run and one after it.
+      const read = alloc.mock.calls.filter(([length]) => length >= size).length
+      expect(read).toBeGreaterThan(0)
+      expect(read * size).toBeLessThanOrEqual(2 * 64 * 1024 * 1024)
+    } finally {
+      alloc.mockRestore()
+    }
+  })
+
   it('catches a file Git ignores rewritten at the same size with its time put back', async () => {
     const harness = await mount({ routing: ROUTING })
     const secrets = join(harness.repo, '.env')

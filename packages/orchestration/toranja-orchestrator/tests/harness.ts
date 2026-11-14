@@ -72,6 +72,11 @@ export interface Harness {
    * command until its abort signal fires.
    */
   gitGate: ((args: readonly string[]) => Promise<unknown> | undefined) | undefined
+  /**
+   * Called when a Git command has exited; when it returns a promise, the
+   * orchestrator gets the command's outcome only after it resolves.
+   */
+  gitAfter: ((args: readonly string[]) => Promise<unknown> | undefined) | undefined
 }
 
 export const repos: string[] = []
@@ -146,6 +151,7 @@ export async function mount(
     gitFailures: 0,
     gitRuns: [],
     gitGate: undefined,
+    gitAfter: undefined,
   }
   ctx.provide('subprocess', {
     spawn: (spec: { argv: readonly string[]; cwd: string; signal?: AbortSignal }) => {
@@ -165,7 +171,7 @@ export async function mount(
             spec.signal?.addEventListener('abort', () => { child.kill() }, { once: true })
             child.stdout.pipe(stdout)
             child.stderr.pipe(stderr)
-            child.on('close', (exitCode) => { resolve({ exitCode }) })
+            child.on('close', (exitCode) => { void Promise.resolve(harness.gitAfter?.(args)).then(() => { resolve({ exitCode }) }) })
           })
         })
         return { stdout, stderr, done, terminate: () => {}, waitForExit: () => done }

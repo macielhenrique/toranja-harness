@@ -3,7 +3,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSy
 import fsPromises from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MemoryMediaPool } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
 import { UserQuestionError } from '@deepseek-ai/dsh-user-questions'
@@ -954,17 +954,27 @@ describe('Toranja write-scope check in an implementer worktree', () => {
       return { harness, ended, outcomeOfHeld }
     }
     /** Move a lane's branch to a commit that adds a protected file, as the held implementer could. */
-    const moveOutside = (lane: Lane): void => {
-      mkdirSync(join(lane.worktree, '.github'))
-      writeFileSync(join(lane.worktree, '.github', 'x'), 'outside\n')
-      git(lane.worktree, 'add', '.github/x')
-      git(lane.worktree, 'commit', '-qm', 'outside')
+    const moveOutside = (worktree: string): void => {
+      mkdirSync(join(worktree, '.github'))
+      writeFileSync(join(worktree, '.github', 'x'), 'outside\n')
+      git(worktree, 'add', '.github/x')
+      git(worktree, 'commit', '-qm', 'outside')
+    }
+    /** Move a lane's branch to a commit that adds a protected file, leaving its worktree and index alone, as any implementer could. */
+    const moveBranchOutside = (repo: string, branch: string): void => {
+      const env = { ...process.env, GIT_INDEX_FILE: join(repo, '.git', 'outside-index') }
+      const run = (...args: string[]): string =>
+        execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', ...args], { cwd: repo, env, input: 'outside\n' }).toString().trim()
+      const tip = run('rev-parse', `refs/heads/${branch}`)
+      run('read-tree', tip)
+      run('update-index', '--add', '--cacheinfo', `100644,${run('hash-object', '-w', '--stdin')},.github/x`)
+      run('update-ref', `refs/heads/${branch}`, run('commit-tree', run('write-tree'), '-p', tip, '-m', 'outside'))
     }
 
     it('fails the implementer that moved the branch of a lane after that lane ended', async () => {
       const { ended: [lane], outcomeOfHeld } = await alongside(1)
       if (lane === undefined) throw new Error('no lane ended')
-      moveOutside(lane)
+      moveOutside(lane.worktree)
       expect(await outcomeOfHeld()).toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${lane.branch}` })
     })
 
@@ -1009,12 +1019,239 @@ describe('Toranja write-scope check in an implementer worktree', () => {
       const [lane] = (await delegate(harness, { role: 'implementer', provider: 'antigravity', writeScope: ['tracked.txt'] })).activations as Lane[]
       if (lane === undefined) throw new Error('no lane started')
       await reached.promise
-      moveOutside(lane)
+      moveOutside(lane.worktree)
       release.resolve(undefined)
       await expect.poll(() => harness.status().tasks.find(task => task.id === held?.taskId)?.state).not.toBe('active')
       settledHeld.resolve(undefined)
       expect((await settled(harness)).find(task => task.id === held?.taskId))
         .toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${lane.branch}` })
+    })
+
+    it('fails the implementer that moved the branch of a lane the Host was releasing without its check', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      const [held] = (await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })).activations as Lane[]
+      // The other implementer never starts, so its lane is released unchecked; its branch moves as the Host unlocks the worktree.
+      let moved: string | undefined
+      harness.gitGate = (args) => {
+        const path = args.includes('unlock') ? args.at(-1) : undefined
+        if (path === undefined || path === held?.worktree || moved !== undefined) return undefined
+        moved = `toranja/${basename(path)}`
+        moveOutside(path)
+        return undefined
+      }
+      harness.offline.set('antigravity', 'quota exhausted')
+      await expect(delegate(harness, { role: 'implementer', provider: 'antigravity', writeScope: ['tracked.txt'] }))
+        .rejects.toThrow('no project agent started')
+      expect(moved).toBeDefined()
+      release.resolve(undefined)
+      expect((await settled(harness)).find(task => task.id === held?.taskId))
+        .toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${moved}` })
+    })
+
+    it('keeps a lane whose branch moved after the Host read it to release the lane', async () => {
+      const harness = await isolated()
+      const base = git(harness.repo, 'rev-parse', 'HEAD')
+      // A commit that changes nothing, so once its branch is moved back the worktree looks untouched.
+      harness.agentSideEffect = (cwd) => { git(cwd, 'commit', '-q', '--allow-empty', '-m', 'empty') }
+      let moved = false
+      harness.gitAfter = (args) => {
+        const ref = args.at(-1) ?? ''
+        if (moved || !args.includes('-q') || !args.includes('rev-parse') || !ref.startsWith('refs/heads/toranja/')) return undefined
+        moved = true
+        git(harness.repo, 'update-ref', ref, base)
+        return undefined
+      }
+      const [lane] = (await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })).activations as Lane[]
+      await settled(harness)
+      expect(moved).toBe(true)
+      expect(git(harness.repo, 'branch', '--list', lane?.branch ?? '')).not.toBe('')
+    })
+
+    it('keeps a lane another implementer put back where it started after the lane\'s own check, and fails that implementer', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      const [held] = (await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })).activations as Lane[]
+      const base = git(harness.repo, 'rev-parse', 'HEAD')
+      let worktree = ''
+      harness.agentSideEffect = (cwd) => {
+        worktree = cwd
+        writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+        git(cwd, 'commit', '-qam', 'inside')
+      }
+      // Right before the Host reads the branch to release the lane, the held implementer resets its branch and worktree to the start.
+      let reset = false
+      harness.gitGate = (args) => {
+        if (reset || !args.includes('-q') || !args.includes('rev-parse') || !(args.at(-1) ?? '').startsWith('refs/heads/toranja/')) return undefined
+        reset = true
+        git(worktree, 'reset', '-q', '--hard', base)
+        return undefined
+      }
+      const [lane] = (await delegate(harness, { role: 'implementer', provider: 'antigravity', writeScope: ['tracked.txt'] })).activations as Lane[]
+      await expect.poll(() => harness.status().tasks.find(task => task.id === lane?.taskId)?.state).toBe('completed')
+      expect(reset).toBe(true)
+      expect(git(harness.repo, 'branch', '--list', lane?.branch ?? '')).not.toBe('')
+      release.resolve(undefined)
+      expect((await settled(harness)).find(task => task.id === held?.taskId))
+        .toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${lane?.branch ?? ''}` })
+    })
+
+    it('fails the owner whose branch another implementer moved while the owner\'s check was reading it', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      const [held] = (await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })).activations as Lane[]
+      harness.agentSideEffect = (cwd) => {
+        writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+        git(cwd, 'commit', '-qam', 'inside')
+      }
+      // The owner's check holds right after its second reading of the refs, while the held implementer moves the branch and is checked.
+      const listed = new Map<string, number>()
+      const reached = Promise.withResolvers<undefined>()
+      const resume = Promise.withResolvers<undefined>()
+      harness.gitAfter = (args) => {
+        const tree = args.find(arg => arg.startsWith('--work-tree='))
+        if (!args.includes('for-each-ref') || tree === undefined || tree === `--work-tree=${held?.worktree ?? ''}`) return undefined
+        listed.set(tree, (listed.get(tree) ?? 0) + 1)
+        if (listed.get(tree) !== 2) return undefined
+        reached.resolve(undefined)
+        return resume.promise
+      }
+      const [lane] = (await delegate(harness, { role: 'implementer', provider: 'antigravity', writeScope: ['tracked.txt'] })).activations as Lane[]
+      if (lane === undefined) throw new Error('no lane started')
+      await reached.promise
+      moveBranchOutside(harness.repo, lane.branch)
+      release.resolve(undefined)
+      await expect.poll(() => harness.status().tasks.find(task => task.id === held?.taskId)?.state).not.toBe('active')
+      resume.resolve(undefined)
+      expect((await settled(harness)).find(task => task.id === lane.taskId))
+        .toMatchObject({ state: 'failed', error: 'implementer branch changed while it was being checked' })
+    })
+
+    it('fails the owner whose branch moved between the reading of its tip and the reading of the refs', async () => {
+      const harness = await isolated()
+      let branch: string | undefined
+      harness.agentSideEffect = (cwd) => {
+        branch = git(cwd, 'branch', '--show-current')
+        writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+        git(cwd, 'commit', '-qam', 'inside')
+      }
+      // The second listing of the refs waits until the commits of the second reading were read, and the branch moves first.
+      let verified = 0
+      let listed = 0
+      const commitsRead = Promise.withResolvers<undefined>()
+      const inLane = (args: readonly string[]): boolean => args.some(arg => arg.startsWith('--work-tree='))
+      harness.gitAfter = (args) => {
+        if (inLane(args) && args.includes('rev-parse') && args.includes('--verify') && ++verified === 4) commitsRead.resolve(undefined)
+        return undefined
+      }
+      harness.gitGate = args => inLane(args) && args.includes('for-each-ref') && ++listed === 2
+        ? commitsRead.promise.then(() => { moveBranchOutside(harness.repo, branch ?? '') })
+        : undefined
+      const [lane] = (await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })).activations as Lane[]
+      expect((await settled(harness)).find(task => task.id === lane?.taskId))
+        .toMatchObject({ state: 'failed', error: 'implementer branch changed while it was being checked' })
+    })
+
+    it('does not blame a run that began after a lane ended for the branch the Host then removed with it', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      // The release of the untouched lane, which inspects its worktree after its check, waits until the other run has started.
+      const reached = Promise.withResolvers<undefined>()
+      const resume = Promise.withResolvers<undefined>()
+      harness.gitGate = (args) => {
+        if (!args.includes('status')) return undefined
+        reached.resolve(undefined)
+        return resume.promise
+      }
+      const [lane] = (await delegate(harness, { role: 'implementer', provider: 'antigravity', writeScope: ['tracked.txt'] })).activations as Lane[]
+      await reached.promise
+      harness.gitGate = undefined
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })
+      resume.resolve(undefined)
+      await expect.poll(() => git(harness.repo, 'branch', '--list', lane?.branch ?? '')).toBe('')
+      release.resolve(undefined)
+      expect((await settled(harness)).map(task => task.state)).toEqual(['completed', 'completed'])
+    })
+
+    it('does not blame a run whose check ends while the Host is deleting the branch of an untouched lane', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      // Both worktrees exist before either run starts, so the held run sees the other lane's branch at its start.
+      const lanes = (await delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] })).activations as (Lane & { provider: string })[]
+      const held = lanes.find(lane => lane.provider === 'codex')
+      // The other lane's deletion has happened, but the Host does not hear back from it until the held run is checked.
+      const deleted = Promise.withResolvers<undefined>()
+      const resume = Promise.withResolvers<undefined>()
+      let holding = false
+      harness.gitAfter = (args) => {
+        if (holding || !args.includes('update-ref') || !args.includes('-d')) return undefined
+        holding = true
+        deleted.resolve(undefined)
+        return resume.promise
+      }
+      await deleted.promise
+      release.resolve(undefined)
+      await expect.poll(() => harness.status().tasks.find(task => task.id === held?.taskId)?.state).not.toBe('active')
+      resume.resolve(undefined)
+      expect((await settled(harness)).map(task => task.state)).toEqual(['completed', 'completed'])
+    })
+
+    it('does not blame a run that begins while the Host is deleting the branch of an untouched lane', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      const reached = Promise.withResolvers<undefined>()
+      const resume = Promise.withResolvers<undefined>()
+      harness.gitGate = (args) => {
+        if (!args.includes('update-ref') || !args.includes('-d')) return undefined
+        reached.resolve(undefined)
+        return resume.promise
+      }
+      const [lane] = (await delegate(harness, { role: 'implementer', provider: 'antigravity', writeScope: ['tracked.txt'] })).activations as Lane[]
+      await reached.promise
+      harness.gitGate = undefined
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })
+      resume.resolve(undefined)
+      await expect.poll(() => git(harness.repo, 'branch', '--list', lane?.branch ?? '')).toBe('')
+      release.resolve(undefined)
+      expect((await settled(harness)).map(task => task.state)).toEqual(['completed', 'completed'])
+    })
+
+    it('fails the implementer that deleted the branch of an untouched lane after that lane ended', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      // The release of the untouched lane waits, so its branch is deleted by the held implementer, not by the Host.
+      const reached = Promise.withResolvers<undefined>()
+      const resume = Promise.withResolvers<undefined>()
+      harness.gitGate = (args) => {
+        if (!args.includes('status')) return undefined
+        reached.resolve(undefined)
+        return resume.promise
+      }
+      const lanes = (await delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] })).activations as (Lane & { provider: string })[]
+      const held = lanes.find(lane => lane.provider === 'codex')
+      const other = lanes.find(lane => lane.provider === 'antigravity')
+      await reached.promise
+      harness.gitGate = undefined
+      git(harness.repo, 'update-ref', '-d', `refs/heads/${other?.branch ?? ''}`)
+      release.resolve(undefined)
+      await expect.poll(() => harness.status().tasks.find(task => task.id === held?.taskId)?.state).not.toBe('active')
+      resume.resolve(undefined)
+      expect((await settled(harness)).find(task => task.id === held?.taskId))
+        .toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${other?.branch ?? ''}` })
     })
   })
 })
