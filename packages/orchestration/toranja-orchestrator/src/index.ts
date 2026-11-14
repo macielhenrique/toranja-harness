@@ -1223,6 +1223,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   /** Write-scope checks not yet made or dropped, with when each began on {@link laneClock}. */
   const checksRunning = new Map<object, number>()
   let laneClock = 0
+  /** Deletions of lane branches the Host has started and not yet heard back from; a check awaits them before it blames anyone. */
+  const hostDeletions = new Set<Promise<boolean>>()
   const endLane = (ref: string, tip: string | undefined, removed = false): void => {
     lanesInUse.delete(ref)
     laneTips.set(ref, { tip, removed, ended: ++laneClock })
@@ -1401,6 +1403,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
       const gitState = changedKeys(before.gitFiles, after.gitFiles)
       if (gitState.length > 0) return `${role} changed Git configuration or hooks: ${listed(gitState)}`
+      // A branch gone because of a deletion still pending is blamed or not by that deletion's outcome.
+      await Promise.allSettled(hostDeletions)
       const refs = changedKeys(before.refs, after.refs).filter(ref => !ownRefs.has(ref) && laneBlames(ref, after.refs.get(ref), since))
       if (refs.length > 0) return `${role} changed other branches or refs: ${listed(refs)}`
       const changed = new Set<string>()
@@ -1679,11 +1683,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // commit inspected.
       if (!await removeWorktree(lane.project, lane.path, filters.overrides)) return false
       const ref = `refs/heads/${lane.branch}`
-      // Recorded on both sides, so neither a check that ends during the deletion nor one that begins during it blames its run for it.
-      endLane(ref, commit, true)
-      await gitOutput(lane.project.path, ['update-ref', '-d', ref, commit])
-      endLane(ref, commit, true)
-      return true
+      // Recorded only once Git confirms the deletion, so a run that deleted the branch first is still blamed for it.
+      const deletion = (async () => {
+        if (await gitOutput(lane.project.path, ['update-ref', '-d', ref, commit]) === undefined) return false
+        endLane(ref, commit, true)
+        return true
+      })()
+      hostDeletions.add(deletion)
+      try {
+        return await deletion
+      } finally {
+        hostDeletions.delete(deletion)
+      }
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: worktree ${lane.path} could not be inspected: ${String(error)}`)
       return false

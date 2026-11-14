@@ -971,6 +971,18 @@ describe('Toranja write-scope check in an implementer worktree', () => {
       run('update-ref', `refs/heads/${branch}`, run('commit-tree', run('write-tree'), '-p', tip, '-m', 'outside'))
     }
 
+    /** A Git hook that calls `then` once the refs of a worktree's run were read the second time, after the run. */
+    const afterSecondListing = (worktree: () => string | undefined, then: () => void) => {
+      const listed = new Map<string, number>()
+      return (args: readonly string[]): undefined => {
+        const tree = args.find(arg => arg.startsWith('--work-tree='))
+        if (!args.includes('for-each-ref') || tree === undefined) return undefined
+        listed.set(tree, (listed.get(tree) ?? 0) + 1)
+        if (tree === `--work-tree=${worktree() ?? ''}` && listed.get(tree) === 2) then()
+        return undefined
+      }
+    }
+
     it('fails the implementer that moved the branch of a lane after that lane ended', async () => {
       const { ended: [lane], outcomeOfHeld } = await alongside(1)
       if (lane === undefined) throw new Error('no lane ended')
@@ -1187,22 +1199,23 @@ describe('Toranja write-scope check in an implementer worktree', () => {
       const release = Promise.withResolvers<undefined>()
       harness.hold = release.promise
       // Both worktrees exist before either run starts, so the held run sees the other lane's branch at its start.
-      const lanes = (await delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] })).activations as (Lane & { provider: string })[]
-      const held = lanes.find(lane => lane.provider === 'codex')
-      // The other lane's deletion has happened, but the Host does not hear back from it until the held run is checked.
+      // The other lane's deletion has happened, but the Host does not hear back from it until the held run's refs were read again.
       const deleted = Promise.withResolvers<undefined>()
       const resume = Promise.withResolvers<undefined>()
+      const found: { held?: Lane | undefined } = {}
+      const listing = afterSecondListing(() => found.held?.worktree, () => { resume.resolve(undefined) })
       let holding = false
       harness.gitAfter = (args) => {
+        listing(args)
         if (holding || !args.includes('update-ref') || !args.includes('-d')) return undefined
         holding = true
         deleted.resolve(undefined)
         return resume.promise
       }
+      const lanes = (await delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] })).activations as (Lane & { provider: string })[]
+      found.held = lanes.find(lane => lane.provider === 'codex')
       await deleted.promise
       release.resolve(undefined)
-      await expect.poll(() => harness.status().tasks.find(task => task.id === held?.taskId)?.state).not.toBe('active')
-      resume.resolve(undefined)
       expect((await settled(harness)).map(task => task.state)).toEqual(['completed', 'completed'])
     })
 
@@ -1252,6 +1265,37 @@ describe('Toranja write-scope check in an implementer worktree', () => {
       resume.resolve(undefined)
       expect((await settled(harness)).find(task => task.id === held?.taskId))
         .toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${other?.branch ?? ''}` })
+    })
+
+    it('fails the implementer that deleted the branch of an untouched lane right before the Host did, and keeps that lane', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      // The held implementer deletes the other lane's branch as the Host is about to, and is checked while the Host's deletion is pending.
+      const deleted = Promise.withResolvers<undefined>()
+      const resume = Promise.withResolvers<undefined>()
+      let branch: string | undefined
+      harness.gitGate = (args) => {
+        const ref = args.at(-2) ?? ''
+        if (branch !== undefined || !args.includes('update-ref') || !args.includes('-d')) return undefined
+        branch = ref
+        git(harness.repo, 'update-ref', '-d', ref)
+        deleted.resolve(undefined)
+        return resume.promise
+      }
+      const found: { held?: Lane | undefined } = {}
+      harness.gitAfter = afterSecondListing(() => found.held?.worktree, () => { resume.resolve(undefined) })
+      const lanes = (await delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] })).activations as (Lane & { provider: string })[]
+      const held = found.held = lanes.find(lane => lane.provider === 'codex')
+      const other = lanes.find(lane => lane.provider === 'antigravity')
+      await deleted.promise
+      release.resolve(undefined)
+      const tasks = await settled(harness)
+      expect(branch).toBe(`refs/heads/${other?.branch ?? ''}`)
+      expect(tasks.find(task => task.id === held?.taskId))
+        .toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${other?.branch ?? ''}` })
+      expect(tasks.find(task => task.id === other?.taskId)).toHaveProperty('worktree')
     })
   })
 })
