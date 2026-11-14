@@ -202,7 +202,9 @@ project) instead of the project's working tree:
   outside `toranja/*` also holds. Every other one is kept, unlocked, and listed
   in the status as `leftoverWorktrees`, for review, merge, or
   `git worktree remove` by hand: it holds work, it carries no lock from this
-  machine, or it or its Git directory is reached through a link.
+  machine, or it or its Git directory is reached through a link. An entry
+  without `worktree` is a branch alone: the directory was removed but Git could
+  not delete the branch.
 - The change time also moves when another program renames a file or changes
   its permissions, so such a change made during a `read-only` or `execute`
   task to a file compared without reading it counts against that task.

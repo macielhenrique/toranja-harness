@@ -1758,9 +1758,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const gitDir = join(realCommon, 'worktrees', name)
       const back = await readFile(join(gitDir, 'gitdir'), 'utf8').then(text => canonical(dirname(text.trim())), () => undefined)
       const plain = real === join(realRoot, name) && await canonical(gitDir) === gitDir && back === real
-      if (!local || !plain || await releaseLane({ project, path, branch, base: undefined, gitDir }) !== 'removed') {
-        kept.push({ project: project.id, worktree: path, branch })
-      }
+      const released = local && plain ? await releaseLane({ project, path, branch, base: undefined, gitDir }) : 'kept'
+      // With the directory already removed, only the branch is left to report.
+      if (released === 'branch kept') kept.push({ project: project.id, branch })
+      else if (released === 'kept') kept.push({ project: project.id, worktree: path, branch })
     }
     return kept
   }
@@ -1772,7 +1773,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }))).then((found) => {
       leftoverWorktrees = found.flat()
       for (const left of leftoverWorktrees) {
-        ctx.logger.info(`toranja-orchestrator: kept worktree ${left.worktree} (${left.branch}) of project ${left.project}${left.inUse === true ? ', in use by a running process' : ' from an earlier run'}`)
+        ctx.logger.info(`toranja-orchestrator: kept ${left.worktree === undefined ? 'branch' : `worktree ${left.worktree}`} (${left.branch}) of project ${left.project}${left.inUse === true ? ', in use by a running process' : ' from an earlier run'}`)
       }
     })
   }

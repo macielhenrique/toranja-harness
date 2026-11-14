@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MemoryMediaPool } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
 import * as orchestrator from '../src/index.ts'
@@ -1217,6 +1217,16 @@ describe('Toranja routed delegation', () => {
         })
         expect(await swept(harness)).toEqual(left)
         expect(toranjaBranches()).toEqual([left[0]?.branch])
+      })
+
+      it('reports only the branch, with no worktree, when the directory is gone but Git cannot delete the branch', async () => {
+        const { harness, left } = await restarted([deadPid()], (worktree) => {
+          // A leftover lock makes Git refuse to delete the ref.
+          const common = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: worktree }).toString().trim()
+          writeFileSync(join(resolve(worktree, common), 'refs', 'heads', 'toranja', `${basename(worktree)}.lock`), '')
+        })
+        expect(await swept(harness)).toEqual([{ project: 'demo', branch: left[0]?.branch }])
+        expect(existsSync(left[0]?.worktree ?? '')).toBe(false)
       })
 
       it('leaves alone a worktree whose owner is still running', async () => {

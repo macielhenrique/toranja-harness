@@ -267,7 +267,8 @@ export interface ToranjaPlanStatus {
 /** An implementer worktree left by an earlier run, waiting for review, merge, or removal by hand. */
 export interface ToranjaLeftoverWorktree {
   readonly project: string
-  readonly worktree: string
+  /** Missing when only the branch is left: the worktree was removed and the branch could not be deleted. */
+  readonly worktree?: string
   readonly branch: string
   /** Set when the worktree's lock names a process still running on this machine. */
   readonly inUse?: true
