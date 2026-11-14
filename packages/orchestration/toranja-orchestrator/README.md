@@ -126,6 +126,16 @@ The check detects a change and does not revert it. Its limits:
 - Untracked files are compared by content, up to 5 MB each and 64 MB in one reading, in path order. Ignored files and directories, and untracked files past either limit, are compared by path, size, modification time, and change time. The change time moves on every write and is not restored with the modification time, so a same-size rewrite is seen wherever the file system records it; a change deep inside an ignored directory is not seen.
 - A reading that fails is tried once more before the check counts as unreadable, since Git can refuse for a moment while another command changes the repository.
 
+## Task classification
+
+`classify_project_task` predicts how a task will be classified, without starting agents. It takes `project`, `task`, `writeScope`, and an optional `level` that can only raise the result, and returns `level` (`simple`, `moderate`, or `complex`), `path` (`direct`, `investigate`, or `approve`), the `reasons` that fired, the normalized `writeScope`, and the `limits` in force. In this version the tool only answers a query: `delegate_project_task` and `run_delivery_gate` do not use the classification yet.
+
+The rules are deterministic and run on the Host. A task is `complex` when its text contains a risk term (whole word, ignoring case; a term with a space is matched as text), its scope touches a protected path or is the whole project, or it lists more than `maxInvestigatedFiles` files. Otherwise it is `moderate` when the scope has a directory entry or more than `maxDirectFiles` files, and `simple` when neither holds. `classification` in the configuration sets `maxDirectFiles` (3), `maxInvestigatedFiles` (10), `riskTerms`, and `protectedPaths`; a value left out keeps its default, and an invalid one fails at load.
+
+`writeScope` lists project-relative paths. An entry ending in `/` (or `/**`) is a directory and covers that directory by whole path segments, so `src/app/` does not cover `src/application/x.ts`. Any other entry is one file. `./` is the whole project. Absolute paths, `..` segments, and wildcards other than the `/**` suffix are rejected. Paths compare without regard to case on Windows and macOS.
+
+A protected path pattern without a `**/` prefix is anchored at the project root; with it, the pattern matches at any depth. A final `/` marks a directory, and a final `*` on the last segment matches a name prefix, so `**/.env*` matches `.env` and `apps/x/.env.prod`.
+
 ## Implementer worktrees
 
 With `implementerWorktrees`, `delegate_project_task` gives each implementer a Git

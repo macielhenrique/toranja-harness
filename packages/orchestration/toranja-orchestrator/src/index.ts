@@ -24,6 +24,13 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type {} from '@deepseek-ai/dsh-workspace'
 import {
+  DEFAULT_CLASSIFICATION_RULES,
+  classifyTask,
+  normalizeWriteScope,
+  type ClassificationRules,
+  type TaskLevel,
+} from './classification.ts'
+import {
   OrchestrationLedger,
   assertProvidersAllowed,
   defaultProvider,
@@ -80,6 +87,7 @@ import {
   type ToranjaCodexDelegationResult,
 } from './service.ts'
 
+export * from './classification.ts'
 export * from './connection.ts'
 export * from './policy.ts'
 export * from './routing.ts'
@@ -211,6 +219,20 @@ export interface Config {
    * `write` role; with this set, the working-tree check is the only safeguard.
    */
   openrouterUnenforcedAccess?: boolean
+  /**
+   * Rules that classify a task as simple, moderate, or complex from its text
+   * and write scope; a value left out keeps its default.
+   */
+  classification?: {
+    /** Most file entries a task may write and still be simple. */
+    maxDirectFiles?: number
+    /** Most file entries a task may write without becoming complex. */
+    maxInvestigatedFiles?: number
+    /** Terms that make a task complex when its text contains them. */
+    riskTerms?: string[]
+    /** Protected path patterns; a write scope that touches one makes the task complex. */
+    protectedPaths?: string[]
+  }
 }
 
 export const Config: z<Config> = z.object({
@@ -256,6 +278,13 @@ export const Config: z<Config> = z.object({
   openrouterLlmProvider: z.string().min(1).default('openrouter'),
   openrouterKeyRef: z.string().min(1).default('OPENROUTER_API_KEY'),
   openrouterUnenforcedAccess: z.boolean().default(false),
+  classification: z.object({
+    // An array schema would default to `[]` and hide that the list was left out.
+    maxDirectFiles: z.number(),
+    maxInvestigatedFiles: z.number(),
+    riskTerms: z.array(z.string()).default(undefined as never),
+    protectedPaths: z.array(z.string()).default(undefined as never),
+  }),
 })
 
 interface ResolvedProject extends ProjectConfig {
@@ -631,6 +660,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     positiveInteger('maxTeamSize', config.maxTeamSize ?? 8),
     configuredLimits.maxConcurrentPerProject,
   )
+  const classificationRules: ClassificationRules = {
+    maxDirectFiles: positiveInteger('classification.maxDirectFiles', config.classification?.maxDirectFiles ?? DEFAULT_CLASSIFICATION_RULES.maxDirectFiles),
+    maxInvestigatedFiles: positiveInteger(
+      'classification.maxInvestigatedFiles',
+      config.classification?.maxInvestigatedFiles ?? DEFAULT_CLASSIFICATION_RULES.maxInvestigatedFiles,
+    ),
+    riskTerms: config.classification?.riskTerms ?? DEFAULT_CLASSIFICATION_RULES.riskTerms,
+    protectedPaths: config.classification?.protectedPaths ?? DEFAULT_CLASSIFICATION_RULES.protectedPaths,
+  }
+  if (classificationRules.maxInvestigatedFiles < classificationRules.maxDirectFiles) {
+    throw new Error('toranja-orchestrator: classification.maxInvestigatedFiles must not be below maxDirectFiles')
+  }
+  if (classificationRules.riskTerms.some(term => term.trim().length === 0)) {
+    throw new Error('toranja-orchestrator: classification.riskTerms must not contain an empty term')
+  }
+  for (const pattern of classificationRules.protectedPaths) {
+    // A pattern is a scope entry once its `**/` prefix and trailing `*` are removed.
+    try {
+      normalizeWriteScope([pattern.replace(/^\*\*\//u, '').replace(/\*$/u, '')])
+    } catch (error: unknown) {
+      throw new Error(`toranja-orchestrator: classification.protectedPaths entry ${JSON.stringify(pattern)} is invalid: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  const caseInsensitivePaths = process.platform === 'win32' || process.platform === 'darwin'
   const ledger = new OrchestrationLedger(() => limitsFor(live().teamSize))
   const domain = await ctx.storageDomain.open(toranjaOrchestrationDomain)
   ctx.effect(() => () => domain.close(), 'toranja-orchestrator.domainClose')
@@ -1671,6 +1724,43 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     },
     execute() {
       return Promise.resolve(JSON.stringify(controller.status()))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'classify_project_task',
+    description: 'Predict how Toranja will classify a task (simple, moderate, or complex) from its text and the files it will write, without starting agents. The result is a prediction: the host recalculates the classification when a plan is submitted and when the implementer is delegated.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'Project lane id from list_project_lanes.' },
+      task: { type: 'string', required: true, description: 'Complete task text to classify.' },
+      writeScope: { type: 'array', required: true, items: { type: 'string' }, description: 'Project-relative paths the implementer may write: a file, or a directory ending in "/" (or "/**"). "./" is the whole project. No absolute paths, "..", or wildcards.' },
+      level: { type: 'string', enum: ['simple', 'moderate', 'complex'] satisfies TaskLevel[], description: 'Minimum level; it can only raise the classification.' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    execute(args) {
+      // A failure rejects the returned promise, like the other tools.
+      return Promise.resolve().then(() => {
+        const project = findProject(args.project)
+        if (project === undefined) throw new Error(`unknown Toranja project lane ${JSON.stringify(args.project)}`)
+        const writeScope = normalizeWriteScope(args.writeScope)
+        const { level, path, reasons } = classifyTask(
+          { task: args.task, writeScope, ...args.level === undefined ? {} : { raise: args.level } },
+          classificationRules,
+          caseInsensitivePaths,
+        )
+        const { maxDirectFiles, maxInvestigatedFiles } = classificationRules
+        return JSON.stringify({
+          project: project.id,
+          level,
+          path,
+          reasons,
+          writeScope,
+          limits: { maxDirectFiles, maxInvestigatedFiles },
+        })
+      })
     },
   }))
 

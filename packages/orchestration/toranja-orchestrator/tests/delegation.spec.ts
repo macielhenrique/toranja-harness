@@ -1649,3 +1649,94 @@ describe('Toranja routed delegation', () => {
     await expect(mount({ routing: { antigravity: { base: {}, models: { light: { effort: 'turbo' } } } } })).rejects.toThrow()
   })
 })
+
+describe('Toranja task classification', () => {
+  const classify = (harness: Harness, args: Record<string, unknown>): Promise<Record<string, unknown>> =>
+    harness.tool('classify_project_task').execute({
+      project: 'demo',
+      task: 'fix a typo',
+      writeScope: ['src/a.ts'],
+      ...args,
+    }, { agent: {}, signal: new AbortController().signal }).then(text => JSON.parse(text) as Record<string, unknown>)
+  const limits = { maxDirectFiles: 3, maxInvestigatedFiles: 10 }
+
+  it('classifies a simple task and reports the normalized scope', async () => {
+    const harness = await mount()
+    expect(await classify(harness, { writeScope: ['src\\a.ts', './src/a.ts'] })).toEqual({
+      project: 'demo',
+      level: 'simple',
+      path: 'direct',
+      reasons: [],
+      writeScope: ['src/a.ts'],
+      limits,
+    })
+  })
+
+  it('classifies a moderate task from a directory entry', async () => {
+    const harness = await mount()
+    expect(await classify(harness, { writeScope: ['src/app/**'] })).toEqual({
+      project: 'demo',
+      level: 'moderate',
+      path: 'investigate',
+      reasons: ['directory scope src/app/'],
+      writeScope: ['src/app/'],
+      limits,
+    })
+  })
+
+  it('classifies a complex task from a risk term and lets the caller raise the level', async () => {
+    const harness = await mount()
+    expect(await classify(harness, { task: 'add a migration' })).toMatchObject({
+      level: 'complex',
+      path: 'approve',
+      reasons: ['risk term "migration"'],
+    })
+    expect(await classify(harness, { level: 'complex' })).toMatchObject({
+      level: 'complex',
+      reasons: ['raised to complex by the caller'],
+    })
+  })
+
+  it('rejects an unknown lane and an invalid scope', async () => {
+    const harness = await mount()
+    await expect(classify(harness, { project: 'nowhere' })).rejects.toThrow('unknown Toranja project lane "nowhere"')
+    await expect(classify(harness, { writeScope: [] })).rejects.toThrow('at least one entry')
+    await expect(classify(harness, { writeScope: ['../outside'] })).rejects.toThrow('".."')
+  })
+
+  it('follows the configured classification', async () => {
+    const harness = await mount({
+      classification: { maxDirectFiles: 1, maxInvestigatedFiles: 2, riskTerms: ['shipit'], protectedPaths: ['docs/'] },
+    })
+    const result = await classify(harness, { task: 'shipit now', writeScope: ['a.ts', 'b.ts'] })
+    expect(result).toMatchObject({
+      level: 'complex',
+      reasons: ['risk term "shipit"', '2 files exceed the direct limit of 1'],
+      limits: { maxDirectFiles: 1, maxInvestigatedFiles: 2 },
+    })
+    expect(await classify(harness, { writeScope: ['docs/a.md'] })).toMatchObject({ reasons: ['protected path docs/a.md'] })
+    expect(await classify(harness, { task: 'add a migration' })).toMatchObject({ level: 'simple' })
+  })
+
+  it('keeps the default of a classification field the configuration leaves out', async () => {
+    const harness = await mount({ classification: { maxDirectFiles: 1 } })
+    expect(await classify(harness, { writeScope: ['a.ts', 'b.ts'] })).toMatchObject({
+      level: 'moderate',
+      limits: { maxDirectFiles: 1, maxInvestigatedFiles: 10 },
+    })
+    expect(await classify(harness, { task: 'add a migration' })).toMatchObject({ level: 'complex' })
+  })
+
+  it.each([
+    [{ maxDirectFiles: 0 }, 'classification.maxDirectFiles must be a positive safe integer'],
+    [{ maxInvestigatedFiles: 1.5 }, 'classification.maxInvestigatedFiles must be a positive safe integer'],
+    [{ maxDirectFiles: 5, maxInvestigatedFiles: 4 }, 'maxInvestigatedFiles must not be below maxDirectFiles'],
+    [{ riskTerms: ['ok', ' '] }, 'classification.riskTerms must not contain an empty term'],
+    [{ protectedPaths: [''] }, 'classification.protectedPaths entry ""'],
+    [{ protectedPaths: ['/etc/'] }, 'classification.protectedPaths entry "/etc/"'],
+    [{ protectedPaths: ['a/../b'] }, 'classification.protectedPaths entry "a/../b"'],
+    [{ protectedPaths: ['src/*.ts'] }, 'classification.protectedPaths entry "src/*.ts"'],
+  ])('rejects the invalid classification %j', async (classification, message) => {
+    await expect(mount({ classification })).rejects.toThrow(message)
+  })
+})
