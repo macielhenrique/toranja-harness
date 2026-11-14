@@ -25,6 +25,7 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type {} from '@deepseek-ai/dsh-workspace'
 import {
   DEFAULT_CLASSIFICATION_RULES,
+  canonicalProtectedPattern,
   classifyTask,
   normalizeWriteScope,
   type ClassificationRules,
@@ -279,7 +280,8 @@ export const Config: z<Config> = z.object({
   openrouterKeyRef: z.string().min(1).default('OPENROUTER_API_KEY'),
   openrouterUnenforcedAccess: z.boolean().default(false),
   classification: z.object({
-    // An array schema would default to `[]` and hide that the list was left out.
+    // An array schema would default to `[]`; the override keeps a missing list `undefined`
+    // and an explicit `null` as `null`, so `apply` can use the default for one and reject the other.
     maxDirectFiles: z.number(),
     maxInvestigatedFiles: z.number(),
     riskTerms: z.array(z.string()).default(undefined as never),
@@ -624,6 +626,12 @@ interface GateResult {
   readonly diagnostic?: string
 }
 
+/** A configured list keeps its default when left out; `null` is rejected so it cannot restore the default in silence. */
+function classificationList(name: string, value: readonly string[] | null | undefined, fallback: readonly string[]): readonly string[] {
+  if (value === null) throw new Error(`toranja-orchestrator: classification.${name} must be a list`)
+  return value ?? fallback
+}
+
 /**
  * Register durable project lanes and model-facing orchestration tools.
  * @param ctx - Plugin context.
@@ -666,8 +674,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       'classification.maxInvestigatedFiles',
       config.classification?.maxInvestigatedFiles ?? DEFAULT_CLASSIFICATION_RULES.maxInvestigatedFiles,
     ),
-    riskTerms: config.classification?.riskTerms ?? DEFAULT_CLASSIFICATION_RULES.riskTerms,
-    protectedPaths: config.classification?.protectedPaths ?? DEFAULT_CLASSIFICATION_RULES.protectedPaths,
+    riskTerms: classificationList('riskTerms', config.classification?.riskTerms, DEFAULT_CLASSIFICATION_RULES.riskTerms),
+    protectedPaths: classificationList('protectedPaths', config.classification?.protectedPaths, DEFAULT_CLASSIFICATION_RULES.protectedPaths),
   }
   if (classificationRules.maxInvestigatedFiles < classificationRules.maxDirectFiles) {
     throw new Error('toranja-orchestrator: classification.maxInvestigatedFiles must not be below maxDirectFiles')
@@ -676,14 +684,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     throw new Error('toranja-orchestrator: classification.riskTerms must not contain an empty term')
   }
   for (const pattern of classificationRules.protectedPaths) {
-    // A pattern is a scope entry once its `**/` prefix and trailing `*` are removed.
     try {
-      normalizeWriteScope([pattern.replace(/^\*\*\//u, '').replace(/\*$/u, '')])
+      const canonical = canonicalProtectedPattern(pattern)
+      if (canonical !== pattern) throw new Error(`write it as ${JSON.stringify(canonical)}`)
     } catch (error: unknown) {
       throw new Error(`toranja-orchestrator: classification.protectedPaths entry ${JSON.stringify(pattern)} is invalid: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  const caseInsensitivePaths = process.platform === 'win32' || process.platform === 'darwin'
   const ledger = new OrchestrationLedger(() => limitsFor(live().teamSize))
   const domain = await ctx.storageDomain.open(toranjaOrchestrationDomain)
   ctx.effect(() => () => domain.close(), 'toranja-orchestrator.domainClose')
@@ -1749,7 +1756,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         const { level, path, reasons } = classifyTask(
           { task: args.task, writeScope, ...args.level === undefined ? {} : { raise: args.level } },
           classificationRules,
-          caseInsensitivePaths,
         )
         const { maxDirectFiles, maxInvestigatedFiles } = classificationRules
         return JSON.stringify({

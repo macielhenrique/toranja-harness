@@ -1672,15 +1672,24 @@ describe('Toranja task classification', () => {
     })
   })
 
-  it('classifies a moderate task from a directory entry', async () => {
+  it('classifies a directory entry as complex', async () => {
     const harness = await mount()
     expect(await classify(harness, { writeScope: ['src/app/**'] })).toEqual({
       project: 'demo',
-      level: 'moderate',
-      path: 'investigate',
-      reasons: ['directory scope src/app/'],
+      level: 'complex',
+      path: 'approve',
+      reasons: ['directory scope src/app/ needs approval'],
       writeScope: ['src/app/'],
       limits,
+    })
+  })
+
+  it('classifies a moderate task from the file count', async () => {
+    const harness = await mount()
+    expect(await classify(harness, { writeScope: ['a.ts', 'b.ts', 'c.ts', 'd.ts'] })).toMatchObject({
+      level: 'moderate',
+      path: 'investigate',
+      reasons: ['4 files exceed the direct limit of 3'],
     })
   })
 
@@ -1689,7 +1698,7 @@ describe('Toranja task classification', () => {
     expect(await classify(harness, { task: 'add a migration' })).toMatchObject({
       level: 'complex',
       path: 'approve',
-      reasons: ['risk term "migration"'],
+      reasons: ['risk term "migra"'],
     })
     expect(await classify(harness, { level: 'complex' })).toMatchObject({
       level: 'complex',
@@ -1736,7 +1745,28 @@ describe('Toranja task classification', () => {
     [{ protectedPaths: ['/etc/'] }, 'classification.protectedPaths entry "/etc/"'],
     [{ protectedPaths: ['a/../b'] }, 'classification.protectedPaths entry "a/../b"'],
     [{ protectedPaths: ['src/*.ts'] }, 'classification.protectedPaths entry "src/*.ts"'],
+    [{ protectedPaths: ['.github\\'] }, 'classification.protectedPaths entry ".github\\\\" is invalid: write it as ".github/"'],
+    [{ protectedPaths: ['./.github/'] }, 'classification.protectedPaths entry "./.github/" is invalid: write it as ".github/"'],
+    [{ protectedPaths: [' .env*'] }, 'classification.protectedPaths entry " .env*" is invalid: write it as ".env*"'],
+    [{ protectedPaths: ['**/a\\b/'] }, 'is invalid: write it as "**/a/b/"'],
+    [{ protectedPaths: ['a/./b/'] }, 'classification.protectedPaths entry "a/./b/"'],
+    [{ protectedPaths: ['GITHUB~1/'] }, 'classification.protectedPaths entry "GITHUB~1/"'],
+    [{ riskTerms: null as never }, 'toranja-orchestrator: classification.riskTerms must be a list'],
+    [{ protectedPaths: null as never }, 'toranja-orchestrator: classification.protectedPaths must be a list'],
   ])('rejects the invalid classification %j', async (classification, message) => {
     await expect(mount({ classification })).rejects.toThrow(message)
+  })
+
+  it('takes an explicit empty list as the operator decision', async () => {
+    const harness = await mount({ classification: { riskTerms: [], protectedPaths: [] } })
+    expect(await classify(harness, { task: 'add a migration', writeScope: ['.github/ci.yml'] })).toMatchObject({ level: 'simple', reasons: [] })
+  })
+
+  it('keeps the default limit the configuration leaves out, whichever it is', async () => {
+    const harness = await mount({ classification: { maxInvestigatedFiles: 5 } })
+    expect(await classify(harness, { writeScope: ['a.ts', 'b.ts', 'c.ts', 'd.ts'] })).toMatchObject({
+      level: 'moderate',
+      limits: { maxDirectFiles: 3, maxInvestigatedFiles: 5 },
+    })
   })
 })

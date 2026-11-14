@@ -29,8 +29,22 @@ describe('normalizeWriteScope', () => {
     expect(() => normalizeWriteScope([entry])).toThrow(JSON.stringify(entry))
   })
 
-  it.each(['..', 'a/../b', '..\\b'])('rejects the parent segment in %s', (entry) => {
+  it.each(['..', 'a/../b', '..\\b', 'a/./b'])('rejects the relative segment in %s', (entry) => {
     expect(() => normalizeWriteScope([entry])).toThrow(JSON.stringify(entry))
+  })
+
+  it.each([
+    '.github./x', 'a/b ./c', 'a /b', '.env:stream', 'C:', 'GITHUB~1/x', 'nul', 'NUL', 'con.txt', 'src/Aux.tar.gz', 'com1', 'LPT9.log', 'CONIN$', 'conout$.txt', 'a\u0001b', 'a\nb',
+  ])('rejects the segment that Windows reads as another name in %j', (entry) => {
+    expect(() => normalizeWriteScope([entry])).toThrow(JSON.stringify(entry))
+  })
+
+  it('keeps names that only resemble the reserved ones', () => {
+    expect(normalizeWriteScope(['console.ts', 'nulls/a', 'com10', 'a~b'])).toEqual(['a~b', 'com10', 'console.ts', 'nulls/a'])
+  })
+
+  it('writes the path in NFC', () => {
+    expect(normalizeWriteScope(['café/x.ts'])).toEqual(['café/x.ts'])
   })
 
   it.each(['src/*.ts', 'a?', 'a[1]', '{a,b}', '**', 'a/**/b'])('rejects the wildcard in %s', (entry) => {
@@ -59,6 +73,17 @@ describe('scopeContains', () => {
     expect(scopeContains(['Src/'], 'src/a.ts', true)).toBe(true)
     expect(scopeContains(['Src/'], 'src/a.ts', false)).toBe(false)
   })
+
+  it('compares NFC and NFD forms as the same name, in either direction', () => {
+    expect(scopeContains(['café/'], 'café/x.ts', false)).toBe(true)
+    expect(scopeContains(['café/'], 'café/x.ts', false)).toBe(true)
+  })
+
+  it('does not contain a path that does not normalize', () => {
+    expect(scopeContains(['src/'], 'src/../.github/x', false)).toBe(false)
+    expect(scopeContains(['./'], '/etc/passwd', false)).toBe(false)
+    expect(scopeContains(['./'], 'src/a.ts:stream', false)).toBe(false)
+  })
 })
 
 describe('scopeWithin', () => {
@@ -82,53 +107,66 @@ describe('scopeWithin', () => {
 
 describe('isProtectedPath', () => {
   it('anchors a pattern without **/ at the project root', () => {
-    expect(isProtectedPath('.github/workflows/ci.yml', ['.github/'], false)).toBe(true)
-    expect(isProtectedPath('sub/.github/ci.yml', ['.github/'], false)).toBe(false)
-    expect(isProtectedPath('Makefile', ['Makefile'], false)).toBe(true)
-    expect(isProtectedPath('sub/Makefile', ['Makefile'], false)).toBe(false)
+    expect(isProtectedPath('.github/workflows/ci.yml', ['.github/'])).toBe(true)
+    expect(isProtectedPath('sub/.github/ci.yml', ['.github/'])).toBe(false)
+    expect(isProtectedPath('Makefile', ['Makefile'])).toBe(true)
+    expect(isProtectedPath('sub/Makefile', ['Makefile'])).toBe(false)
   })
 
   it('matches at any depth with **/', () => {
-    expect(isProtectedPath('a/b/package-lock.json', ['**/package-lock.json'], false)).toBe(true)
-    expect(isProtectedPath('package-lock.json', ['**/package-lock.json'], false)).toBe(true)
-    expect(isProtectedPath('package-lock.json.bak', ['**/package-lock.json'], false)).toBe(false)
-    expect(isProtectedPath('db/migrations/001.sql', ['**/migrations/'], false)).toBe(true)
-    expect(isProtectedPath('db/migrationsx/001.sql', ['**/migrations/'], false)).toBe(false)
+    expect(isProtectedPath('a/b/package-lock.json', ['**/package-lock.json'])).toBe(true)
+    expect(isProtectedPath('package-lock.json', ['**/package-lock.json'])).toBe(true)
+    expect(isProtectedPath('package-lock.json.bak', ['**/package-lock.json'])).toBe(false)
+    expect(isProtectedPath('db/migrations/001.sql', ['**/migrations/'])).toBe(true)
+    expect(isProtectedPath('db/migrationsx/001.sql', ['**/migrations/'])).toBe(false)
   })
 
   it('treats a trailing * on the last segment as a name prefix', () => {
     const patterns = ['**/.env*']
-    expect(isProtectedPath('.env', patterns, false)).toBe(true)
-    expect(isProtectedPath('.env.local', patterns, false)).toBe(true)
-    expect(isProtectedPath('apps/x/.env.prod', patterns, false)).toBe(true)
-    expect(isProtectedPath('apps/x/env.prod', patterns, false)).toBe(false)
+    expect(isProtectedPath('.env', patterns)).toBe(true)
+    expect(isProtectedPath('.env.local', patterns)).toBe(true)
+    expect(isProtectedPath('apps/x/.env.prod', patterns)).toBe(true)
+    expect(isProtectedPath('apps/x/env.prod', patterns)).toBe(false)
   })
 
   it('protects a directory entry equal to or inside a protected directory, not one that merely holds a protected file', () => {
-    expect(isProtectedPath('.github/', ['.github/'], false)).toBe(true)
-    expect(isProtectedPath('.github/workflows/', ['.github/'], false)).toBe(true)
-    expect(isProtectedPath('src/', ['**/.env*'], false)).toBe(false)
+    expect(isProtectedPath('.github/', ['.github/'])).toBe(true)
+    expect(isProtectedPath('.github/workflows/', ['.github/'])).toBe(true)
+    expect(isProtectedPath('src/', ['**/.env*'])).toBe(false)
   })
 
   it('does not treat a file named like a protected directory as inside it', () => {
-    expect(isProtectedPath('db/migrations', ['**/migrations/'], false)).toBe(false)
+    expect(isProtectedPath('db/migrations', ['**/migrations/'])).toBe(false)
   })
 
-  it('honors case sensitivity', () => {
-    expect(isProtectedPath('.GitHub/ci.yml', ['.github/'], true)).toBe(true)
-    expect(isProtectedPath('.GitHub/ci.yml', ['.github/'], false)).toBe(false)
+  it('ignores case on every platform', () => {
+    expect(isProtectedPath('.GitHub/ci.yml', ['.github/'])).toBe(true)
+    expect(isProtectedPath('.github/ci.yml', ['.GitHub/'])).toBe(true)
+    expect(isProtectedPath('APPS/.ENV', ['**/.env*'])).toBe(true)
+  })
+
+  it('compares NFC and NFD forms as the same name', () => {
+    expect(isProtectedPath('café/x', ['café/'])).toBe(true)
+    expect(isProtectedPath('café/x', ['café/'])).toBe(true)
+  })
+
+  it('treats a path that does not normalize as protected', () => {
+    expect(isProtectedPath('src/../.github/x', ['.github/'])).toBe(true)
+    expect(isProtectedPath('/etc/x', ['.github/'])).toBe(true)
+    expect(isProtectedPath('GITHUB~1/x', ['.github/'])).toBe(true)
+    expect(isProtectedPath('', ['.github/'])).toBe(true)
   })
 })
 
 describe('classifyTask', () => {
   const rules = DEFAULT_CLASSIFICATION_RULES
   const classify = (task: string, writeScope: string[], raise?: 'simple' | 'moderate' | 'complex') =>
-    classifyTask({ task, writeScope, ...raise === undefined ? {} : { raise } }, rules, false)
+    classifyTask({ task, writeScope, ...raise === undefined ? {} : { raise } }, rules)
 
   it('ships the documented defaults', () => {
     expect(rules.maxDirectFiles).toBe(3)
     expect(rules.maxInvestigatedFiles).toBe(10)
-    expect(rules.riskTerms).toContain('rm -rf')
+    expect(rules.riskTerms).toContain('rm -r')
     expect(rules.protectedPaths).toEqual(['.github/', '**/.env*', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/migrations/'])
   })
 
@@ -136,12 +174,14 @@ describe('classifyTask', () => {
     expect(classify('fix a typo', ['src/a.ts', 'src/b.ts', 'src/c.ts'])).toEqual({ level: 'simple', path: 'direct', reasons: [] })
   })
 
-  it('is moderate for a directory entry', () => {
-    expect(classify('fix a typo', ['src/app/'])).toEqual({
-      level: 'moderate',
-      path: 'investigate',
-      reasons: ['directory scope src/app/'],
-    })
+  it.each(['db/', 'apps/web/', 'packages/', 'src/app/', './'])('is complex for the directory entry %s', (entry) => {
+    const result = classify('fix a typo', [entry])
+    expect(result).toMatchObject({ level: 'complex', path: 'approve' })
+    expect(result.reasons).toContain(`directory scope ${entry} needs approval`)
+  })
+
+  it('keeps a directory out of the file count', () => {
+    expect(classify('fix a typo', ['src/', ...files(3)]).reasons).toEqual(['directory scope src/ needs approval'])
   })
 
   it('is moderate above the direct file limit', () => {
@@ -156,19 +196,48 @@ describe('classifyTask', () => {
     expect(classify('Add a MIGRATION for users', ['src/a.ts'])).toEqual({
       level: 'complex',
       path: 'approve',
-      reasons: ['risk term "migration"'],
+      reasons: ['risk term "migra"'],
     })
   })
 
-  it('matches a one-word term as a whole word only', () => {
-    expect(classify('update the author page', ['src/a.ts']).level).toBe('simple')
+  it('matches a term as the start of a word, not inside one', () => {
+    expect(classify('update the README wording', ['src/a.ts']).level).toBe('simple')
     expect(classify('rotate the senha', ['src/a.ts']).reasons).toEqual(['risk term "senha"'])
     expect(classify('trocar a ésenha', ['src/a.ts']).level).toBe('simple')
-    expect(classify('Executar a migração agora', ['src/a.ts']).reasons).toEqual(['risk term "migração"'])
+    expect(classify('Executar a migração agora', ['src/a.ts']).reasons).toEqual(['risk term "migra"'])
   })
 
-  it('matches a term with a space as a substring', () => {
-    expect(classify('then rm -rf build', ['src/a.ts']).reasons).toEqual(['risk term "rm -rf"'])
+  it('keeps the terms as stems, so a false positive asks for approval', () => {
+    expect(classify('update the author page', ['src/a.ts']).reasons).toEqual(['risk term "auth"'])
+    expect(classify('fix the dropdown', ['src/a.ts']).reasons).toEqual(['risk term "drop"'])
+  })
+
+  it.each([
+    'deleted the table',
+    'run migrations',
+    'rotate tokens',
+    'deploying now',
+    'fix delete_user',
+    'refactor deleteUser',
+    'auth_token leak',
+    'de​lete rows',
+    'rm  -fr /tmp/x',
+    'migração',
+  ])('is complex when a risk term hides in %j', (task) => {
+    expect(classify(task, ['src/a.ts'])).toMatchObject({ level: 'complex', path: 'approve' })
+  })
+
+  it('matches a term with a space across any run of spaces', () => {
+    expect(classify('then rm   -rf build', ['src/a.ts']).reasons).toEqual(['risk term "rm -r"'])
+    expect(classify('then rm\t-fr build', ['src/a.ts']).reasons).toEqual(['risk term "rm -f"'])
+  })
+
+  it('matches a term with regular expression characters literally', () => {
+    const rules = { ...DEFAULT_CLASSIFICATION_RULES, riskTerms: ['a.c', '(x+)+$'] }
+    const run = (task: string) => classifyTask({ task, writeScope: ['src/a.ts'] }, rules).level
+    expect(run('abc')).toBe('simple')
+    expect(run('a.c')).toBe('complex')
+    expect(run(`${'x'.repeat(5000)}!`)).toBe('simple')
   })
 
   it('is complex for a protected path', () => {
@@ -183,7 +252,7 @@ describe('classifyTask', () => {
     expect(classify('fix a typo', ['./'])).toEqual({
       level: 'complex',
       path: 'approve',
-      reasons: ['scope covers the whole project'],
+      reasons: ['directory scope ./ needs approval'],
     })
   })
 
@@ -205,16 +274,14 @@ describe('classifyTask', () => {
 
   it('uses the limits of the given rules', () => {
     const strict = { ...rules, maxDirectFiles: 1, maxInvestigatedFiles: 2, riskTerms: ['shipit'] }
-    expect(classifyTask({ task: 'x', writeScope: ['a.ts', 'b.ts'] }, strict, false).level).toBe('moderate')
-    expect(classifyTask({ task: 'x', writeScope: ['a.ts', 'b.ts', 'c.ts'] }, strict, false).level).toBe('complex')
-    expect(classifyTask({ task: 'run shipit', writeScope: ['a.ts'] }, strict, false).level).toBe('complex')
-    expect(classifyTask({ task: 'run deploy', writeScope: ['a.ts'] }, strict, false).level).toBe('simple')
+    expect(classifyTask({ task: 'x', writeScope: ['a.ts', 'b.ts'] }, strict).level).toBe('moderate')
+    expect(classifyTask({ task: 'x', writeScope: ['a.ts', 'b.ts', 'c.ts'] }, strict).level).toBe('complex')
+    expect(classifyTask({ task: 'run shipit', writeScope: ['a.ts'] }, strict).level).toBe('complex')
+    expect(classifyTask({ task: 'run deploy', writeScope: ['a.ts'] }, strict).level).toBe('simple')
   })
 
-  it('applies case sensitivity to protected paths', () => {
-    const scope = ['.GITHUB/ci.yml']
-    expect(classifyTask({ task: 'x', writeScope: scope }, rules, true).level).toBe('complex')
-    expect(classifyTask({ task: 'x', writeScope: scope }, rules, false).level).toBe('simple')
+  it('protects a path whatever its case', () => {
+    expect(classifyTask({ task: 'x', writeScope: ['.GITHUB/ci.yml'] }, rules).level).toBe('complex')
   })
 
   it('lets raise only raise the level', () => {
@@ -229,6 +296,6 @@ describe('classifyTask', () => {
       reasons: ['raised to moderate by the caller'],
     })
     expect(classify('add a migration', ['src/a.ts'], 'simple').level).toBe('complex')
-    expect(classify('fix a typo', ['src/app/'], 'moderate').reasons).toEqual(['directory scope src/app/'])
+    expect(classify('fix a typo', files(4), 'moderate').reasons).toEqual(['4 files exceed the direct limit of 3'])
   })
 })
