@@ -1295,7 +1295,11 @@ describe('Toranja write-scope check in an implementer worktree', () => {
       expect(branch).toBe(`refs/heads/${other?.branch ?? ''}`)
       expect(tasks.find(task => task.id === held?.taskId))
         .toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${other?.branch ?? ''}` })
-      expect(tasks.find(task => task.id === other?.taskId)).toHaveProperty('worktree')
+      // The Host removed the worktree before its deletion of the branch failed: the ledger lists the branch only.
+      const ended = tasks.find(task => task.id === other?.taskId)
+      expect(existsSync(other?.worktree ?? '')).toBe(false)
+      expect(ended).not.toHaveProperty('worktree')
+      expect(ended).toHaveProperty('branch', other?.branch)
     })
   })
 })

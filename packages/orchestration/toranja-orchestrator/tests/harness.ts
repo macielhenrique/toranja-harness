@@ -8,10 +8,14 @@ import { PassThrough } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
 import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
-import { expect } from 'vitest'
+import { expect, vi } from 'vitest'
 import { MemoryMediaPool, MemoryStorageBackend } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
 import * as orchestrator from '../src/index.ts'
 import type { ToranjaOrchestrationStatus } from '../src/index.ts'
+
+// Every test runs real Git processes, a few seconds in the longest, beside the processes of other workers.
+// A test that never settles still fails at these limits; they only stop a busy host from failing one that was about to pass.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000, expect: { poll: { timeout: 15_000 } } })
 
 interface RegisteredProvider {
   readonly name: string

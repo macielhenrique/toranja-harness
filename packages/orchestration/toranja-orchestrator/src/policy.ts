@@ -348,14 +348,15 @@ export class OrchestrationLedger {
   }
 
   /**
-   * Forget the worktree of a task whose worktree was removed.
+   * Forget the worktree of a task whose worktree was removed, and its branch unless that was kept.
    * @param taskId - Task whose worktree no longer exists.
+   * @param branchKept - Whether the branch stayed behind for manual review.
    */
-  dropWorktree(taskId: string): void {
+  dropWorktree(taskId: string, branchKept = false): void {
     const task = this.taskHistory.find(candidate => candidate.id === taskId)
     if (task === undefined) return
     delete task.worktree
-    delete task.branch
+    if (!branchKept) delete task.branch
   }
 
   /**

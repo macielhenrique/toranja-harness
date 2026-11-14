@@ -620,6 +620,9 @@ const LANE_NAME = /^[a-z0-9]+-[a-z0-9]+$/u
 /** Lock reason of a worktree whose implementer is running: the machine and process that own it. */
 const LANE_OWNER = /^toranja-orchestrator host=(\S+) pid=([1-9]\d*)$/u
 
+/** What the Host released of a lane: worktree and branch, only the worktree, or nothing. */
+type Release = 'removed' | 'branch kept' | 'kept'
+
 interface IsolatedLane {
   readonly project: ResolvedProject
   readonly path: string
@@ -1623,27 +1626,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * review and merge. The worktree is inspected through the Git directory
    * recorded when it was created, never through the `.git` entry the
    * implementer could have replaced, and with the repository's filters off.
-   * @returns Whether the worktree was removed.
+   * @returns Whether the worktree and branch were removed, only the worktree (the Host's deletion of the branch failed), or neither.
    */
-  const releaseLane = async (lane: IsolatedLane): Promise<boolean> => {
+  const releaseLane = async (lane: IsolatedLane): Promise<Release> => {
     const ref = `refs/heads/${lane.branch}`
     // Ended before anything below exposes the lane, so whoever moves its branch from here answers for it.
     const tip = await endUnchecked(lane.project, ref)
     // Its own check may have ended the lane earlier, at the tip it read.
     const removed = await removeUntouched(lane, laneTips.get(ref)?.tip ?? tip)
     // A worktree that is kept is no longer in use, so the user can manage it with plain Git commands.
-    if (!removed) await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
+    if (removed === 'kept') await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
     return removed
   }
   /**
    * Remove a worktree and its branch when they hold no work and the branch is
    * still at `expected`, the tip its lane ended at.
    */
-  const removeUntouched = async (lane: IsolatedLane, expected: string | undefined): Promise<boolean> => {
+  const removeUntouched = async (lane: IsolatedLane, expected: string | undefined): Promise<Release> => {
     try {
       const scope = [`--git-dir=${lane.gitDir}`, `--work-tree=${lane.path}`]
       const filters = await filtersOff(lane.project.path, scope)
-      if (filters === undefined) return false
+      if (filters === undefined) return 'kept'
       // A nested repository would be inspected with its own configuration,
       // which is not read here, so submodules are not entered; an index that
       // names one counts as work to keep. The branch is compared as well as
@@ -1661,27 +1664,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         gitOutput(lane.project.path, [...scope, 'ls-files', '-s', '-z']),
         gitOutput(lane.project.path, [...scope, 'ls-files', '-v', '-z']),
       ])
-      if (changes === undefined || head === undefined || tip === undefined || index === undefined || flags === undefined) return false
+      if (changes === undefined || head === undefined || tip === undefined || index === undefined || flags === undefined) return 'kept'
       // A file Git was told to skip is invisible to the status above, so it may hold work.
-      if (flags.toString('utf8').split('\0').some(entry => /^[a-zS] /u.test(entry))) return false
-      if (changes.length > 0 || index.toString('utf8').split('\0').some(entry => entry.startsWith('160000 '))) return false
+      if (flags.toString('utf8').split('\0').some(entry => /^[a-zS] /u.test(entry))) return 'kept'
+      if (changes.length > 0 || index.toString('utf8').split('\0').some(entry => entry.startsWith('160000 '))) return 'kept'
       const commit = tip.toString('utf8').trim()
-      if (commit !== expected || head.toString('utf8').trim() !== commit) return false
+      if (commit !== expected || head.toString('utf8').trim() !== commit) return 'kept'
       if (lane.base === undefined) {
         // Where the branch started is not known for a worktree found at start,
         // so its commit must be held by a branch or tag outside Toranja's own.
         const holders = await gitOutput(lane.project.path, [
           'for-each-ref', '--format=%(refname)', `--contains=${commit}`, 'refs/heads', 'refs/remotes', 'refs/tags',
         ])
-        if (holders === undefined) return false
-        if (!holders.toString('utf8').split('\n').some(ref => ref.length > 0 && !ref.startsWith('refs/heads/toranja/'))) return false
+        if (holders === undefined) return 'kept'
+        if (!holders.toString('utf8').split('\n').some(ref => ref.length > 0 && !ref.startsWith('refs/heads/toranja/'))) return 'kept'
       } else if (commit !== lane.base) {
-        return false
+        return 'kept'
       }
       // Git refuses a worktree that gained a change since the inspection
       // above, and the branch is deleted only while it still points at the
       // commit inspected.
-      if (!await removeWorktree(lane.project, lane.path, filters.overrides)) return false
+      if (!await removeWorktree(lane.project, lane.path, filters.overrides)) return 'kept'
       const ref = `refs/heads/${lane.branch}`
       // Recorded only once Git confirms the deletion, so a run that deleted the branch first is still blamed for it.
       const deletion = (async () => {
@@ -1691,13 +1694,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       })()
       hostDeletions.add(deletion)
       try {
-        return await deletion
+        return await deletion ? 'removed' : 'branch kept'
       } finally {
         hostDeletions.delete(deletion)
       }
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: worktree ${lane.path} could not be inspected: ${String(error)}`)
-      return false
+      return 'kept'
     }
   }
 
@@ -1755,7 +1758,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const gitDir = join(realCommon, 'worktrees', name)
       const back = await readFile(join(gitDir, 'gitdir'), 'utf8').then(text => canonical(dirname(text.trim())), () => undefined)
       const plain = real === join(realRoot, name) && await canonical(gitDir) === gitDir && back === real
-      if (!local || !plain || !await releaseLane({ project, path, branch, base: undefined, gitDir })) {
+      if (!local || !plain || await releaseLane({ project, path, branch, base: undefined, gitDir }) !== 'removed') {
         kept.push({ project: project.id, worktree: path, branch })
       }
     }
@@ -1875,7 +1878,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const settleInBackground = (started: StartedRun): void => {
     void awaitRouted(started).then(async ({ run, result, violation, error }) => {
       const { lane } = run.request
-      if (lane !== undefined && await releaseLane(lane)) ledger.dropWorktree(run.lease.taskId)
+      const released = lane === undefined ? 'kept' : await releaseLane(lane)
+      if (released !== 'kept') ledger.dropWorktree(run.lease.taskId, released === 'branch kept')
       const success = result?.stopReason === 'completed' && violation === undefined
       run.lease.settle(success, violation ?? error ?? result?.diagnostic ?? result?.stopReason)
       // A failed writer leaves nothing to review; what it spent stays until the next reset.
