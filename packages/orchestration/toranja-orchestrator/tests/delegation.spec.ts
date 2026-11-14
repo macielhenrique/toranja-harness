@@ -1258,6 +1258,16 @@ describe('Toranja routed delegation', () => {
         expect(toranjaBranches()).toEqual([left[0]?.branch])
       })
 
+      it('does not list the branch of a valid worktree that lives outside this deployment\'s root', async () => {
+        const { repo, worktreeRoot } = await restarted([process.pid])
+        const outside = join(mkdtempSync(join(tmpdir(), 'toranja-outside-')), 'tree')
+        execFileSync('git', ['worktree', 'add', '-b', 'toranja/other-tree', outside, 'HEAD'], { cwd: repo, stdio: 'ignore' })
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        const branches = (await swept(again) ?? []).map(left => left.branch)
+        expect(branches).not.toContain('toranja/other-tree')
+        expect(existsSync(outside)).toBe(true)
+      })
+
       it('leaves alone a worktree whose owner is still running', async () => {
         const { harness, left, toranjaBranches } = await restarted([process.pid])
         // In use by a running Toranja: never removed, and reported as such so nothing stays out of sight.
