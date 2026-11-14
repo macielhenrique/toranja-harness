@@ -926,6 +926,97 @@ describe('Toranja write-scope check in an implementer worktree', () => {
     release.resolve(undefined)
     expect((await settled(harness)).map(task => task.state)).toEqual(['completed', 'completed'])
   })
+
+  describe('while a lane ends during another implementer\'s run', () => {
+    interface Lane { readonly taskId: string; readonly worktree: string; readonly branch: string }
+    /** Hold a Codex implementer, then start `others` Antigravity implementers that each commit inside the scope. */
+    const alongside = async (others: number) => {
+      const harness = await isolated()
+      await harness.update({ teamSize: others + 1 })
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      const held = (await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })).activations as Lane[]
+      harness.agentSideEffect = (cwd) => {
+        writeFileSync(join(cwd, 'tracked.txt'), `implemented in ${cwd}\n`)
+        git(cwd, 'commit', '-qam', 'inside')
+      }
+      const ended: Lane[] = []
+      for (let index = 0; index < others; index++) {
+        const [lane] = (await delegate(harness, { role: 'implementer', provider: 'antigravity', writeScope: ['tracked.txt'] })).activations as Lane[]
+        if (lane === undefined) throw new Error('no lane started')
+        await expect.poll(() => harness.status().tasks.find(task => task.id === lane.taskId)?.state).toBe('completed')
+        ended.push(lane)
+      }
+      const outcomeOfHeld = async () => {
+        release.resolve(undefined)
+        return (await settled(harness)).find(task => task.id === held[0]?.taskId)
+      }
+      return { harness, ended, outcomeOfHeld }
+    }
+    /** Move a lane's branch to a commit that adds a protected file, as the held implementer could. */
+    const moveOutside = (lane: Lane): void => {
+      mkdirSync(join(lane.worktree, '.github'))
+      writeFileSync(join(lane.worktree, '.github', 'x'), 'outside\n')
+      git(lane.worktree, 'add', '.github/x')
+      git(lane.worktree, 'commit', '-qm', 'outside')
+    }
+
+    it('fails the implementer that moved the branch of a lane after that lane ended', async () => {
+      const { ended: [lane], outcomeOfHeld } = await alongside(1)
+      if (lane === undefined) throw new Error('no lane ended')
+      moveOutside(lane)
+      expect(await outcomeOfHeld()).toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${lane.branch}` })
+    })
+
+    it('does not blame it for the commits lanes made on their own branches before they ended, however many end meanwhile', async () => {
+      const { ended, outcomeOfHeld } = await alongside(2)
+      expect(ended).toHaveLength(2)
+      expect(await outcomeOfHeld()).toMatchObject({ state: 'completed' })
+    })
+
+    it('does not blame it for the branch the Host removed with a lane that left nothing behind', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      // Both worktrees exist before either run starts, so the held run sees the other lane's branch at its start.
+      const lanes = (await delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] })).activations as (Lane & { provider: string })[]
+      const other = lanes.find(lane => lane.provider === 'antigravity')
+      await expect.poll(() => harness.status().tasks.find(task => task.id === other?.taskId)?.state).toBe('completed')
+      expect(git(harness.repo, 'branch', '--list', other?.branch ?? '')).toBe('')
+      release.resolve(undefined)
+      expect((await settled(harness)).map(task => task.state)).toEqual(['completed', 'completed'])
+    })
+
+    it('fails the implementer that moved the branch of a lane already checked but not yet released', async () => {
+      const harness = await isolated()
+      await harness.update({ teamSize: 2 })
+      const release = Promise.withResolvers<undefined>()
+      harness.hold = release.promise
+      const [held] = (await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })).activations as Lane[]
+      harness.agentSideEffect = (cwd) => {
+        writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+        git(cwd, 'commit', '-qam', 'inside')
+      }
+      // The release of the other lane, which inspects its worktree after its check, waits until the held run is settled.
+      const reached = Promise.withResolvers<undefined>()
+      const settledHeld = Promise.withResolvers<undefined>()
+      harness.gitGate = (args) => {
+        if (!args.includes('status') || args.some(arg => arg.includes(held?.worktree ?? '\0'))) return undefined
+        reached.resolve(undefined)
+        return settledHeld.promise
+      }
+      const [lane] = (await delegate(harness, { role: 'implementer', provider: 'antigravity', writeScope: ['tracked.txt'] })).activations as Lane[]
+      if (lane === undefined) throw new Error('no lane started')
+      await reached.promise
+      moveOutside(lane)
+      release.resolve(undefined)
+      await expect.poll(() => harness.status().tasks.find(task => task.id === held?.taskId)?.state).not.toBe('active')
+      settledHeld.resolve(undefined)
+      expect((await settled(harness)).find(task => task.id === held?.taskId))
+        .toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${lane.branch}` })
+    })
+  })
 })
 
 describe('Toranja admission of a writer', () => {

@@ -861,6 +861,35 @@ describe('Toranja routed delegation', () => {
     expect(tasks[0]).toMatchObject({ state: 'failed', error: 'execute role changed Git state that hides file changes' })
   })
 
+  it('does not read a large hidden file whole, and still catches it rewritten at the same size with its time put back', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await harness.setMode({ mode: 'codex' })
+    // Larger than the 5 MiB read by content.
+    const size = 5 * 1024 * 1024 + 1
+    writeFileSync(join(harness.repo, 'large.bin'), Buffer.alloc(size, 'a'))
+    gitIn(harness.repo, 'add', 'large.bin')
+    gitIn(harness.repo, 'commit', '-q', '-m', 'large')
+    gitIn(harness.repo, 'update-index', '--skip-worktree', 'large.bin')
+    // A whole second, which the platform puts back exactly; only the change time then tells the rewrite apart.
+    const time = 1_700_000_000
+    utimesSync(join(harness.repo, 'large.bin'), time, time)
+    const rewritten = Buffer.alloc(size, 'b')
+    harness.agentSideEffect = (cwd) => {
+      const file = join(cwd, 'large.bin')
+      writeFileSync(file, rewritten)
+      utimesSync(file, time, time)
+    }
+    const alloc = vi.spyOn(Buffer, 'alloc')
+    try {
+      await delegate(harness, { role: 'tester' })
+      const tasks = await settled(harness)
+      expect(tasks[0]).toMatchObject({ state: 'failed', error: 'execute role changed Git state that hides file changes' })
+      expect(alloc.mock.calls.filter(([length]) => length >= size)).toEqual([])
+    } finally {
+      alloc.mockRestore()
+    }
+  })
+
   it('catches a file Git ignores rewritten at the same size with its time put back', async () => {
     const harness = await mount({ routing: ROUTING })
     const secrets = join(harness.repo, '.env')

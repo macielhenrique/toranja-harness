@@ -120,8 +120,6 @@ const GIT_TIMEOUT_MS = 60_000
 const GIT_FILE_LIMIT = 1024 * 1024
 /** Most entries of a Git directory's `hooks/` a reading compares; past it the reading fails. */
 const HOOKS_LIMIT = 256
-/** Most ended implementer lanes remembered for the write-scope checks still running. */
-const LANE_HISTORY = 256
 /** Flags that open a file without following a link or waiting on a pipe; the typings list flags Windows does not define. */
 const { O_NOFOLLOW = 0, O_NONBLOCK = 0 } = constants as Partial<typeof constants>
 const READ_FLAGS = constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK
@@ -1135,9 +1133,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const hidden = index.toString('utf8').split('\0').filter(entry => /^[a-zS] /u.test(entry))
       const state = createHash('sha256').update(filters.names.join('\0')).update('\0\0')
       for (const entry of hidden) {
-        // Only a regular file is read: a pipe put in its place would hold the Host.
-        const read = await readEntry(join(cwd, entry.slice(2)), Infinity)
-        const content = read === undefined ? 'missing' : read.hash ?? `not-a-file:${read.entry.size}:${read.entry.mtimeMs}`
+        // Only a regular file up to the size limit is read: a pipe put in its place would hold the Host.
+        const read = await readEntry(join(cwd, entry.slice(2)), UNTRACKED_CONTENT_LIMIT)
+        const content = read === undefined ? 'missing' : read.hash ?? `not-read:${read.entry.size}:${read.entry.mtimeMs}:${read.entry.ctimeMs}`
         state.update(`${entry}\0${content}\0`)
       }
       return {
@@ -1218,25 +1216,45 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (own !== '') files.set(`${own}/config.worktree`, await gitFileFacts(join(gitDir, 'config.worktree')))
     return files
   }
-  /** Lane branches by when their lane stopped being in use, on {@link laneClock}; `undefined` while in use. */
-  const laneEnds = new Map<string, number | undefined>()
+  /** Lane branches in use: their own write-scope check has not read them yet, so their own run answers for them. */
+  const lanesInUse = new Set<string>()
+  /**
+   * Lane branches no longer in use: the tip their own check read (`undefined`
+   * when the branch was gone), where the lane started, and when it ended on
+   * {@link laneClock}. Kept while a check that began before it is still running.
+   */
+  const laneTips = new Map<string, { readonly tip: string | undefined; readonly base: string | undefined; readonly ended: number }>()
+  /** Write-scope checks not yet made or dropped, with when each began on {@link laneClock}. */
+  const checksRunning = new Map<object, number>()
   let laneClock = 0
-  /** Whether a lane branch was in use at any moment after `since`, so its own run, not another, answers for it. */
-  const laneBusySince = (ref: string, since: number): boolean => laneEnds.has(ref) && (laneEnds.get(ref) ?? Infinity) > since
-  /** Mark a lane branch no longer in use, keeping only the {@link LANE_HISTORY} that ended last. */
-  const endLane = (ref: string): void => {
-    // Moved to the end, so the entries are in the order their lanes ended.
-    laneEnds.delete(ref)
-    laneEnds.set(ref, ++laneClock)
-    // shortcut: a check running since before a dropped lane ended blames its run for that branch; raise LANE_HISTORY past that many.
-    let ended = [...laneEnds.values()].filter(end => end !== undefined).length
-    for (const [key, end] of laneEnds) {
-      if (ended <= LANE_HISTORY) break
-      if (end !== undefined) {
-        laneEnds.delete(key)
-        ended--
-      }
-    }
+  const endLane = (ref: string, tip: string | undefined, base: string | undefined): void => {
+    lanesInUse.delete(ref)
+    laneTips.set(ref, { tip, base, ended: ++laneClock })
+  }
+  /** End a lane its own check never read, at the tip its branch has now. */
+  const endUnchecked = async (project: ResolvedProject, ref: string, base: string | undefined): Promise<void> => {
+    if (!lanesInUse.has(ref)) return
+    const tip = await gitOutput(project.path, ['rev-parse', '--verify', '-q', ref])
+    if (lanesInUse.has(ref)) endLane(ref, tip?.toString('utf8').trim(), base)
+  }
+  /** Forget a check that was made or will never be, and every ended lane no running check began before. */
+  const endCheck = (check: object): void => {
+    checksRunning.delete(check)
+    const oldest = Math.min(...checksRunning.values())
+    for (const [ref, { ended }] of laneTips) if (ended <= oldest) laneTips.delete(ref)
+  }
+  /**
+   * Whether a check that began at `since` blames its run for a changed ref
+   * whose final value is `now`. A lane in use answers for its own
+   * branch; one that ended during the check, only up to the tip its own
+   * check read, or for its removal when that tip is where it started, as the
+   * Host then deletes it; one that ended before, never.
+   */
+  const laneBlames = (ref: string, now: string | undefined, since: number): boolean => {
+    if (lanesInUse.has(ref)) return false
+    const lane = laneTips.get(ref)
+    if (lane === undefined || lane.ended <= since) return true
+    return now !== lane.tip && !(now === undefined && lane.tip === lane.base)
   }
   /**
    * Read what a write-scope check compares, with the same precautions as the
@@ -1353,19 +1371,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     ])
     // A worktree's reading goes through the Git directory recorded for it, so its `.git` entry is compared directly.
     const pointer = async (): Promise<string | undefined> => lane === undefined ? undefined : await gitFileFacts(join(lane.path, '.git'))
-    const lanesSince = laneClock
     const pointerBefore = await pointer()
+    // Registered before the refs are read, so every lane that ends from here on stays remembered until this check is over.
+    const since = laneClock
+    const reading = {}
+    checksRunning.set(reading, since)
     const before = await read()
-    if (before === undefined) return () => Promise.resolve(unreadable)
-    return async () => {
+    if (before === undefined) {
+      endCheck(reading)
+      return () => Promise.resolve(unreadable)
+    }
+    const compare = async (): Promise<string | undefined> => {
       const relocated = await locate()
       if (relocated === undefined) return unreadable
       if (relocated !== located || await pointer() !== pointerBefore) return `${role} changed the Git directory`
       const after = await read()
       if (after === undefined) return unreadable
+      if (lane !== undefined) {
+        // From here another run that moves this lane's branch answers for it.
+        const own = `refs/heads/${lane.branch}`
+        endLane(own, after.refs.get(own), lane.base)
+      }
       const gitState = changedKeys(before.gitFiles, after.gitFiles)
       if (gitState.length > 0) return `${role} changed Git configuration or hooks: ${listed(gitState)}`
-      const refs = changedKeys(before.refs, after.refs).filter(ref => !ownRefs.has(ref) && !laneBusySince(ref, lanesSince))
+      const refs = changedKeys(before.refs, after.refs).filter(ref => !ownRefs.has(ref) && laneBlames(ref, after.refs.get(ref), since))
       if (refs.length > 0) return `${role} changed other branches or refs: ${listed(refs)}`
       const changed = new Set<string>()
       const linked = new Set<string>()
@@ -1423,6 +1452,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const outside = paths.filter(path => !scopeContains(writeScope, path, CASE_INSENSITIVE))
       return outside.length === 0 ? undefined : `${role} wrote outside the approved scope: ${listed(outside)}`
     }
+    const check = async (): Promise<string | undefined> => {
+      try {
+        return await compare()
+      } finally {
+        endCheck(check)
+      }
+    }
+    // Keyed by the check itself, so a run that never reaches it can drop it with {@link endCheck}.
+    checksRunning.delete(reading)
+    checksRunning.set(check, since)
+    return check
   }
   /** Start one routed delegation on the provider instance that enforces its route. */
   const launch = async (request: {
@@ -1470,6 +1510,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       },
       signal: request.signal,
       delivery: request.delivery,
+    }).catch((error: unknown) => {
+      // The run never started, so its check is never made.
+      endCheck(verify)
+      throw error
     })
     return { activation, providerName: instance, verify }
   }
@@ -1534,7 +1578,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // The lock names this process, so a later start can tell a worktree in use from one left behind.
       const owner = `toranja-orchestrator host=${hostname()} pid=${process.pid}`
       // From here the branch is in use, so a scope check running meanwhile does not blame its run for it.
-      laneEnds.set(`refs/heads/${branch}`, undefined)
+      lanesInUse.add(`refs/heads/${branch}`)
       const added = await gitOutput(
         project.path,
         ['worktree', 'add', '-q', '--lock', '--reason', owner, '-b', branch, path, 'HEAD'],
@@ -1559,7 +1603,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ctx.logger.warn(`toranja-orchestrator: worktree for project ${project.id} could not be created: ${String(error)}`)
       return undefined
     } finally {
-      if (lane === undefined && laneEnds.has(`refs/heads/${branch}`)) endLane(`refs/heads/${branch}`)
+      if (lane === undefined) await endUnchecked(project, `refs/heads/${branch}`, undefined)
     }
   }
   /**
@@ -1574,7 +1618,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const removed = await removeUntouched(lane)
     // A worktree that is kept is no longer in use, so the user can manage it with plain Git commands.
     if (!removed) await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
-    endLane(`refs/heads/${lane.branch}`)
+    await endUnchecked(lane.project, `refs/heads/${lane.branch}`, lane.base)
     return removed
   }
   const removeUntouched = async (lane: IsolatedLane): Promise<boolean> => {
@@ -1771,6 +1815,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     try {
       result = await run.activation.result
     } catch (error: unknown) {
+      // The run's outcome is unknown and it fails, so its check is never made.
+      endCheck(run.verify)
       return { run, error: error instanceof Error ? error.message : 'subagent result infrastructure failure' }
     }
     const violation = await run.verify()
