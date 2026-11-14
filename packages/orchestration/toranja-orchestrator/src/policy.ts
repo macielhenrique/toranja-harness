@@ -140,6 +140,10 @@ export interface ReservationRequest {
   readonly worktree?: string | undefined
   /** Branch of that worktree. */
   readonly branch?: string | undefined
+  /** Approved plan a writing task runs under. */
+  readonly planId?: string | undefined
+  /** Paths a writing task may change. */
+  readonly writeScope?: readonly string[] | undefined
 }
 
 interface MutableMetric {
@@ -172,6 +176,8 @@ interface MutableTask {
   error?: string
   worktree?: string
   branch?: string
+  planId?: string
+  writeScope?: readonly string[]
 }
 
 const freshMetric = (): MutableMetric => ({ active: 0, completed: 0, failed: 0 })
@@ -286,6 +292,8 @@ export class OrchestrationLedger {
         ...request.access === undefined ? {} : { access: request.access },
         ...request.worktree === undefined ? {} : { worktree: request.worktree },
         ...request.branch === undefined ? {} : { branch: request.branch },
+        ...request.planId === undefined ? {} : { planId: request.planId },
+        ...request.writeScope === undefined ? {} : { writeScope: [...request.writeScope] },
         state: 'active',
         startedAt,
       }

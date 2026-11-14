@@ -4,7 +4,7 @@
  * @module @deepseek-ai/dsh-toranja-orchestrator
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
 import { lstat, readFile, realpath, stat } from 'node:fs/promises'
@@ -22,13 +22,17 @@ import type {} from '@deepseek-ai/dsh-storage-domain'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { UserQuestionError, type AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions'
 import type {} from '@deepseek-ai/dsh-workspace'
 import {
   DEFAULT_CLASSIFICATION_RULES,
   canonicalProtectedPattern,
   classifyTask,
   normalizeWriteScope,
+  scopeContains,
+  scopeWithin,
   type ClassificationRules,
+  type TaskClassification,
   type TaskLevel,
 } from './classification.ts'
 import {
@@ -70,6 +74,7 @@ import {
 import type {
   ToranjaAgentMode,
   ToranjaAgentModeRequest,
+  ToranjaApprovalPolicy,
   ToranjaSettingsRequest,
   ToranjaConnectRequest,
   ToranjaConnectResult,
@@ -77,6 +82,7 @@ import type {
   ToranjaLegacyModeRequest,
   ToranjaExecutionProfile,
   ToranjaOrchestrationStatus,
+  ToranjaPlanStatus,
   ToranjaProviderId,
   ToranjaRoleAccess,
   ToranjaRoleRoute,
@@ -100,12 +106,28 @@ export const name = 'toranja-orchestrator'
 export const inject = ['storageDomain', 'subagents', 'subprocess', 'systemPrompt', 'tools', 'workspaceRegistry']
 
 const PROJECT_ID = /^[a-z][a-z0-9-]{1,31}$/
+const APPROVAL_POLICIES: readonly ToranjaApprovalPolicy[] = ['off', 'auto', 'always']
 const DEFAULT_MAX_TASK_CHARS = 12_000
 /** Largest untracked file compared by content; a larger one is compared by size and time. */
 const UNTRACKED_CONTENT_LIMIT = 5 * 1024 * 1024
 /** Bytes of untracked files read in one fingerprint; past it, the rest are compared by size and time. */
 const UNTRACKED_CONTENT_BUDGET = 64 * 1024 * 1024
 const GIT_GRACE_MS = 3_000
+/** Index and tree modes of a symbolic link and of a submodule. */
+const LINK_MODES = new Set(['120000', '160000'])
+/** Task levels from lowest to highest. */
+const TASK_LEVELS: readonly TaskLevel[] = ['simple', 'moderate', 'complex']
+/** Roles that only read, whose completed tasks count as investigation of a plan. */
+const READING_ROLES: ReadonlySet<Role> = new Set(['reader', 'searcher', 'inspector', 'planner', 'architect'])
+/** Most plans the status keeps; an approved plan is never dropped. */
+const PLAN_HISTORY = 24
+/** Option labels of the plan review put to the user. */
+const APPROVE_PLAN = 'Aprovar e executar'
+const REVISE_PLAN = 'Revisar o plano'
+/** Most paths a write-scope failure names. */
+const SCOPE_REPORT_LIMIT = 5
+/** Whether paths compare without regard to case, as the platform's default file system does. */
+const CASE_INSENSITIVE = process.platform === 'win32' || process.platform === 'darwin'
 
 /** Provider plugins Toranja can instantiate per route to fix model, effort, and access. */
 const VARIANT_PLUGINS = {
@@ -234,6 +256,12 @@ export interface Config {
     /** Protected path patterns; a write scope that touches one makes the task complex. */
     protectedPaths?: string[]
   }
+  /**
+   * When a writing role needs an approved plan and a write scope, until the
+   * user changes it: `off` (default) checks nothing, `auto` asks the user only
+   * for a complex plan, and `always` asks for every plan.
+   */
+  approvalPolicy?: ToranjaApprovalPolicy
 }
 
 export const Config: z<Config> = z.object({
@@ -287,6 +315,7 @@ export const Config: z<Config> = z.object({
     riskTerms: z.array(z.string()).default(undefined as never),
     protectedPaths: z.array(z.string()).default(undefined as never),
   }),
+  approvalPolicy: z.union(['off', 'auto', 'always'] as const).default('off'),
 })
 
 interface ResolvedProject extends ProjectConfig {
@@ -509,7 +538,32 @@ interface RoutedRequest {
   readonly strict?: boolean
   /** Worktree the run works in instead of the project's own tree. */
   readonly lane?: IsolatedLane
+  /** Paths a writing run may change, checked after it ran; absent while the approval policy is off. */
+  readonly writeScope?: readonly string[]
+  /** Approved plan the run works under. */
+  readonly planId?: string
 }
+
+/** What a write-scope check compares before and after a run. */
+interface ScopeSnapshot {
+  /** The checked-out commit, then the tip of the worktree's branch when there is one. */
+  readonly commits: readonly string[]
+  /** Index entries by path: flag, mode, object, and stage. */
+  readonly index: ReadonlyMap<string, string>
+  /** Changed, hidden, untracked, and ignored entries by path, compared as {@link entryFacts} reads them. */
+  readonly files: ReadonlyMap<string, string>
+}
+
+/** A submitted plan with the rules it was decided under. */
+interface PlanRecord extends ToranjaPlanStatus {
+  state: ToranjaPlanStatus['state']
+  decidedAt?: string
+  /** Classification rules and approval policy in force when the plan was decided. */
+  readonly rulesKey: string
+}
+
+/** NUL-separated Git output as a sorted list without empty entries. */
+const zList = (listing: Buffer): string[] => listing.toString('utf8').split('\0').filter(Boolean).sort()
 
 /** Git worktree and branch created for one implementer. */
 /** Worktree names this plugin creates: creation time and a sequence number, both in base 36. */
@@ -567,6 +621,7 @@ interface LiveSettings {
   readonly teamSize: number
   /** Tier models in force per provider: the user's over the deployment's. */
   readonly models: ReadonlyMap<RunProvider, ProviderModels>
+  readonly approvalPolicy: ToranjaApprovalPolicy
 }
 
 interface ProviderRouting {
@@ -661,7 +716,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     maxConcurrentTotal: Math.max(configuredLimits.maxConcurrentTotal, teamSize),
     maxConcurrentPerProject: teamSize,
     maxConcurrentPerProvider: Math.max(configuredLimits.maxConcurrentPerProvider, teamSize),
-    allowParallelImplementation: configuredLimits.allowParallelImplementation,
+    // While writes are checked against a scope, what each of two writers in one tree changed cannot be told apart.
+    allowParallelImplementation: configuredLimits.allowParallelImplementation && live().approvalPolicy === 'off',
   })
   // The deployment's own default team size is never above the limit it reports.
   const maxTeamSize = Math.max(
@@ -726,6 +782,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     crossReview: config.crossReview ?? true,
     teamSize: configuredLimits.maxConcurrentPerProject,
     models: modelsInForce(undefined),
+    approvalPolicy: config.approvalPolicy ?? 'off',
   } satisfies LiveSettings
   // The stored global is the only source of the live routing: every reader
   // resolves it over the deployment defaults, so a change is visible to
@@ -748,6 +805,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         // The deployment may have lowered the limit since the size was stored.
         teamSize: Math.min(stored.teamSize ?? defaults.teamSize, maxTeamSize),
         models: stored.tierModels === undefined ? defaults.models : storedModelsInForce(stored.tierModels),
+        approvalPolicy: stored.approvalPolicy ?? defaults.approvalPolicy,
       }
     }
     return resolved
@@ -890,10 +948,25 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    */
   const untrackedHash = async (cwd: string, untracked: Buffer, ignored: Buffer): Promise<string> => {
     const hash = createHash('sha256')
+    for (const [path, facts] of await entryFacts(cwd, [[zList(untracked), true], [zList(ignored), false]])) {
+      hash.update(`${path}\0${facts}\0`)
+    }
+    return hash.digest('hex')
+  }
+  /**
+   * Describe each entry of a working tree: a regular file listed by content
+   * by its content hash, any other entry by size, modification time, and
+   * change time. A file over the size limit, or past the reading budget, is
+   * described like an entry not read by content.
+   */
+  const entryFacts = async (
+    cwd: string,
+    groups: readonly (readonly [readonly string[], boolean])[],
+  ): Promise<[string, string][]> => {
     // One reading has a total budget too, so a tree full of untracked files does not stall every task.
     let budget = UNTRACKED_CONTENT_BUDGET
-    const list = (listing: Buffer): string[] => listing.toString('utf8').split('\0').filter(Boolean).sort()
-    for (const [paths, byContent] of [[list(untracked), true], [list(ignored), false]] as const) {
+    const described: [string, string][] = []
+    for (const [paths, byContent] of groups) {
       for (const path of paths) {
         const facts = await stat(join(cwd, path)).then(
           async (entry) => {
@@ -906,10 +979,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           },
           () => 'missing',
         )
-        hash.update(`${path}\0${facts}\0`)
+        described.push([path, facts])
       }
     }
-    return hash.digest('hex')
+    return described
   }
   /**
    * Overrides that switch off every content filter Git would apply in a
@@ -1027,6 +1100,127 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       return violation
     }
   }
+  /**
+   * Read what a write-scope check compares, with the same precautions as the
+   * working-tree fingerprint. Returns undefined when Git fails.
+   * @param scope - Git arguments selecting a worktree by its recorded Git directory.
+   * @param branch - Branch whose tip is compared besides the checked-out commit.
+   */
+  const readScope = async (cwd: string, scope: readonly string[], branch: string | undefined): Promise<ScopeSnapshot | undefined> => {
+    try {
+      const filters = await filtersOff(cwd, scope)
+      if (filters === undefined) return undefined
+      const off = filters.overrides
+      const [head, tip, changed, untracked, ignored, index] = await Promise.all([
+        gitOutput(cwd, [...scope, 'rev-parse', '--verify', 'HEAD']),
+        branch === undefined ? Promise.resolve(Buffer.alloc(0)) : gitOutput(cwd, [...scope, 'rev-parse', '--verify', `refs/heads/${branch}`]),
+        // A submodule would be inspected with its own configuration; its entry in the index is compared instead.
+        gitOutput(cwd, [...scope, 'diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', 'HEAD'], off),
+        gitOutput(cwd, [...scope, 'ls-files', '--others', '--exclude-standard', '-z'], off),
+        gitOutput(cwd, [...scope, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], off),
+        gitOutput(cwd, [...scope, 'ls-files', '-s', '-v', '-z'], off),
+      ])
+      if (
+        head === undefined || tip === undefined || changed === undefined
+        || untracked === undefined || ignored === undefined || index === undefined
+      ) {
+        return undefined
+      }
+      const entries = new Map<string, string>()
+      const hidden: string[] = []
+      for (const record of zList(index)) {
+        const tab = record.indexOf('\t')
+        const path = record.slice(tab + 1)
+        // A conflicted path has one entry per stage.
+        entries.set(path, `${entries.get(path) ?? ''}${record.slice(0, tab)};`)
+        // A file Git was told to skip is invisible to the diff above.
+        if (/^[a-zS] /u.test(record)) hidden.push(path)
+      }
+      const files = await entryFacts(cwd, [[zList(changed), true], [hidden, true], [zList(untracked), true], [zList(ignored), false]])
+      return {
+        commits: [head, tip].map(commit => commit.toString('utf8').trim()).filter(Boolean),
+        index: entries,
+        files: new Map(files),
+      }
+    } catch (error: unknown) {
+      ctx.logger.warn(`toranja-orchestrator: write scope could not be read in ${cwd}: ${String(error)}`)
+      return undefined
+    }
+  }
+  /**
+   * Capture a tree before a writing run. The returned check lists every path
+   * the run changed, through the working tree, the index, or a commit, and
+   * reports a link or submodule among them, or a path outside the write scope.
+   * Nothing is undone.
+   */
+  const guardScope = async (
+    cwd: string,
+    lane: IsolatedLane | undefined,
+    writeScope: readonly string[],
+    role: Role,
+  ): Promise<() => Promise<string | undefined>> => {
+    const unreadable = 'write scope could not be verified'
+    const scope = lane === undefined ? [] : [`--git-dir=${lane.gitDir}`, `--work-tree=${lane.path}`]
+    // Git can refuse for a moment while another command changes the repository, so a failed reading is tried once more.
+    const read = async (): Promise<ScopeSnapshot | undefined> =>
+      await readScope(cwd, scope, lane?.branch) ?? await readScope(cwd, scope, lane?.branch)
+    const before = await read()
+    if (before === undefined) return () => Promise.resolve(unreadable)
+    return async () => {
+      const after = await read()
+      if (after === undefined) return unreadable
+      const changed = new Set<string>()
+      const linked = new Set<string>()
+      const linkMode = (entry: string | undefined): boolean =>
+        entry !== undefined && entry.split(';').some(stage => LINK_MODES.has(stage.split(' ')[1] ?? ''))
+      for (const [was, is] of [[before.index, after.index], [before.files, after.files]] as const) {
+        for (const path of new Set([...was.keys(), ...is.keys()])) {
+          if (was.get(path) === is.get(path)) continue
+          changed.add(path)
+          if (linkMode(before.index.get(path)) || linkMode(after.index.get(path))) linked.add(path)
+        }
+      }
+      const base = before.commits[0]
+      for (const commit of new Set(after.commits)) {
+        if (base === undefined || commit === base) continue
+        const raw = await gitOutput(cwd, [...scope, 'diff', '--raw', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', base, commit])
+        if (raw === undefined) return unreadable
+        // Each change is a `:mode mode object object status` field followed by its path.
+        const fields = raw.toString('utf8').split('\0')
+        for (let index = 0; index + 1 < fields.length; index += 2) {
+          const path = fields[index + 1] ?? ''
+          changed.add(path)
+          if ((fields[index] ?? '').slice(1).split(' ').slice(0, 2).some(mode => LINK_MODES.has(mode))) linked.add(path)
+        }
+      }
+      const paths = [...changed].sort()
+      // Git may list the files under a directory link as if they were the
+      // project's own, so the path and each directory above it are looked at.
+      const isLink = new Map<string, Promise<boolean>>()
+      const linkOnDisk = async (path: string): Promise<string | undefined> => {
+        const segments = path.split('/').filter(Boolean)
+        for (const [index] of segments.entries()) {
+          const prefix = segments.slice(0, index + 1).join('/')
+          let pending = isLink.get(prefix)
+          if (pending === undefined) {
+            pending = lstat(join(cwd, prefix)).then(entry => entry.isSymbolicLink(), () => false)
+            isLink.set(prefix, pending)
+          }
+          if (await pending) return prefix
+        }
+        return undefined
+      }
+      for (const path of paths) {
+        if (linked.has(path)) return `${role} changed a link or submodule: ${path}`
+        const link = await linkOnDisk(path)
+        if (link !== undefined) return `${role} changed a link or submodule: ${link}`
+      }
+      const outside = paths.filter(path => !scopeContains(writeScope, path, CASE_INSENSITIVE))
+      if (outside.length === 0) return undefined
+      const more = outside.length - SCOPE_REPORT_LIMIT
+      return `${role} wrote outside the approved scope: ${outside.slice(0, SCOPE_REPORT_LIMIT).join(', ')}${more > 0 ? ` (and ${more} more)` : ''}`
+    }
+  }
   /** Start one routed delegation on the provider instance that enforces its route. */
   const launch = async (request: {
     readonly project: ResolvedProject
@@ -1038,6 +1232,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     readonly delivery: 'caller' | 'parent'
     /** Treat an unverifiable working tree as a failure instead of skipping the check. */
     readonly strict?: boolean
+    /** Worktree the run works in; `project.path` is then its path. */
+    readonly lane?: IsolatedLane
+    /** Paths a writing run may change; when set, they are checked instead of the role's access. */
+    readonly writeScope?: readonly string[]
   }): Promise<{ activation: SubagentActivation; providerName: string; verify: () => Promise<string | undefined> }> => {
     const instance = await instanceFor(request.route)
     const { route } = request
@@ -1047,7 +1245,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (route.provider === 'openrouter' && route.model === undefined) {
       throw new Error(`toranja-orchestrator: routing.openrouter.models has no model for the ${route.tier} tier`)
     }
-    const verify = await guardAccess(request.project, request.route.access, request.strict ?? false)
+    const verify = request.writeScope === undefined
+      ? await guardAccess(request.project, request.route.access, request.strict ?? false)
+      : await guardScope(request.project.path, request.lane, request.writeScope, route.role)
     const activation = await ctx.subagents.startActivation({
       provider: instance,
       label: request.label,
@@ -1070,7 +1270,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     })
     return { activation, providerName: instance, verify }
   }
-  const reservation = (project: ResolvedProject, route: ToranjaRoleRoute, label: string, lane?: IsolatedLane) => ({
+  const reservation = (
+    project: ResolvedProject,
+    route: ToranjaRoleRoute,
+    label: string,
+    lane?: IsolatedLane,
+    approval: { readonly planId?: string; readonly writeScope?: readonly string[] } = {},
+  ) => ({
     project: project.id,
     provider: route.provider,
     role: route.role,
@@ -1080,6 +1286,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     access: route.access,
     worktree: lane?.path,
     branch: lane?.branch,
+    planId: approval.planId,
+    writeScope: approval.writeScope,
   })
 
   const implementerWorktrees = config.implementerWorktrees ?? false
@@ -1312,7 +1520,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const route = routeFor(request.role, provider)
       try {
         lease ??= requiredAt(
-          ledger.reserveBatch([reservation(request.project, route, request.description, request.lane)]),
+          ledger.reserveBatch([reservation(request.project, route, request.description, request.lane, request)]),
           0,
           'delegation reservation',
         )
@@ -1326,6 +1534,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           signal: request.signal,
           delivery: request.delivery,
           ...request.strict === undefined ? {} : { strict: request.strict },
+          ...request.lane === undefined ? {} : { lane: request.lane },
+          ...request.writeScope === undefined ? {} : { writeScope: request.writeScope },
         })
         return { ...launched, route, lease, fallbackFrom, remaining: providers.slice(index + 1), request }
       } catch (error: unknown) {
@@ -1539,6 +1749,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       crossReview: live().crossReview,
       teamSize: live().teamSize,
       onboarded: domain.global.get().onboarded === true,
+      approvalPolicy: live().approvalPolicy,
+      classification: {
+        maxDirectFiles: classificationRules.maxDirectFiles,
+        maxInvestigatedFiles: classificationRules.maxInvestigatedFiles,
+      },
+      plans: [...plans.values()].reverse().map(({ rulesKey: _key, ...plan }) => ({ ...plan })),
       active: ledger.activeCount,
       limits: { ...limitsFor(live().teamSize), maxTeamSize },
       projects: lanes.map(project => ({ ...project, metrics: ledger.project(project.id) })),
@@ -1575,10 +1791,101 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (description.length > 80) throw new Error('delegate_project_task description exceeds 80 characters')
     return { project, description, task }
   }
+  /** Submitted plans by id, in submission order. */
+  const plans = new Map<string, PlanRecord>()
+  /** Key of the classification rules and approval policy in force; a plan decided under another key is stale. */
+  const rulesKey = (): string =>
+    createHash('sha256').update(JSON.stringify([classificationRules, live().approvalPolicy])).digest('hex')
+  /** Keep the newest plans, dropping the oldest ones that are no longer approved first. */
+  const recordPlan = (plan: PlanRecord): void => {
+    plans.set(plan.id, plan)
+    for (const [id, candidate] of plans) {
+      if (plans.size <= PLAN_HISTORY) break
+      if (candidate.state !== 'approved') plans.delete(id)
+    }
+  }
+  /** Files simple tasks wrote directly in each project since its last passing delivery gate. */
+  const directSpent = new Map<string, Set<string>>()
+  const fileKey = (path: string): string => CASE_INSENSITIVE ? path.toLowerCase() : path
+  /**
+   * Classify a task with its project's direct budget: a simple task whose
+   * files, together with those simple tasks wrote directly since the last
+   * passing gate, exceed `maxDirectFiles` is moderate.
+   */
+  const classifyScoped = (projectId: string, task: string, writeScope: readonly string[], raise?: TaskLevel): TaskClassification => {
+    const result = classifyTask({ task, writeScope, ...raise === undefined ? {} : { raise } }, classificationRules)
+    if (result.level !== 'simple') return result
+    const files = new Set([...directSpent.get(projectId) ?? [], ...writeScope.filter(entry => !entry.endsWith('/')).map(fileKey)])
+    if (files.size <= classificationRules.maxDirectFiles) return result
+    return { level: 'moderate', path: 'investigate', reasons: [...result.reasons, `direct budget of ${classificationRules.maxDirectFiles} files exceeded`] }
+  }
+  /** Whether a directory is the top level of a Git work tree with a commit, so its writes can be listed. */
+  const checkableTree = async (path: string): Promise<boolean> => {
+    try {
+      // The prefix line is empty only at the top level, and `--verify HEAD` fails without a commit.
+      return (await gitOutput(path, ['rev-parse', '--show-prefix', '--verify', 'HEAD']))?.toString('utf8').startsWith('\n') === true
+    } catch {
+      return false
+    }
+  }
+  /**
+   * Admit a writing role under the approval policy. While it is on, the
+   * write scope is required, the project must be a Git work tree the check
+   * can read, and the task needs an approved plan unless `auto` takes it as
+   * simple, in which case its files are spent from the direct budget.
+   * @returns The scope and plan the task runs under; empty while the policy is off or the role does not write.
+   */
+  const admitWrite = async (
+    project: ResolvedProject,
+    role: Role,
+    task: string,
+    rawScope: readonly string[] | undefined,
+    planId: string | undefined,
+  ): Promise<{ readonly writeScope?: readonly string[]; readonly planId?: string }> => {
+    const policy = live().approvalPolicy
+    if (policy === 'off' || roleAccess(role) !== 'write') return {}
+    if (rawScope === undefined) throw new Error(`writeScope is required for ${role} while the approval policy is ${policy}`)
+    const writeScope = normalizeWriteScope(rawScope)
+    if (!await checkableTree(project.path)) {
+      throw new Error(`project ${project.id} is not the top level of a Git work tree with a commit, so what ${role} writes cannot be checked; ${role} does not run there while the approval policy is ${policy}`)
+    }
+    // Nothing below awaits, so two delegations cannot both spend the same direct budget.
+    const { level, path, reasons } = classifyScoped(project.id, task, writeScope)
+    if (planId === undefined && policy === 'auto' && path === 'direct') {
+      const spent = directSpent.get(project.id) ?? new Set<string>()
+      for (const entry of writeScope) spent.add(fileKey(entry))
+      directSpent.set(project.id, spent)
+      return { writeScope }
+    }
+    const why = reasons.length === 0 ? level : `${level}: ${reasons.join('; ')}`
+    if (planId === undefined) {
+      throw new Error(`${role} needs an approved plan for this task (${why}); submit it with submit_project_plan and pass its planId`)
+    }
+    const plan = plans.get(planId)
+    if (plan === undefined) {
+      throw new Error(`plan ${JSON.stringify(planId)} does not exist; submit the plan with submit_project_plan and pass the planId it returns`)
+    }
+    if (plan.project !== project.id) throw new Error(`plan ${planId} belongs to project ${plan.project}, not ${project.id}; submit a plan for ${project.id}`)
+    if (plan.state === 'closed') throw new Error(`plan ${planId} was closed by a delivery gate that passed; submit a new plan`)
+    if (plan.state !== 'approved') throw new Error(`plan ${planId} was not approved: ${plan.error ?? plan.state}; revise it and submit it again`)
+    if (plan.rulesKey !== rulesKey()) throw new Error(`plan ${planId} was approved under other rules; submit it again`)
+    if (!scopeWithin(writeScope, plan.writeScope, CASE_INSENSITIVE)) {
+      throw new Error(`writeScope ${writeScope.join(', ')} goes beyond plan ${planId} (${plan.writeScope.join(', ')}); narrow it or submit a plan that covers it`)
+    }
+    if (TASK_LEVELS.indexOf(level) > TASK_LEVELS.indexOf(plan.level)) {
+      throw new Error(`the task is ${why}, above plan ${planId} approved as ${plan.level}; submit a plan at level ${level}`)
+    }
+    return { writeScope, planId }
+  }
   const startCodexAndWait = async (
     request: ToranjaCodexDelegationRequest,
   ): Promise<ToranjaCodexDelegationResult> => {
     assertProvidersAllowed(live().mode, ['codex'])
+    const policy = live().approvalPolicy
+    // This path carries no write scope or plan, so it cannot be held to them.
+    if (policy !== 'off' && roleAccess(request.role) === 'write') {
+      throw new Error(`toranja-orchestrator: delegate the ${request.role} with delegate_project_task while the approval policy is ${policy}`)
+    }
     const { project, description, task } = validateAssignment(request)
     const route = routeFor(request.role, 'codex')
     const [lease] = ledger.reserveBatch([reservation(project, route, description)])
@@ -1639,6 +1946,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const fallbackOrder = request.fallbackOrder === undefined || request.fallbackOrder.length === 0
       ? undefined
       : parseFallbackOrder(request.fallbackOrder)
+    // Remote input is untyped at run time, and the schema of the stored value would only reject it later.
+    if (request.approvalPolicy !== undefined && !APPROVAL_POLICIES.includes(request.approvalPolicy)) {
+      throw new Error(`toranja-orchestrator: approvalPolicy must be one of ${APPROVAL_POLICIES.join(', ')}`)
+    }
     if (request.teamSize !== undefined && positiveInteger('teamSize', request.teamSize) > maxTeamSize) {
       throw new Error(`toranja-orchestrator: teamSize must not exceed ${maxTeamSize}, the deployment's maxTeamSize`)
     }
@@ -1654,6 +1965,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ...request.teamSize === undefined ? {} : { teamSize: positiveInteger('teamSize', request.teamSize) },
       ...tierModels === undefined ? {} : { tierModels },
       ...request.onboarded === undefined ? {} : { onboarded: request.onboarded },
+      ...request.approvalPolicy === undefined ? {} : { approvalPolicy: request.approvalPolicy },
     }
     // Validate before storing. The live routing derives from the stored
     // value, so a failed write leaves the routing in force untouched.
@@ -1753,10 +2065,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         const project = findProject(args.project)
         if (project === undefined) throw new Error(`unknown Toranja project lane ${JSON.stringify(args.project)}`)
         const writeScope = normalizeWriteScope(args.writeScope)
-        const { level, path, reasons } = classifyTask(
-          { task: args.task, writeScope, ...args.level === undefined ? {} : { raise: args.level } },
-          classificationRules,
-        )
+        const { level, path, reasons } = classifyScoped(project.id, args.task, writeScope, args.level)
         const { maxDirectFiles, maxInvestigatedFiles } = classificationRules
         return JSON.stringify({
           project: project.id,
@@ -1771,6 +2080,108 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }))
 
   ctx.tools.register(defineTool({
+    name: 'submit_project_plan',
+    description: 'Submit the plan of a change before delegating its implementer while the approval policy is on. The host classifies the plan, checks the investigation evidence, and approves it by policy or asks the user. Delegate the implementer with the returned planId and a writeScope inside the plan\'s.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'Project lane id from list_project_lanes.' },
+      plan: { type: 'string', required: true, description: 'The complete plan as markdown, starting with a # heading that names it.' },
+      writeScope: { type: 'array', required: true, items: { type: 'string' }, description: 'Project-relative paths the implementation may change, as in classify_project_task.' },
+      evidenceTaskIds: { type: 'array', items: { type: 'string' }, description: 'taskIds of completed reader, searcher, inspector, planner, or architect tasks of this project. Required for a moderate or complex plan.' },
+      level: { type: 'string', enum: ['simple', 'moderate', 'complex'] satisfies TaskLevel[], description: 'Minimum level; it can only raise the classification.' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args, exec) {
+      const project = findProject(args.project)
+      if (project === undefined) throw new Error(`unknown Toranja project lane ${JSON.stringify(args.project)}`)
+      const text = args.plan.trim()
+      const title = /^#\s+(\S.*)$/mu.exec(text.split('\n', 1)[0] ?? '')?.[1]?.trim()
+      if (title === undefined) throw new Error('submit_project_plan requires a markdown plan starting with a # heading')
+      if (text.length > maxTaskChars) throw new Error(`submit_project_plan plan exceeds ${maxTaskChars} characters`)
+      const writeScope = normalizeWriteScope(args.writeScope)
+      const evidenceTaskIds = [...new Set((args.evidenceTaskIds ?? []).map(id => id.trim()))]
+      const { level, path, reasons } = classifyScoped(project.id, text, writeScope, args.level)
+      const policy = live().approvalPolicy
+      // The key is taken before any question, so a policy changed while the user decides makes the plan stale.
+      const key = rulesKey()
+      const plan: PlanRecord = {
+        id: randomUUID(),
+        project: project.id,
+        title,
+        level,
+        path,
+        reasons,
+        writeScope,
+        evidenceTaskIds,
+        state: 'rejected',
+        decidedBy: 'policy',
+        createdAt: new Date().toISOString(),
+        rulesKey: key,
+      }
+      const decide = (state: 'approved' | 'rejected', decidedBy: 'policy' | 'user', error?: string): string => {
+        Object.assign(plan, { state, decidedBy, decidedAt: new Date().toISOString() }, error === undefined ? {} : { error })
+        recordPlan(plan)
+        if (error !== undefined) throw new Error(`plan ${plan.id} rejected: ${error}`)
+        return JSON.stringify({ planId: plan.id, state, decidedBy, level, path, reasons, writeScope })
+      }
+      const tasks = ledger.tasks()
+      for (const id of evidenceTaskIds) {
+        const task = tasks.find(candidate => candidate.id === id)
+        if (task?.projectId !== project.id || !READING_ROLES.has(task.role) || task.state !== 'completed') {
+          return decide('rejected', 'policy', `evidence task ${id} is not a completed reading task of project ${project.id}; delegate a reader in this project first and pass its taskId`)
+        }
+      }
+      if (path !== 'direct' && evidenceTaskIds.length === 0) {
+        return decide('rejected', 'policy', `a ${level} plan needs investigation in evidenceTaskIds; delegate a reader in this project first and pass its taskId`)
+      }
+      if (policy === 'off' || (policy === 'auto' && path !== 'approve')) return decide('approved', 'policy')
+      const interaction = ctx.get('userQuestions')
+      if (interaction === undefined) return decide('rejected', 'policy', 'no user-questions channel is available to approve the plan')
+      let answer: AskUserQuestionAnswer
+      try {
+        answer = await interaction.ask({
+          questions: [{
+            id: plan.id,
+            header: 'Aprovação do plano',
+            question: `Aprovar este plano para o projeto ${project.title}?`,
+            detail: [
+              text,
+              '',
+              '---',
+              `- Nível: ${level}`,
+              `- Motivos: ${reasons.length === 0 ? 'nenhum' : reasons.join('; ')}`,
+              `- Escopo de escrita: ${writeScope.join(', ')}`,
+              `- Evidências: ${evidenceTaskIds.length === 0 ? 'nenhuma' : evidenceTaskIds.join(', ')}`,
+            ].join('\n'),
+            options: [
+              { label: APPROVE_PLAN, description: 'O implementador pode alterar o escopo de escrita acima.' },
+              { label: REVISE_PLAN, description: 'O plano volta ao líder com o seu retorno.' },
+            ],
+            intent: { kind: 'plan-review', approve: APPROVE_PLAN, callId: exec.callId },
+          }],
+          ...exec.agent === undefined ? {} : { agent: exec.agent },
+          signal: exec.signal,
+        })
+      } catch (cause: unknown) {
+        // The turn itself ended: the plan is left undecided and the abort keeps its own failure.
+        if (exec.signal.aborted) throw cause
+        if (cause instanceof UserQuestionError && cause.code === 'ASK_CANCELLED') return decide('rejected', 'user', 'the user dismissed the plan review')
+        const reason = cause instanceof UserQuestionError ? cause.code : cause instanceof Error ? cause.message : String(cause)
+        return decide('rejected', 'policy', `the plan could not be put to the user (${reason})`)
+      }
+      const replies = answer.answers.filter(entry => entry.id === plan.id)
+      const reply = replies.length === 1 ? replies[0] : undefined
+      if (reply?.selected.length !== 1 || reply.selected[0] !== APPROVE_PLAN || reply.custom !== undefined) {
+        const feedback = reply?.custom ?? ''
+        return decide('rejected', 'user', feedback === '' ? 'the user did not approve the plan' : `the user did not approve the plan; their feedback: ${feedback}`)
+      }
+      return decide('approved', 'user')
+    },
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'delegate_project_task',
     description: 'Start a managed role-scoped task in one configured Toranja project. Select codex, antigravity, claude-code, openrouter, both, or all; both starts the first two connected providers and all starts every connected provider up to the team size, concurrently in the same project lane. Fan out only when independent answers materially improve confidence, because each provider spends its own credits. The tool returns immediately and normal subtask updates deliver results.',
     parameters: {
@@ -1779,6 +2190,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       provider: { type: 'string', enum: [...PROVIDERS], description: 'Provider choice. Omit to use the role default with automatic fallback.' },
       description: { type: 'string', required: true, description: 'Short 3-5 word label shown in the subtask UI.' },
       task: { type: 'string', required: true, description: 'Complete self-contained task and acceptance criteria.' },
+      writeScope: { type: 'array', items: { type: 'string' }, description: 'Project-relative paths the implementer may change, as in classify_project_task. Required for the implementer while the approval policy is on; the host fails the task when it changes anything else.' },
+      planId: { type: 'string', description: 'planId of an approved plan from submit_project_plan whose writeScope covers this one. Required for the implementer unless the policy is auto and the task is simple.' },
     },
     output: {
       schema: { type: 'string' },
@@ -1803,12 +2216,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (selected.length === 0) throw new Error('delegate_project_task: no connected provider is available')
       assertProvidersAllowed(live().mode, selected)
       const { project, description, task } = validateAssignment(args)
+      const approval = await admitWrite(project, role, task, args.writeScope, args.planId)
       // Each implementer gets a worktree of its own when the deployment asks for it.
       const lanes = await Promise.all(selected.map(() => role === 'implementer' ? isolate(project) : Promise.resolve(undefined)))
       let leases: ReservationLease[]
       try {
         leases = ledger.reserveBatch(selected.map((provider, index) =>
-          reservation(project, routeFor(role, provider), description, lanes[index])))
+          reservation(project, routeFor(role, provider), description, lanes[index], approval)))
       } catch (error: unknown) {
         for (const lane of lanes) if (lane !== undefined) await releaseLane(lane)
         throw error
@@ -1825,6 +2239,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           signal: exec.signal,
           delivery: 'parent',
           ...lane === undefined ? {} : { lane },
+          ...approval,
         }
       }
       const results = await Promise.all(selected.map(async (first, index) => {
@@ -1984,6 +2399,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }
       }))
       const passed = results.every(result => result.stopReason === 'completed' && result.verdict === 'pass')
+      if (passed) {
+        // The delivery is done: its plans are spent and simple tasks start a new budget.
+        const closedAt = new Date().toISOString()
+        for (const plan of plans.values()) {
+          if (plan.project === project.id && plan.state === 'approved') Object.assign(plan, { state: 'closed', decidedAt: closedAt })
+        }
+        directSpent.delete(project.id)
+      }
       let replan: Record<string, unknown> | undefined
       if (replanOnGateFailure && results.some(result => result.verdict === 'fail')) {
         // Evidence comes first and each part has its own budget, so a long
@@ -2045,6 +2468,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ctx.systemPrompt.section({
     name: 'toranja:orchestration',
     order: ctx.systemPrompt.getSectionOrder('TOOL_SUBAGENT'),
-    text: 'Toranja Harness manages named project lanes. Use `list_project_lanes` instead of guessing paths and `get_orchestration_status` before expensive parallel work. Use `delegate_project_task` so every child starts in the correct repository with an explicit role. The Toranja Agents panel is authoritative: Solo Codex permits only Codex, Solo Antigravity permits only Antigravity, and Team permits role-aware cross-provider collaboration. In Team mode, the primary agent remains responsible for reviewing and consolidating delegated results. Independent read-only work should start together. Use provider `both` only when independent cross-provider verification materially improves confidence; otherwise respect the selected routing mode to avoid duplicate credit use. Toranja write isolation rejects simultaneous implementers in the same worktree. For material multi-step deliveries, mirror the plan on the durable Team task board with dependencies and write scopes. Before reporting such work complete, call `run_delivery_gate`; report completion only when its decision is `ready`, and route a `not-ready` finding back to an implementer before running the gate again.',
+    text: 'Toranja Harness manages named project lanes. Use `list_project_lanes` instead of guessing paths and `get_orchestration_status` before expensive parallel work. Use `delegate_project_task` so every child starts in the correct repository with an explicit role. The Toranja Agents panel is authoritative: Solo Codex permits only Codex, Solo Antigravity permits only Antigravity, and Team permits role-aware cross-provider collaboration. In Team mode, the primary agent remains responsible for reviewing and consolidating delegated results. Independent read-only work should start together. Use provider `both` only when independent cross-provider verification materially improves confidence; otherwise respect the selected routing mode to avoid duplicate credit use. Toranja write isolation rejects simultaneous implementers in the same worktree. For material multi-step deliveries, mirror the plan on the durable Team task board with dependencies and write scopes. Before reporting such work complete, call `run_delivery_gate`; report completion only when its decision is `ready`, and route a `not-ready` finding back to an implementer before running the gate again. When the approval policy reported by `get_orchestration_status` is not `off`, call `classify_project_task` before implementing; when its path is `investigate` or `approve`, delegate a reader in the project first, then send the plan with `submit_project_plan`, its `writeScope`, and the reader `taskId` in `evidenceTaskIds`, and delegate the implementer with the returned `planId` and a `writeScope` inside the plan. Under the `auto` policy a simple task needs only its `writeScope`. The host refuses a delegation that skips these steps and fails an implementer that changes anything outside its scope.',
   })
 }

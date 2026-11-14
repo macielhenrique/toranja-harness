@@ -1,0 +1,514 @@
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
+import { MemoryMediaPool } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
+import { UserQuestionError } from '@deepseek-ai/dsh-user-questions'
+import { ROUTING, cleanup, delegate, gitRepo, mount, repos, runGate, settled, type Harness } from './harness.ts'
+
+afterEach(cleanup)
+
+const git = (cwd: string, ...args: string[]): string =>
+  execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', ...args], { cwd }).toString().trim()
+
+/** The settled task of the only delegation of a harness. */
+const outcome = async (harness: Harness): Promise<Record<string, unknown>> =>
+  (await settled(harness))[0] as unknown as Record<string, unknown>
+
+interface Question {
+  readonly id: string
+  readonly header: string
+  readonly question: string
+  readonly detail?: string
+  readonly options: readonly { readonly label: string }[]
+  readonly intent?: { readonly kind: string; readonly approve: string; readonly callId?: string }
+}
+interface Ask {
+  readonly questions: readonly Question[]
+  readonly agent: unknown
+  readonly signal: AbortSignal
+}
+
+/** A simulated `userQuestions` service that records each request and answers with `reply`. */
+function questions(reply: (request: Ask) => unknown): {
+  readonly asked: Ask[]
+  readonly service: { ask: (request: Ask) => Promise<unknown> }
+} {
+  const asked: Ask[] = []
+  return { asked, service: { ask: async (request) => { asked.push(request); return await Promise.resolve().then(() => reply(request)) } } }
+}
+/** The user's answer that picks the approving option. */
+const approving = (request: Ask): unknown => {
+  const [question] = request.questions
+  return { answers: [{ id: question?.id, selected: [question?.intent?.approve] }] }
+}
+
+const PLAN = '# Fix the typo\n\nChange tracked.txt.'
+
+function submit(
+  harness: Harness,
+  args: Record<string, unknown> = {},
+  signal = new AbortController().signal,
+): Promise<Record<string, unknown>> {
+  return harness.tool('submit_project_plan').execute({
+    project: 'demo',
+    plan: PLAN,
+    writeScope: ['tracked.txt'],
+    ...args,
+  }, { agent: {}, signal, callId: 'call-plan' }).then(text => JSON.parse(text) as Record<string, unknown>)
+}
+
+/** Run a completed reader in a project and return its task id. */
+async function investigate(harness: Harness, project = 'demo'): Promise<string> {
+  const result = await delegate(harness, { role: 'reader', project })
+  await settled(harness)
+  return (result.activations as { taskId: string }[])[0]?.taskId ?? ''
+}
+
+describe('Toranja approval policy', () => {
+  it('is off unless configured, and the status reports it with the classification limits and no plans', async () => {
+    const harness = await mount({ routing: ROUTING })
+    expect(harness.status()).toMatchObject({
+      approvalPolicy: 'off',
+      classification: { maxDirectFiles: 3, maxInvestigatedFiles: 10 },
+      plans: [],
+    })
+    expect((await mount({ routing: ROUTING, approvalPolicy: 'auto' })).status().approvalPolicy).toBe('auto')
+  })
+
+  it('stores a policy the user changes, keeps it after a restart, and rejects an unknown one', async () => {
+    const disk = new MemoryMediaPool()
+    const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    // A state stored before the field existed still loads.
+    await harness.setMode({ mode: 'codex' })
+    const older = await mount({ routing: ROUTING, approvalPolicy: 'auto' }, ['codex', 'antigravity'], disk)
+    expect(older.status()).toMatchObject({ mode: 'codex', approvalPolicy: 'auto' })
+    await older.update({ approvalPolicy: 'always' })
+    await expect(older.update({ approvalPolicy: 'sometimes' })).rejects.toThrow('approvalPolicy')
+    expect(older.status().approvalPolicy).toBe('always')
+    const restarted = await mount({ routing: ROUTING, approvalPolicy: 'auto' }, ['codex', 'antigravity'], disk)
+    expect(restarted.status().approvalPolicy).toBe('always')
+  })
+
+  it('leaves the implementer unchanged while the policy is off', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await delegate(harness, { role: 'implementer', task: 'delete the production database' })
+    expect((await settled(harness))[0]).toMatchObject({ role: 'implementer', state: 'completed' })
+  })
+
+  it('requires a write scope for the implementer while the policy is on', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    await expect(delegate(harness, { role: 'implementer' })).rejects.toThrow('writeScope is required for implementer while the approval policy is auto')
+    expect(harness.started).toEqual([])
+    expect(harness.status().tasks).toEqual([])
+  })
+
+  it('runs a simple implementer task directly and records its scope', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n') }
+    await delegate(harness, { role: 'implementer', writeScope: ['./tracked.txt'] })
+    expect(await outcome(harness)).toMatchObject({ state: 'completed', writeScope: ['tracked.txt'] })
+  })
+})
+
+describe('Toranja write-scope check in the project tree', () => {
+  const run = async (sideEffect: (cwd: string) => void, writeScope = ['tracked.txt'], before?: (repo: string) => void) => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    before?.(harness.repo)
+    harness.agentSideEffect = sideEffect
+    await delegate(harness, { role: 'implementer', writeScope })
+    return await outcome(harness)
+  }
+
+  it('fails an implementer that wrote outside its scope and lists at most five paths', async () => {
+    const task = await run((cwd) => {
+      writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+      for (const name of ['a', 'b', 'c', 'd', 'e', 'f', 'g']) writeFileSync(join(cwd, `${name}.txt`), name)
+    })
+    expect(task).toMatchObject({
+      state: 'failed',
+      error: 'implementer wrote outside the approved scope: a.txt, b.txt, c.txt, d.txt, e.txt (and 2 more)',
+    })
+  })
+
+  it('accepts a new file in a new directory when the scope names it', async () => {
+    const task = await run((cwd) => {
+      mkdirSync(join(cwd, 'src'))
+      writeFileSync(join(cwd, 'src', 'new.ts'), 'export {}\n')
+    }, ['src/new.ts'])
+    expect(task).toMatchObject({ state: 'completed' })
+  })
+
+  it('catches a file that was already changed before the run and is changed again outside the scope', async () => {
+    const task = await run(
+      (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), 'changed again by the implementer\n') },
+      ['other.txt'],
+      (repo) => { writeFileSync(join(repo, 'tracked.txt'), 'work of the user\n') },
+    )
+    expect(task).toMatchObject({ state: 'failed', error: 'implementer wrote outside the approved scope: tracked.txt' })
+  })
+
+  it('does not blame the implementer for changes that were there before it ran', async () => {
+    const task = await run(
+      (cwd) => { writeFileSync(join(cwd, 'other.txt'), 'implemented\n') },
+      ['other.txt'],
+      (repo) => {
+        writeFileSync(join(repo, 'tracked.txt'), 'work of the user\n')
+        writeFileSync(join(repo, 'notes.txt'), 'draft of the user\n')
+      },
+    )
+    expect(task).toMatchObject({ state: 'completed' })
+  })
+
+  it('catches a commit the implementer made outside its scope', async () => {
+    const task = await run((cwd) => {
+      writeFileSync(join(cwd, 'other.txt'), 'committed\n')
+      git(cwd, 'add', 'other.txt')
+      git(cwd, 'commit', '-q', '-m', 'outside')
+    })
+    expect(task).toMatchObject({ state: 'failed', error: 'implementer wrote outside the approved scope: other.txt' })
+  })
+
+  it('catches a link the implementer put in the index, even inside its scope', async () => {
+    const task = await run((cwd) => {
+      const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd, input: '/etc/passwd' }).toString().trim()
+      git(cwd, 'update-index', '--add', '--cacheinfo', `120000,${blob},inside.txt`)
+    }, ['inside.txt'])
+    expect(task).toMatchObject({ state: 'failed', error: 'implementer changed a link or submodule: inside.txt' })
+  })
+
+  it('catches a link the implementer created on disk, even inside its scope', async () => {
+    // A junction needs no privilege on Windows; elsewhere the type is ignored and a symbolic link is made.
+    const target = mkdtempSync(join(tmpdir(), 'toranja-link-target-'))
+    repos.push(target)
+    writeFileSync(join(target, 'file.txt'), 'outside the project\n')
+    const task = await run((cwd) => { symlinkSync(target, join(cwd, 'inside'), 'junction') }, ['inside', 'inside/file.txt'])
+    expect(task).toMatchObject({ state: 'failed', error: 'implementer changed a link or submodule: inside' })
+  })
+})
+
+describe('Toranja direct budget', () => {
+  it('asks for a plan once simple tasks together wrote more files than the direct limit, until a delivery gate passes', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    await delegate(harness, { role: 'implementer', writeScope: ['a.txt', 'b.txt'] })
+    await settled(harness)
+    expect(JSON.parse(await harness.tool('classify_project_task').execute(
+      { project: 'demo', task: 'add two files', writeScope: ['c.txt', 'd.txt'] },
+      { agent: {}, signal: new AbortController().signal },
+    ))).toMatchObject({ level: 'moderate', path: 'investigate', reasons: ['direct budget of 3 files exceeded'] })
+    await expect(delegate(harness, { role: 'implementer', writeScope: ['c.txt', 'd.txt'] }))
+      .rejects.toThrow('implementer needs an approved plan for this task (moderate: direct budget of 3 files exceeded)')
+    // The same files again do not spend the budget twice.
+    await delegate(harness, { role: 'implementer', writeScope: ['A.txt', 'b.txt'].map(path => process.platform === 'linux' ? path.toLowerCase() : path) })
+    await settled(harness)
+    expect(await runGate(harness)).toMatchObject({ passed: true })
+    await delegate(harness, { role: 'implementer', writeScope: ['c.txt', 'd.txt'] })
+    await settled(harness)
+  })
+})
+
+describe('Toranja plan submission', () => {
+  it('approves a simple plan by policy and lists it in the status', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    const result = await submit(harness)
+    expect(result).toEqual({
+      planId: expect.any(String) as unknown,
+      state: 'approved',
+      decidedBy: 'policy',
+      level: 'simple',
+      path: 'direct',
+      reasons: [],
+      writeScope: ['tracked.txt'],
+    })
+    expect(harness.status().plans).toEqual([expect.objectContaining({
+      id: result.planId,
+      project: 'demo',
+      title: 'Fix the typo',
+      state: 'approved',
+      decidedBy: 'policy',
+      evidenceTaskIds: [],
+      createdAt: expect.any(String) as unknown,
+    })])
+  })
+
+  it('refuses a plan without a heading and one for an unknown project', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    await expect(submit(harness, { plan: 'just do it' })).rejects.toThrow('starting with a # heading')
+    await expect(submit(harness, { project: 'nowhere' })).rejects.toThrow('unknown Toranja project lane "nowhere"')
+    expect(harness.status().plans).toEqual([])
+  })
+
+  it('rejects a moderate plan without investigation and approves it with a completed reader of the project', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    const writeScope = ['a.txt', 'b.txt', 'c.txt', 'd.txt']
+    await expect(submit(harness, { writeScope })).rejects.toThrow('delegate a reader in this project first and pass its taskId')
+    expect(harness.status().plans[0]).toMatchObject({ state: 'rejected', decidedBy: 'policy', level: 'moderate', error: expect.stringContaining('evidenceTaskIds') as unknown })
+    const reader = await investigate(harness)
+    expect(await submit(harness, { writeScope, evidenceTaskIds: [reader] })).toMatchObject({ state: 'approved', decidedBy: 'policy', level: 'moderate', path: 'investigate' })
+    expect(harness.status().plans[0]).toMatchObject({ state: 'approved', evidenceTaskIds: [reader] })
+  })
+
+  it('takes as evidence only a completed reading task of the same project', async () => {
+    const [demo, other] = [gitRepo(), gitRepo()]
+    const harness = await mount({
+      routing: ROUTING,
+      approvalPolicy: 'auto',
+      projects: [{ id: 'demo', title: 'Demo', path: demo }, { id: 'other', title: 'Other', path: other }],
+    })
+    const writeScope = ['a.txt', 'b.txt', 'c.txt', 'd.txt']
+    const elsewhere = await investigate(harness, 'other')
+    await delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'] })
+    const writer = (await settled(harness)).find(task => task.role === 'implementer')?.id ?? ''
+    harness.agentSideEffect = (cwd) => { writeFileSync(join(cwd, 'proof.txt'), 'written by a reader') }
+    const failed = await investigate(harness)
+    expect(harness.status().tasks.find(task => task.id === failed)).toMatchObject({ state: 'failed' })
+    for (const id of [elsewhere, writer, failed, 'toranja-missing']) {
+      await expect(submit(harness, { writeScope, evidenceTaskIds: [id] })).rejects.toThrow(`evidence task ${id} is not a completed reading task of project demo`)
+    }
+    expect(harness.status().plans.map(plan => plan.state)).toEqual(['rejected', 'rejected', 'rejected', 'rejected'])
+  })
+
+  it('puts a complex plan to the user and approves it only with the approving option', async () => {
+    const asker = questions(approving)
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
+    const reader = await investigate(harness)
+    const result = await submit(harness, { plan: '# Rotate the token\n\nReplace the token.', evidenceTaskIds: [reader] })
+    expect(result).toMatchObject({ state: 'approved', decidedBy: 'user', level: 'complex', path: 'approve', reasons: ['risk term "token"'] })
+    expect(asker.asked).toHaveLength(1)
+    const [question] = asker.asked[0]?.questions ?? []
+    expect(question).toMatchObject({
+      header: 'Aprovação do plano',
+      intent: { kind: 'plan-review', callId: 'call-plan' },
+      detail: expect.stringContaining('# Rotate the token') as unknown,
+    })
+    expect(question?.detail).toContain('risk term "token"')
+    expect(question?.detail).toContain('tracked.txt')
+    expect(question?.detail).toContain(reader)
+    expect(question?.options.map(option => option.label)).toContain(question?.intent?.approve)
+  })
+
+  it.each([
+    ['another option', (request: Ask) => ({ answers: [{ id: request.questions[0]?.id, selected: ['Revisar o plano'] }] }), 'the user did not approve the plan'],
+    ['the approving option with words of their own', (request: Ask) => ({ answers: [{ id: request.questions[0]?.id, selected: [request.questions[0]?.intent?.approve], custom: 'only after the backup' }] }), 'the user did not approve the plan; their feedback: only after the backup'],
+    ['an answer to another question', () => ({ answers: [{ id: 'other', selected: ['Aprovar e executar'] }] }), 'the user did not approve the plan'],
+  ])('rejects a complex plan when the user answers with %s', async (_name, reply, message) => {
+    const asker = questions(reply)
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
+    const reader = await investigate(harness)
+    await expect(submit(harness, { level: 'complex', evidenceTaskIds: [reader] })).rejects.toThrow(message)
+    expect(harness.status().plans[0]).toMatchObject({ state: 'rejected', decidedBy: 'user' })
+  })
+
+  it.each([
+    ['the user dismisses the review', () => { throw new UserQuestionError('cancelled', 'ASK_CANCELLED') }, 'the user dismissed the plan review'],
+    ['no answerer is connected', () => { throw new UserQuestionError('no answerer', 'NO_PROVIDER') }, 'the plan could not be put to the user (NO_PROVIDER)'],
+    ['the question fails', () => { throw new Error('the window closed') }, 'the plan could not be put to the user (the window closed)'],
+  ])('rejects a complex plan when %s', async (_name, reply, message) => {
+    const asker = questions(reply)
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
+    const reader = await investigate(harness)
+    await expect(submit(harness, { level: 'complex', evidenceTaskIds: [reader] })).rejects.toThrow(message)
+    expect(harness.status().plans[0]).toMatchObject({ state: 'rejected', error: expect.stringContaining(message) as unknown })
+  })
+
+  it('rejects a complex plan when no user-questions channel is available', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    const reader = await investigate(harness)
+    await expect(submit(harness, { level: 'complex', evidenceTaskIds: [reader] })).rejects.toThrow('no user-questions channel is available to approve the plan')
+    expect(harness.status().plans[0]).toMatchObject({ state: 'rejected', decidedBy: 'policy' })
+  })
+
+  it('passes on the abort of the turn without deciding the plan', async () => {
+    const turn = new AbortController()
+    const asker = questions(() => {
+      turn.abort()
+      throw new UserQuestionError('aborted', 'ASK_ABORTED')
+    })
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'always' }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
+    await expect(submit(harness, {}, turn.signal)).rejects.toThrow('aborted')
+    expect(harness.status().plans).toEqual([])
+  })
+
+  it('puts even a simple plan to the user when the policy is always', async () => {
+    const asker = questions(approving)
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'always' }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
+    expect(await submit(harness)).toMatchObject({ state: 'approved', decidedBy: 'user', level: 'simple' })
+    expect(asker.asked).toHaveLength(1)
+  })
+
+  it('keeps a bounded list of plans without dropping an approved one', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    const { planId } = await submit(harness)
+    for (let index = 0; index < 30; index++) {
+      await expect(submit(harness, { writeScope: ['a.txt', 'b.txt', 'c.txt', 'd.txt'] })).rejects.toThrow('needs investigation')
+    }
+    const { plans } = harness.status()
+    expect(plans).toHaveLength(24)
+    expect(plans.at(-1)).toMatchObject({ id: planId, state: 'approved' })
+  })
+})
+
+describe('Toranja implementer under an approved plan', () => {
+  /** Mount with a user who approves every plan, and a completed reader to offer as evidence. */
+  const approvedBy = async (config: Record<string, unknown> = {}) => {
+    const asker = questions(approving)
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto', ...config }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
+    const reader = await investigate(harness)
+    return { harness, asker, reader }
+  }
+
+  it('runs the implementer under an approved plan, inside a directory of its scope', async () => {
+    const { harness, reader } = await approvedBy()
+    const { planId } = await submit(harness, { writeScope: ['src/'], evidenceTaskIds: [reader] })
+    harness.agentSideEffect = (cwd) => {
+      mkdirSync(join(cwd, 'src', 'app'), { recursive: true })
+      writeFileSync(join(cwd, 'src', 'app', 'new.ts'), 'export {}\n')
+    }
+    const result = await delegate(harness, { role: 'implementer', writeScope: ['src/app/'], planId })
+    expect(result.activations).toHaveLength(1)
+    const tasks = await settled(harness)
+    expect(tasks.find(task => task.role === 'implementer')).toMatchObject({ state: 'completed', planId, writeScope: ['src/app/'] })
+  })
+
+  it('refuses a plan that does not exist, was rejected, or belongs to another project', async () => {
+    const [demo, other] = [gitRepo(), gitRepo()]
+    const asker = questions(request => ({ answers: [{ id: request.questions[0]?.id, selected: ['Revisar o plano'] }] }))
+    const harness = await mount({
+      routing: ROUTING,
+      approvalPolicy: 'auto',
+      projects: [{ id: 'demo', title: 'Demo', path: demo }, { id: 'other', title: 'Other', path: other }],
+    }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
+    const reader = await investigate(harness)
+    await expect(submit(harness, { level: 'complex', evidenceTaskIds: [reader] })).rejects.toThrow('the user did not approve the plan')
+    const rejected = harness.status().plans[0]?.id
+    const { planId: elsewhere } = await submit(harness, { project: 'other' })
+    await expect(delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId: 'no-such-plan' })).rejects.toThrow('plan "no-such-plan" does not exist')
+    await expect(delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId: rejected })).rejects.toThrow(`plan ${rejected} was not approved: the user did not approve the plan`)
+    await expect(delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId: elsewhere })).rejects.toThrow(`plan ${String(elsewhere)} belongs to project other, not demo`)
+    expect(harness.status().tasks.filter(task => task.role === 'implementer')).toEqual([])
+  })
+
+  it('refuses a scope wider than the plan and a task above the plan level', async () => {
+    const { harness, reader } = await approvedBy()
+    const { planId } = await submit(harness, { writeScope: ['a.txt', 'b.txt', 'c.txt', 'd.txt'], evidenceTaskIds: [reader] })
+    await expect(delegate(harness, { role: 'implementer', writeScope: ['a.txt', 'e.txt'], planId })).rejects.toThrow('goes beyond plan')
+    await expect(delegate(harness, { role: 'implementer', task: 'rotate the token', writeScope: ['a.txt'], planId }))
+      .rejects.toThrow(`the task is complex: risk term "token", above plan ${String(planId)} approved as moderate`)
+    expect(harness.started.filter(name => name.includes('~rw~'))).toEqual([])
+  })
+
+  it('refuses a plan approved before the policy changed', async () => {
+    const { harness } = await approvedBy()
+    const { planId } = await submit(harness)
+    await harness.update({ approvalPolicy: 'always' })
+    await expect(delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId })).rejects.toThrow('was approved under other rules; submit it again')
+  })
+
+  it('closes the approved plans of a project when its delivery gate passes', async () => {
+    const { harness, reader } = await approvedBy()
+    const { planId } = await submit(harness, { level: 'complex', evidenceTaskIds: [reader] })
+    await delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId })
+    await settled(harness)
+    expect(await runGate(harness)).toMatchObject({ passed: true })
+    expect(harness.status().plans[0]).toMatchObject({ id: planId, state: 'closed', decidedAt: expect.any(String) as unknown })
+    await expect(delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId })).rejects.toThrow('was closed by a delivery gate that passed')
+  })
+
+  it('keeps the plans open when the delivery gate does not pass', async () => {
+    const { harness, reader } = await approvedBy({ replanOnGateFailure: false })
+    const { planId } = await submit(harness, { level: 'complex', evidenceTaskIds: [reader] })
+    harness.answer = 'TORANJA_GATE: FAIL\nmissing tests'
+    expect(await runGate(harness)).toMatchObject({ passed: false })
+    expect(harness.status().plans[0]).toMatchObject({ id: planId, state: 'approved' })
+  })
+})
+
+describe('Toranja write-scope check in an implementer worktree', () => {
+  const isolated = async (config: Record<string, unknown> = {}) => {
+    const worktreeRoot = mkdtempSync(join(tmpdir(), 'toranja-worktrees-'))
+    repos.push(worktreeRoot)
+    return await mount({ routing: ROUTING, approvalPolicy: 'auto', implementerWorktrees: true, worktreeRoot, ...config })
+  }
+  const implementIn = async (
+    harness: Harness,
+    sideEffect: (cwd: string) => void,
+  ): Promise<{ task: Record<string, unknown>; worktree: string }> => {
+    harness.agentSideEffect = sideEffect
+    const result = await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })
+    const [run] = result.activations as { worktree: string }[]
+    return { task: await outcome(harness), worktree: run?.worktree ?? '' }
+  }
+
+  it('accepts a change inside the scope and keeps the worktree for review', async () => {
+    const harness = await isolated()
+    const { task, worktree } = await implementIn(harness, (cwd) => { writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n') })
+    expect(task).toMatchObject({ state: 'completed', worktree })
+  })
+
+  it.each([
+    ['a new file', (cwd: string) => { writeFileSync(join(cwd, 'other.txt'), 'outside\n') }],
+    ['a commit', (cwd: string) => {
+      writeFileSync(join(cwd, 'other.txt'), 'outside\n')
+      git(cwd, 'add', 'other.txt')
+      git(cwd, 'commit', '-q', '-m', 'outside')
+    }],
+    ['a commit left on the branch after stepping back', (cwd: string) => {
+      writeFileSync(join(cwd, 'other.txt'), 'outside\n')
+      git(cwd, 'add', 'other.txt')
+      git(cwd, 'commit', '-q', '-m', 'outside')
+      git(cwd, 'checkout', '-q', '--detach', 'HEAD~1')
+    }],
+  ])('fails %s outside the scope and keeps the worktree', async (_name, sideEffect) => {
+    const harness = await isolated()
+    const { task, worktree } = await implementIn(harness, sideEffect)
+    expect(task).toMatchObject({ state: 'failed', error: 'implementer wrote outside the approved scope: other.txt', worktree })
+    expect(existsSync(worktree)).toBe(true)
+  })
+
+  it('runs implementers side by side only in worktrees of their own', async () => {
+    const harness = await isolated({ allowParallelImplementation: true })
+    await harness.update({ teamSize: 3 })
+    const result = await delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] })
+    expect(result.activations).toHaveLength(2)
+    expect((await settled(harness)).map(task => task.state)).toEqual(['completed', 'completed'])
+  })
+})
+
+describe('Toranja writers while the approval policy is on', () => {
+  it('keeps a second implementer out of the project tree even when parallel implementation is allowed', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto', allowParallelImplementation: true, maxConcurrentPerProject: 3 })
+    await expect(delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] }))
+      .rejects.toThrow('write isolation prevents multiple implementers in project demo')
+    const release = Promise.withResolvers<undefined>()
+    harness.hold = release.promise
+    await delegate(harness, { role: 'implementer', provider: 'codex', writeScope: ['tracked.txt'] })
+    await expect(delegate(harness, { role: 'implementer', provider: 'antigravity', writeScope: ['tracked.txt'] }))
+      .rejects.toThrow('write isolation prevents multiple implementers in project demo')
+    release.resolve(undefined)
+    await settled(harness)
+    expect(harness.status().limits.allowParallelImplementation).toBe(false)
+  })
+
+  it('refuses the implementer in a project that is not a Git work tree', async () => {
+    const plain = mkdtempSync(join(tmpdir(), 'toranja-plain-'))
+    repos.push(plain)
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto', projects: [{ id: 'plain', title: 'Plain', path: plain }] })
+    await expect(delegate(harness, { project: 'plain', role: 'implementer', writeScope: ['a.txt'] }))
+      .rejects.toThrow('project plain is not the top level of a Git work tree with a commit')
+    expect(harness.started).toEqual([])
+  })
+
+  it('refuses a writing role through the direct Codex delegation', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    await expect(harness.ctx.toranjaOrchestrator.delegateCodex({
+      project: 'demo',
+      role: 'implementer',
+      description: 'implement',
+      task: 'do the work',
+      parent: {} as never,
+      signal: new AbortController().signal,
+    })).rejects.toThrow('delegate the implementer with delegate_project_task while the approval policy is auto')
+    expect(harness.started).toEqual([])
+  })
+})

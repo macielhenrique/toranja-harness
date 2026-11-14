@@ -39,6 +39,9 @@ function status(rest: Partial<ToranjaOrchestrationStatus> = {}): ToranjaOrchestr
     crossReview: true,
     teamSize: 2,
     onboarded: false,
+    approvalPolicy: 'off',
+    classification: { maxDirectFiles: 3, maxInvestigatedFiles: 10 },
+    plans: [],
     active: 0,
     limits: {
       maxConcurrentTotal: 4, maxConcurrentPerProject: 2, maxConcurrentPerProvider: 2, maxTeamSize: 3, allowParallelImplementation: false,

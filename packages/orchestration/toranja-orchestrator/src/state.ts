@@ -31,6 +31,7 @@ export const toranjaOrchestrationState = z.object({
   teamSize: z.number().int().positive().optional(),
   onboarded: z.boolean().optional(),
   tierModels: z.partialRecord(provider, z.partialRecord(z.enum(['light', 'advanced', 'max']), tierModel)).optional(),
+  approvalPolicy: z.enum(['off', 'auto', 'always']).optional(),
 })
 
 /** Stored orchestration state inferred from {@link toranjaOrchestrationState}. */

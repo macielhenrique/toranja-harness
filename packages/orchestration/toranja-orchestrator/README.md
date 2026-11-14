@@ -20,7 +20,7 @@ delegations that omit an explicit provider:
 
 The controller's `setMode` changes the routing mode, and `updateSettings`
 changes the execution profile, fallback order, provider per role, cross-review
-setting, team size, and tier models without naming the mode, so a client
+setting, team size, tier models, and approval policy without naming the mode, so a client
 holding an older snapshot does not undo a mode chosen meanwhile. Both store the
 fields the request names in the `toranja_orchestration` storage domain and
 change the live routing only after that write succeeds; a failed write rejects
@@ -128,7 +128,7 @@ The check detects a change and does not revert it. Its limits:
 
 ## Task classification
 
-`classify_project_task` predicts how a task will be classified, without starting agents. It takes `project`, `task`, `writeScope`, and an optional `level` that can only raise the result, and returns `level` (`simple`, `moderate`, or `complex`), `path` (`direct`, `investigate`, or `approve`), the `reasons` that fired, the normalized `writeScope`, and the `limits` in force. In this version the tool only answers a query: `delegate_project_task` and `run_delivery_gate` do not use the classification yet.
+`classify_project_task` predicts how a task will be classified, without starting agents. It takes `project`, `task`, `writeScope`, and an optional `level` that can only raise the result, and returns `level` (`simple`, `moderate`, or `complex`), `path` (`direct`, `investigate`, or `approve`), the `reasons` that fired, the normalized `writeScope`, and the `limits` in force. It counts the project's direct budget like a delegation does (see [Approval policy](#approval-policy)); the Host classifies again when a plan is submitted and when the implementer is delegated.
 
 The rules are deterministic and run on the Host. A task is `complex` when its text contains a risk term, its scope touches a protected path, its scope has any directory entry (including `./`, the whole project), or it lists more than `maxInvestigatedFiles` files. Otherwise it is `moderate` when it lists more than `maxDirectFiles` files, and `simple` when none of these holds. A directory always needs approval because it can hold protected paths its entry never names: `db/` holds `db/migrations/`, and `apps/web/` holds `apps/web/.env`; the reason reads `directory scope <entry> needs approval`.
 
@@ -137,6 +137,28 @@ The risk terms are stems matched at the start of a word. The task text is first 
 `writeScope` lists project-relative paths. An entry ending in `/` (or `/**`) is a directory and covers that directory by whole path segments, so `src/app/` does not cover `src/application/x.ts`. Any other entry is one file. `./` is the whole project. Paths are held in Unicode NFC. On every platform, absolute paths, `.` and `..` segments, wildcards other than the `/**` suffix, and segments Windows reads as another name are rejected: a segment that ends in a dot or a space, holds `:` or a control character, is a `~1`-style short name, or is a reserved device name such as `NUL` or `con.txt`. Scope containment compares without regard to case on Windows and macOS; a path that does not normalize is never contained.
 
 A protected path pattern without a `**/` prefix is anchored at the project root; with it, the pattern matches at any depth. A final `/` marks a directory, and a final `*` on the last segment matches a name prefix, so `**/.env*` matches `.env` and `apps/x/.env.prod`. Protected paths compare without regard to case on every platform, and a path that does not normalize counts as protected. A pattern must be written in its normal form (`/` separators, no leading `./`, no surrounding spaces); a pattern such as `.github\` or `./.github/` fails at load with the form to use.
+
+## Approval policy
+
+`approvalPolicy` decides what a writing role (`implementer`) needs before it starts. `off`, the default, changes nothing: `writeScope` and `planId` are ignored. `auto` and `always` turn on everything below; the bundle sets `auto`. The user changes the policy with `updateSettings({ approvalPolicy })`, stored like the other choices, and the status reports it with `classification` (`maxDirectFiles`, `maxInvestigatedFiles`) and the recent `plans`, newest first.
+
+While the policy is on, `delegate_project_task` for the implementer requires `writeScope` and classifies the task from its text and scope. Under `auto` a `simple` task runs at once and its files are spent from the project's direct budget; every other task, and every task under `always`, needs the `planId` of an approved plan. The plan must belong to the same project, be approved and not closed, have been decided under the classification rules and policy in force, cover the delegated `writeScope`, and have a level no lower than the task's. A refused delegation starts and reserves nothing.
+
+The direct budget counts the files that simple tasks wrote directly in a project since its last delivery gate that passed. A simple task whose files, together with those already spent, exceed `maxDirectFiles` is `moderate` (`direct budget of N files exceeded`). A gate whose decision is `ready` resets the budget and closes the project's approved plans.
+
+`submit_project_plan` takes `project`, a markdown `plan` starting with a `#` heading, `writeScope`, optional `evidenceTaskIds`, and an optional `level` that only raises the classification. The Host classifies the plan with the direct budget. A `moderate` or `complex` plan needs at least one piece of evidence, and every id given must be a completed `reader`, `searcher`, `inspector`, `planner`, or `architect` task of the same project still in the task history. A task that changed files it may not change settles as failed and does not count. Under `auto` a `simple` or `moderate` plan is approved by the policy and a `complex` one is put to the user; under `always` every plan is put to the user. The question goes through `userQuestions` with the `plan-review` intent, the plan, its level, reasons, write scope, and evidence. Only one answer to that question selecting exactly the approving option, without words of its own, approves it. Any other answer rejects the plan and returns the user's words, if any. No user-questions service, a question that fails (for example `NO_PROVIDER`, or a caller that is a child agent), or a dismissed review (`ASK_CANCELLED`) each reject it with its own reason; an aborted turn leaves the plan undecided. A rejected plan stays in the status with its `error`, and the tool fails with that reason.
+
+After an implementer runs, the Host lists every path it changed and fails the task when one lies outside its `writeScope` (`implementer wrote outside the approved scope: …`, naming at most five paths) or when one is a link or submodule (`implementer changed a link or submodule: …`). Nothing is undone, and a worktree with changes is kept as usual. In the project's tree the Host compares, before and after the run, the index entries, the content of tracked files changed against `HEAD`, of untracked files, and of files Git was told to skip, and the size and times of ignored entries, with the precautions of the working-tree check above; a commit adds the paths it changed. In an implementer worktree it compares the same through the worktree's recorded Git directory, and also the commits on the worktree's branch, so a commit left there after stepping back is seen. A path counts as a link when its index or commit mode is a link or submodule, or when it or a directory above it is a link on disk. A reading that fails twice fails the task with `write scope could not be verified`.
+
+Limits of the policy:
+
+- A write outside the project's work tree, including inside its Git directory, is not seen.
+- Ignored output counts as a change: an implementer whose build or tests create or remove entries Git ignores, such as `dist/` or a cache under `node_modules/`, fails unless its scope covers them. A change deep inside an ignored directory is not seen, as in the working-tree check.
+- Changes can be attributed only with one writer per tree: while the policy is on, two implementers never share the project's tree, even with `allowParallelImplementation`, which the status then reports as `false`; implementers in worktrees of their own still run side by side. A reader that writes during an implementer's run is blamed on the implementer.
+- The project must be the top level of a Git work tree with a commit; otherwise the implementer is refused.
+- Evidence proves that an investigation of the project finished, not what it was about.
+- Plans and the direct budget live in memory and are lost on restart, and the plan list is bounded like the task history; an approved plan is never dropped from it.
+- The process-local `ToranjaOrchestrator` service carries no scope or plan, so it refuses a writing role while the policy is on.
 
 ## Implementer worktrees
 

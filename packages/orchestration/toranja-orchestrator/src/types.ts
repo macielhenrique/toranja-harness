@@ -53,6 +53,15 @@ export type ToranjaReadOnlyEnforcement = 'sandbox' | 'permission-mode' | 'adviso
 
 /** Preferred provider per role; a role without an entry uses the built-in default. */
 export type ToranjaRoleProviders = Readonly<Partial<Record<ToranjaTaskRole, ToranjaProviderId>>>
+/**
+ * When the Host asks before a writing role runs: `off` never (writes are not
+ * scoped), `auto` lets a simple task run and approves a moderate plan with
+ * evidence by itself while a complex plan goes to the user, and `always` puts
+ * every plan to the user.
+ */
+export type ToranjaApprovalPolicy = 'off' | 'auto' | 'always'
+/** Lifecycle state of a submitted plan; a `closed` plan was spent by a delivery gate that passed. */
+export type ToranjaPlanState = 'approved' | 'rejected' | 'closed'
 /** Lifecycle state of a delegated project task. */
 export type ToranjaTaskState = 'active' | 'completed' | 'failed'
 
@@ -78,6 +87,8 @@ export interface ToranjaSettingsRequest {
   readonly tierModels?: Readonly<Partial<Record<ToranjaProviderId, ToranjaTierModels>>>
   /** Whether the user finished or dismissed the first-run setup. */
   readonly onboarded?: boolean
+  /** When a writing role needs an approved plan and when the user is asked. */
+  readonly approvalPolicy?: ToranjaApprovalPolicy
 }
 
 /** Request to change the routing mode, optionally together with other settings. */
@@ -168,6 +179,10 @@ export interface ToranjaTaskStatus {
   readonly worktree?: string
   /** Branch of that worktree, holding the implementer's changes. */
   readonly branch?: string
+  /** Approved plan a writing task ran under. */
+  readonly planId?: string
+  /** Project-relative paths a writing task was allowed to change, checked after it ran. */
+  readonly writeScope?: readonly string[]
   readonly state: ToranjaTaskState
   readonly startedAt: string
   readonly settledAt?: string
@@ -191,6 +206,17 @@ export interface ToranjaOrchestrationStatus {
   readonly teamSize: number
   /** Whether the user finished or dismissed the first-run setup. */
   readonly onboarded: boolean
+  /** When a writing role needs an approved plan and when the user is asked. */
+  readonly approvalPolicy: ToranjaApprovalPolicy
+  /** File limits of the task classification in force. */
+  readonly classification: {
+    /** Most files a simple task, or the direct work since the last passing gate, may write. */
+    readonly maxDirectFiles: number
+    /** Most files a moderate task may write. */
+    readonly maxInvestigatedFiles: number
+  }
+  /** Recent plans, newest first; held in memory only and bounded like `tasks`. */
+  readonly plans: readonly ToranjaPlanStatus[]
   readonly active: number
   readonly limits: {
     readonly maxConcurrentTotal: number
@@ -212,6 +238,30 @@ export interface ToranjaOrchestrationStatus {
    * until the search at start has finished.
    */
   readonly leftoverWorktrees?: readonly ToranjaLeftoverWorktree[]
+}
+
+/** One plan submitted with `submit_project_plan`. */
+export interface ToranjaPlanStatus {
+  readonly id: string
+  readonly project: string
+  /** Text of the plan's first `#` heading. */
+  readonly title: string
+  readonly level: 'simple' | 'moderate' | 'complex'
+  readonly path: 'direct' | 'investigate' | 'approve'
+  /** Classification rules that fired. */
+  readonly reasons: readonly string[]
+  /** Normalized project-relative paths the plan allows a writing role to change. */
+  readonly writeScope: readonly string[]
+  /** Completed reading tasks of the project offered as investigation. */
+  readonly evidenceTaskIds: readonly string[]
+  readonly state: ToranjaPlanState
+  /** Whether the Host's policy or the user made the decision. */
+  readonly decidedBy: 'policy' | 'user'
+  readonly createdAt: string
+  /** When the plan was approved or rejected; for a `closed` plan, when it was closed. */
+  readonly decidedAt?: string
+  /** Why the plan was rejected. */
+  readonly error?: string
 }
 
 /** An implementer worktree left by an earlier run, waiting for review, merge, or removal by hand. */
