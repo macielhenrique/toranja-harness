@@ -35,7 +35,16 @@ describe('normalizeWriteScope', () => {
 
   it.each([
     '.github./x', 'a/b ./c', 'a /b', '.env:stream', 'C:', 'GITHUB~1/x', 'nul', 'NUL', 'con.txt', 'src/Aux.tar.gz', 'com1', 'LPT9.log', 'CONIN$', 'conout$.txt', 'a\u0001b', 'a\nb',
+    'con .txt', 'src/nul  .tar.gz',
   ])('rejects the segment that Windows reads as another name in %j', (entry) => {
+    expect(() => normalizeWriteScope([entry])).toThrow(JSON.stringify(entry))
+  })
+
+  it.each(['.git', '.git/config', '.GIT/hooks/pre-commit', 'sub/.Git/x', '.git/'])('rejects the Git directory in %j', (entry) => {
+    expect(() => normalizeWriteScope([entry])).toThrow(JSON.stringify(entry))
+  })
+
+  it.each(['a​b.ts', 'src/‮evil.ts', 'a﻿b.ts'])('rejects an invisible format character in %j', (entry) => {
     expect(() => normalizeWriteScope([entry])).toThrow(JSON.stringify(entry))
   })
 
@@ -72,6 +81,11 @@ describe('scopeContains', () => {
   it('honors case sensitivity', () => {
     expect(scopeContains(['Src/'], 'src/a.ts', true)).toBe(true)
     expect(scopeContains(['Src/'], 'src/a.ts', false)).toBe(false)
+  })
+
+  it('folds case through upper case, so a long s matches s', () => {
+    expect(scopeContains(['src/'], 'ſrc/a.ts', true)).toBe(true)
+    expect(scopeContains(['src/'], 'ſrc/a.ts', false)).toBe(false)
   })
 
   it('compares NFC and NFD forms as the same name, in either direction', () => {
@@ -143,6 +157,24 @@ describe('isProtectedPath', () => {
     expect(isProtectedPath('.GitHub/ci.yml', ['.github/'])).toBe(true)
     expect(isProtectedPath('.github/ci.yml', ['.GitHub/'])).toBe(true)
     expect(isProtectedPath('APPS/.ENV', ['**/.env*'])).toBe(true)
+  })
+
+  it('folds case through upper case, so a long s matches s', () => {
+    expect(isProtectedPath('migrationſ/x.sql', ['**/migrations/'])).toBe(true)
+  })
+
+  it('normalizes each pattern as the configuration does', () => {
+    expect(isProtectedPath('.github/ci.yml', ['.github\\'])).toBe(true)
+    expect(isProtectedPath('.github/ci.yml', ['./.github/'])).toBe(true)
+    expect(isProtectedPath('db/migrations/1.sql', ['**/db//migrations/'])).toBe(true)
+  })
+
+  it('lets the whole-project pattern protect every path', () => {
+    expect(isProtectedPath('src/a.ts', ['./'])).toBe(true)
+  })
+
+  it.each(['../x', 'a/../b', '/etc/', 'a*b/c'])('lets the invalid pattern %j protect every path', (pattern) => {
+    expect(isProtectedPath('src/a.ts', [pattern])).toBe(true)
   })
 
   it('compares NFC and NFD forms as the same name', () => {
@@ -230,6 +262,13 @@ describe('classifyTask', () => {
   it('matches a term with a space across any run of spaces', () => {
     expect(classify('then rm   -rf build', ['src/a.ts']).reasons).toEqual(['risk term "rm -r"'])
     expect(classify('then rm\t-fr build', ['src/a.ts']).reasons).toEqual(['risk term "rm -f"'])
+  })
+
+  it('normalizes a configured term like the task text', () => {
+    const rules = { ...DEFAULT_CLASSIFICATION_RULES, riskTerms: ['deleteUser', 'pur​ge'] }
+    const run = (task: string) => classifyTask({ task, writeScope: ['src/a.ts'] }, rules).reasons
+    expect(run('deleteUser now')).toEqual(['risk term "deleteUser"'])
+    expect(run('purge the cache')).toEqual(['risk term "pur​ge"'])
   })
 
   it('matches a term with regular expression characters literally', () => {

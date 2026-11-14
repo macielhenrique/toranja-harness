@@ -1,8 +1,8 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, renameSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MemoryMediaPool } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
 import { UserQuestionError } from '@deepseek-ai/dsh-user-questions'
 import { ROUTING, cleanup, delegate, gitRepo, mount, repos, runGate, settled, type Harness } from './harness.ts'
@@ -178,6 +178,147 @@ describe('Toranja write-scope check in the project tree', () => {
     expect(task).toMatchObject({ state: 'failed', error: 'implementer changed a link or submodule: inside.txt' })
   })
 
+  it.each([
+    ['a hook', (cwd: string) => { writeFileSync(join(cwd, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\necho planted\n') }, 'implementer changed Git configuration or hooks: hooks/pre-commit'],
+    ['the configuration', (cwd: string) => { git(cwd, 'config', 'toranja.planted', 'yes') }, 'implementer changed Git configuration or hooks: config'],
+    ['the exclude file', (cwd: string) => { writeFileSync(join(cwd, '.git', 'info', 'exclude'), 'other.txt\n') }, 'implementer changed Git configuration or hooks: info/exclude'],
+    ['another branch', (cwd: string) => { git(cwd, 'branch', 'outro') }, 'implementer changed other branches or refs: refs/heads/outro'],
+    ['a tag', (cwd: string) => { git(cwd, 'tag', 'v9') }, 'implementer changed other branches or refs: refs/tags/v9'],
+  ])('fails an implementer that changed %s, even inside its scope', async (_name, sideEffect, error) => {
+    const task = await run((cwd) => {
+      writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+      sideEffect(cwd)
+    })
+    expect(task).toMatchObject({ state: 'failed', error })
+  })
+
+  it('fails an implementer that added a replacement object', async () => {
+    let replaced = ''
+    const task = await run((cwd) => {
+      replaced = git(cwd, 'rev-parse', 'HEAD')
+      git(cwd, 'update-ref', `refs/replace/${replaced}`, replaced)
+    })
+    expect(task).toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/replace/${replaced}` })
+  })
+
+  it('accepts a commit inside the scope on the branch the tree has checked out', async () => {
+    const task = await run((cwd) => {
+      writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+      git(cwd, 'commit', '-qam', 'inside')
+    })
+    expect(task).toMatchObject({ state: 'completed' })
+  })
+
+  it('fails an implementer that pointed the project at another Git directory', async () => {
+    const elsewhere = gitRepo()
+    const task = await run((cwd) => {
+      renameSync(join(cwd, '.git'), join(cwd, '.git-moved'))
+      writeFileSync(join(cwd, '.git'), `gitdir: ${join(elsewhere, '.git')}\n`)
+    })
+    expect(task).toMatchObject({ state: 'failed', error: 'implementer changed the Git directory' })
+  })
+
+  describe('with entries Git ignores', () => {
+    const ignoring = (repo: string): void => {
+      writeFileSync(join(repo, '.gitignore'), '.env\ndist/\nnode_modules/\n')
+      git(repo, 'commit', '-qam', 'ignore build output')
+      mkdirSync(join(repo, 'node_modules', 'x'), { recursive: true })
+      writeFileSync(join(repo, 'node_modules', 'x', 'i.js'), 'before\n')
+      writeFileSync(join(repo, '.env'), 'A=1\n')
+    }
+    const implementInScope = (cwd: string): void => {
+      mkdirSync(join(cwd, 'src'), { recursive: true })
+      writeFileSync(join(cwd, 'src', 'a.ts'), 'export {}\n')
+    }
+
+    it('does not count what the implementer wrote in them outside its scope', async () => {
+      const task = await run((cwd) => {
+        implementInScope(cwd)
+        mkdirSync(join(cwd, 'dist'))
+        writeFileSync(join(cwd, 'dist', 'out.js'), 'built\n')
+        writeFileSync(join(cwd, 'node_modules', 'x', 'i.js'), 'after\n')
+        writeFileSync(join(cwd, 'node_modules', 'new.js'), 'installed\n')
+      }, ['src/a.ts'], ignoring)
+      expect(task).toMatchObject({ state: 'completed' })
+    })
+
+    it('counts an ignored entry that is protected', async () => {
+      const task = await run((cwd) => {
+        implementInScope(cwd)
+        writeFileSync(join(cwd, '.env'), 'A=2\n')
+      }, ['src/a.ts'], ignoring)
+      expect(task).toMatchObject({ state: 'failed', error: 'implementer wrote outside the approved scope: .env' })
+    })
+
+    it('counts an ignored directory that holds a protected path anchored at the root', async () => {
+      const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto', classification: { protectedPaths: ['config/secrets/'] } })
+      writeFileSync(join(harness.repo, '.gitignore'), 'config/\n')
+      git(harness.repo, 'commit', '-qam', 'ignore the local configuration')
+      harness.agentSideEffect = (cwd) => {
+        implementInScope(cwd)
+        mkdirSync(join(cwd, 'config', 'secrets'), { recursive: true })
+        writeFileSync(join(cwd, 'config', 'secrets', 'key'), 'planted\n')
+      }
+      await delegate(harness, { role: 'implementer', writeScope: ['src/a.ts'] })
+      expect(await outcome(harness)).toMatchObject({ state: 'failed', error: 'implementer wrote outside the approved scope: config/' })
+    })
+
+    it('counts ignored entries when the implementer changed an ignore file', async () => {
+      const task = await run((cwd) => {
+        writeFileSync(join(cwd, '.gitignore'), '.env\ndist/\nnode_modules/\nsecret/\n')
+        mkdirSync(join(cwd, 'secret'))
+        writeFileSync(join(cwd, 'secret', 'x.sh'), 'planted\n')
+      }, ['.gitignore'], ignoring)
+      expect(task).toMatchObject({ state: 'failed', error: 'implementer wrote outside the approved scope: secret/' })
+    })
+
+    it('counts a new directory that ignores itself', async () => {
+      const task = await run((cwd) => {
+        implementInScope(cwd)
+        mkdirSync(join(cwd, 'lib'))
+        writeFileSync(join(cwd, 'lib', '.gitignore'), '*\n')
+        writeFileSync(join(cwd, 'lib', 'evil.js'), 'planted\n')
+      }, ['src/a.ts'], ignoring)
+      expect(task).toMatchObject({ state: 'failed', error: expect.stringContaining('implementer wrote outside the approved scope: lib/') as unknown })
+    })
+
+    it('does not take ignore rules from a file outside the repository', async () => {
+      const outside = mkdtempSync(join(tmpdir(), 'toranja-excludes-'))
+      repos.push(outside)
+      const excludes = join(outside, 'ignore')
+      writeFileSync(excludes, '')
+      const task = await run((cwd) => {
+        implementInScope(cwd)
+        writeFileSync(excludes, 'evil.js\n')
+        writeFileSync(join(cwd, 'evil.js'), 'planted\n')
+      }, ['src/a.ts'], (repo) => {
+        ignoring(repo)
+        git(repo, 'config', 'core.excludesFile', excludes.replaceAll('\\', '/'))
+      })
+      expect(task).toMatchObject({ state: 'failed', error: 'implementer wrote outside the approved scope: evil.js' })
+    })
+  })
+
+  it('fails the implementer, within the time limit, when a Git command of the check never ends', async () => {
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal)
+    // The Host stops a Git command after 60 seconds; the test shortens only that wait.
+    const timeouts = vi.spyOn(AbortSignal, 'timeout').mockImplementation(ms => realTimeout(ms === 60_000 ? 200 : ms))
+    try {
+      const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+      let hung = false
+      harness.gitGate = () => hung ? new Promise(() => {}) : undefined
+      harness.agentSideEffect = (cwd) => {
+        writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+        hung = true
+      }
+      await delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'] })
+      await expect.poll(() => harness.status().active, { timeout: 4_000 }).toBe(0)
+      expect(harness.status().tasks[0]).toMatchObject({ state: 'failed', error: 'write scope could not be verified' })
+    } finally {
+      timeouts.mockRestore()
+    }
+  })
+
   it('catches a link the implementer created on disk, even inside its scope', async () => {
     // A junction needs no privilege on Windows; elsewhere the type is ignored and a symbolic link is made.
     const target = mkdtempSync(join(tmpdir(), 'toranja-link-target-'))
@@ -188,23 +329,48 @@ describe('Toranja write-scope check in the project tree', () => {
   })
 })
 
+/** Delegate a simple implementer, wait for it, and return its task id. */
+async function implementDirect(harness: Harness, writeScope: string[]): Promise<string> {
+  const result = await delegate(harness, { role: 'implementer', writeScope })
+  await settled(harness)
+  return (result.activations as { taskId: string }[])[0]?.taskId ?? ''
+}
+
+/** The classification `classify_project_task` predicts for a task writing `writeScope`. */
+async function classify(harness: Harness, writeScope: string[]): Promise<Record<string, unknown>> {
+  return JSON.parse(await harness.tool('classify_project_task').execute(
+    { project: 'demo', task: 'add files', writeScope },
+    { agent: {}, signal: new AbortController().signal },
+  )) as Record<string, unknown>
+}
+
 describe('Toranja direct budget', () => {
   it('asks for a plan once simple tasks together wrote more files than the direct limit, until a delivery gate passes', async () => {
     const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
-    await delegate(harness, { role: 'implementer', writeScope: ['a.txt', 'b.txt'] })
-    await settled(harness)
-    expect(JSON.parse(await harness.tool('classify_project_task').execute(
-      { project: 'demo', task: 'add two files', writeScope: ['c.txt', 'd.txt'] },
-      { agent: {}, signal: new AbortController().signal },
-    ))).toMatchObject({ level: 'moderate', path: 'investigate', reasons: ['direct budget of 3 files exceeded'] })
+    await implementDirect(harness, ['a.txt', 'b.txt'])
+    expect(await classify(harness, ['c.txt', 'd.txt'])).toMatchObject({ level: 'moderate', path: 'investigate', reasons: ['direct budget of 3 files exceeded'] })
     await expect(delegate(harness, { role: 'implementer', writeScope: ['c.txt', 'd.txt'] }))
       .rejects.toThrow('implementer needs an approved plan for this task (moderate: direct budget of 3 files exceeded)')
     // The same files again do not spend the budget twice.
-    await delegate(harness, { role: 'implementer', writeScope: ['A.txt', 'b.txt'].map(path => process.platform === 'linux' ? path.toLowerCase() : path) })
-    await settled(harness)
-    expect(await runGate(harness)).toMatchObject({ passed: true })
-    await delegate(harness, { role: 'implementer', writeScope: ['c.txt', 'd.txt'] })
-    await settled(harness)
+    const implementation = await implementDirect(harness, ['A.txt', 'b.txt'].map(path => process.platform === 'linux' ? path.toLowerCase() : path))
+    expect(await runGate(harness, { implementationTaskId: implementation })).toMatchObject({ passed: true, budgetReset: true })
+    await implementDirect(harness, ['c.txt', 'd.txt'])
+  })
+
+  it('keeps the budget when the passing gate names no implementer', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    await implementDirect(harness, ['a.txt', 'b.txt'])
+    expect(await runGate(harness)).toMatchObject({ passed: true, budgetReset: false })
+    expect(await classify(harness, ['c.txt', 'd.txt'])).toMatchObject({ level: 'moderate' })
+  })
+
+  it('keeps the budget when the named implementer started before the last reset', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    const first = await implementDirect(harness, ['a.txt'])
+    expect(await runGate(harness, { implementationTaskId: first })).toMatchObject({ passed: true, budgetReset: true })
+    await implementDirect(harness, ['b.txt', 'c.txt'])
+    expect(await runGate(harness, { implementationTaskId: first })).toMatchObject({ passed: true, budgetReset: false })
+    expect(await classify(harness, ['d.txt', 'e.txt'])).toMatchObject({ level: 'moderate' })
   })
 })
 
@@ -273,18 +439,25 @@ describe('Toranja plan submission', () => {
     const asker = questions(approving)
     const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
     const reader = await investigate(harness)
-    const result = await submit(harness, { plan: '# Rotate the token\n\nReplace the token.', evidenceTaskIds: [reader] })
-    expect(result).toMatchObject({ state: 'approved', decidedBy: 'user', level: 'complex', path: 'approve', reasons: ['risk term "token"'] })
+    const plan = '# Rotate the token\n\nReplace the token.'
+    const writeScope = ['tracked.txt', 'docs/token.md', 'src/']
+    const result = await submit(harness, { plan, writeScope, evidenceTaskIds: [reader] })
+    expect(result).toMatchObject({ state: 'approved', decidedBy: 'user', level: 'complex', path: 'approve' })
     expect(asker.asked).toHaveLength(1)
     const [question] = asker.asked[0]?.questions ?? []
     expect(question).toMatchObject({
       header: 'Aprovação do plano',
+      question: 'Aprovar este plano complexo que escreve em 3 caminhos no projeto Demo?',
       intent: { kind: 'plan-review', callId: 'call-plan' },
-      detail: expect.stringContaining('# Rotate the token') as unknown,
     })
-    expect(question?.detail).toContain('risk term "token"')
-    expect(question?.detail).toContain('tracked.txt')
-    expect(question?.detail).toContain(reader)
+    // The decision comes first, so a long plan cannot push it out of view; the plan follows it.
+    const detail = question?.detail ?? ''
+    const planAt = detail.indexOf(plan)
+    expect(planAt).toBeGreaterThan(0)
+    for (const fact of ['Nível: complex', 'risk term "token"', 'directory scope src/ needs approval', 'docs/token.md, src/, tracked.txt', reader]) {
+      expect(detail.indexOf(fact), fact).toBeGreaterThanOrEqual(0)
+      expect(detail.indexOf(fact), fact).toBeLessThan(planAt)
+    }
     expect(question?.options.map(option => option.label)).toContain(question?.intent?.approve)
   })
 
@@ -335,6 +508,34 @@ describe('Toranja plan submission', () => {
     const harness = await mount({ routing: ROUTING, approvalPolicy: 'always' }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
     expect(await submit(harness)).toMatchObject({ state: 'approved', decidedBy: 'user', level: 'simple' })
     expect(asker.asked).toHaveLength(1)
+  })
+
+  it('puts a moderate plan to the user once plans the policy approved would pass the investigated limit', async () => {
+    const asker = questions(approving)
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
+    const six = (prefix: string) => Array.from({ length: 6 }, (_, index) => `${prefix}${index}.txt`)
+    expect(await submit(harness, { writeScope: six('a'), evidenceTaskIds: [await investigate(harness)] }))
+      .toMatchObject({ state: 'approved', decidedBy: 'policy', level: 'moderate' })
+    expect(await submit(harness, { writeScope: six('b'), evidenceTaskIds: [await investigate(harness)] })).toMatchObject({
+      state: 'approved',
+      decidedBy: 'user',
+      level: 'complex',
+      reasons: expect.arrayContaining(['investigated budget of 10 files exceeded']) as unknown,
+    })
+    expect(asker.asked).toHaveLength(1)
+    // A plan the user approved spends nothing: four more files still fit beside the first six.
+    expect(await submit(harness, { writeScope: six('c').slice(0, 4), evidenceTaskIds: [await investigate(harness)] }))
+      .toMatchObject({ state: 'approved', decidedBy: 'policy', level: 'moderate' })
+  })
+
+  it('takes each investigation as evidence for one plan only', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    const writeScope = ['a.txt', 'b.txt', 'c.txt', 'd.txt']
+    const reader = await investigate(harness)
+    const { planId } = await submit(harness, { writeScope, evidenceTaskIds: [reader] })
+    await expect(submit(harness, { writeScope, evidenceTaskIds: [reader] }))
+      .rejects.toThrow(`evidence task ${reader} already supports plan ${String(planId)}`)
+    expect(harness.status().plans[0]).toMatchObject({ state: 'rejected' })
   })
 
   it('keeps a bounded list of plans without dropping an approved one', async () => {
@@ -405,12 +606,15 @@ describe('Toranja implementer under an approved plan', () => {
     await expect(delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId })).rejects.toThrow('was approved under other rules; submit it again')
   })
 
-  it('closes the approved plans of a project when its delivery gate passes', async () => {
+  it('closes the approved plans of a project when its delivery gate passes for an implementer of the project', async () => {
     const { harness, reader } = await approvedBy()
     const { planId } = await submit(harness, { level: 'complex', evidenceTaskIds: [reader] })
-    await delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId })
+    const result = await delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId })
     await settled(harness)
-    expect(await runGate(harness)).toMatchObject({ passed: true })
+    expect(await runGate(harness)).toMatchObject({ passed: true, budgetReset: false })
+    expect(harness.status().plans[0]).toMatchObject({ id: planId, state: 'approved' })
+    const implementationTaskId = (result.activations as { taskId: string }[])[0]?.taskId
+    expect(await runGate(harness, { implementationTaskId })).toMatchObject({ passed: true, budgetReset: true })
     expect(harness.status().plans[0]).toMatchObject({ id: planId, state: 'closed', decidedAt: expect.any(String) as unknown })
     await expect(delegate(harness, { role: 'implementer', writeScope: ['tracked.txt'], planId })).rejects.toThrow('was closed by a delivery gate that passed')
   })
@@ -446,6 +650,26 @@ describe('Toranja write-scope check in an implementer worktree', () => {
     expect(task).toMatchObject({ state: 'completed', worktree })
   })
 
+  it('accepts a commit inside the scope on the worktree\'s own branch', async () => {
+    const harness = await isolated()
+    const { task } = await implementIn(harness, (cwd) => {
+      writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+      git(cwd, 'commit', '-qam', 'inside')
+    })
+    expect(task).toMatchObject({ state: 'completed' })
+  })
+
+  it('fails an implementer that moved another branch from its worktree', async () => {
+    const harness = await isolated()
+    const main = git(harness.repo, 'symbolic-ref', '--short', 'HEAD')
+    const { task } = await implementIn(harness, (cwd) => {
+      writeFileSync(join(cwd, 'tracked.txt'), 'implemented\n')
+      git(cwd, 'commit', '-qam', 'inside')
+      git(cwd, 'update-ref', `refs/heads/${main}`, 'HEAD')
+    })
+    expect(task).toMatchObject({ state: 'failed', error: `implementer changed other branches or refs: refs/heads/${main}` })
+  })
+
   it.each([
     ['a new file', (cwd: string) => { writeFileSync(join(cwd, 'other.txt'), 'outside\n') }],
     ['a commit', (cwd: string) => {
@@ -472,6 +696,49 @@ describe('Toranja write-scope check in an implementer worktree', () => {
     const result = await delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] })
     expect(result.activations).toHaveLength(2)
     expect((await settled(harness)).map(task => task.state)).toEqual(['completed', 'completed'])
+  })
+
+  it('does not blame one implementer for the commits another one made on its own branch meanwhile', async () => {
+    const harness = await isolated({ allowParallelImplementation: true })
+    await harness.update({ teamSize: 3 })
+    const release = Promise.withResolvers<undefined>()
+    harness.hold = release.promise
+    harness.agentSideEffect = (cwd) => {
+      writeFileSync(join(cwd, 'tracked.txt'), `implemented in ${cwd}\n`)
+      git(cwd, 'commit', '-qam', 'inside')
+    }
+    // Each run commits as it starts, while the other is already running and is held until both started.
+    const result = await delegate(harness, { role: 'implementer', provider: 'both', writeScope: ['tracked.txt'] })
+    expect(result.activations).toHaveLength(2)
+    release.resolve(undefined)
+    expect((await settled(harness)).map(task => task.state)).toEqual(['completed', 'completed'])
+  })
+})
+
+describe('Toranja admission of a writer', () => {
+  it('refuses a writer whose approval policy changed while its worktree was being made, and starts nothing', async () => {
+    const worktreeRoot = mkdtempSync(join(tmpdir(), 'toranja-worktrees-'))
+    repos.push(worktreeRoot)
+    const harness = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot })
+    harness.gitGate = args => args.includes('worktree') && args.includes('add') ? harness.update({ approvalPolicy: 'auto' }) : undefined
+    await expect(delegate(harness, { role: 'implementer', provider: 'codex' }))
+      .rejects.toThrow('the approval policy changed while the task was starting; delegate it again')
+    harness.gitGate = undefined
+    expect(harness.started).toEqual([])
+    expect(harness.status().tasks).toEqual([])
+    // The worktree made for it is given back.
+    expect(git(harness.repo, 'branch', '--list', 'toranja/*')).toBe('')
+  })
+
+  it('spends nothing from the direct budget when no agent starts', async () => {
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })
+    harness.offline.set('codex', 'quota exhausted')
+    harness.offline.set('antigravity', 'signed out')
+    await expect(delegate(harness, { role: 'implementer', writeScope: ['a.txt', 'b.txt', 'c.txt'] })).rejects.toThrow('no project agent started')
+    expect(JSON.parse(await harness.tool('classify_project_task').execute(
+      { project: 'demo', task: 'add a file', writeScope: ['d.txt'] },
+      { agent: {}, signal: new AbortController().signal },
+    ))).toMatchObject({ level: 'simple', reasons: [] })
   })
 })
 

@@ -66,6 +66,12 @@ export interface Harness {
   gitFailures: number
   /** Arguments of every Git command the orchestrator ran. */
   readonly gitRuns: string[][]
+  /**
+   * Called before each Git command; when it returns a promise, the command
+   * starts only after it resolves, and one that never resolves holds the
+   * command until its abort signal fires.
+   */
+  gitGate: ((args: readonly string[]) => Promise<unknown> | undefined) | undefined
 }
 
 export const repos: string[] = []
@@ -139,18 +145,30 @@ export async function mount(
     gitBroken: false,
     gitFailures: 0,
     gitRuns: [],
+    gitGate: undefined,
   }
   ctx.provide('subprocess', {
-    spawn: (spec: { argv: readonly string[]; cwd: string }) => {
+    spawn: (spec: { argv: readonly string[]; cwd: string; signal?: AbortSignal }) => {
       // The orchestrator runs Git by the absolute path it resolved from PATH.
       if (/(?:^|[\\/])git(?:\.exe)?$/iu.test(spec.argv[0] ?? '')) {
-        harness.gitRuns.push(spec.argv.slice(1))
+        const args = spec.argv.slice(1)
+        harness.gitRuns.push(args)
         const failing = harness.gitBroken || harness.gitFailures-- > 0
-        const child = spawn('git', failing ? ['not-a-git-command'] : spec.argv.slice(1), { cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+        const stdout = new PassThrough()
+        const stderr = new PassThrough()
         const done = new Promise<{ exitCode: number | null }>((resolve) => {
-          child.on('close', (exitCode) => { resolve({ exitCode }) })
+          // Like the real service, an abort ends the command.
+          spec.signal?.addEventListener('abort', () => { stdout.end(); stderr.end(); resolve({ exitCode: null }) }, { once: true })
+          void Promise.resolve(harness.gitGate?.(args)).then(() => {
+            if (spec.signal?.aborted === true) return
+            const child = spawn('git', failing ? ['not-a-git-command'] : args, { cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+            spec.signal?.addEventListener('abort', () => { child.kill() }, { once: true })
+            child.stdout.pipe(stdout)
+            child.stderr.pipe(stderr)
+            child.on('close', (exitCode) => { resolve({ exitCode }) })
+          })
         })
-        return { stdout: child.stdout, stderr: child.stderr, done, terminate: () => {}, waitForExit: () => done }
+        return { stdout, stderr, done, terminate: () => {}, waitForExit: () => done }
       }
       if (harness.brokenCli.has(spec.argv[0] ?? '')) throw new Error('spawn EPERM')
       const scripted = harness.cli.get(spec.argv[0] ?? '')

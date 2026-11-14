@@ -769,8 +769,9 @@ describe('Toranja routed delegation', () => {
     await settled(harness)
     expect(harness.gitRuns.length).toBeGreaterThan(0)
     for (const args of harness.gitRuns) {
-      // A file-system monitor or hook named in the repository's own Git config would run on the Host.
-      expect(args.slice(0, 3)).toEqual(['--no-optional-locks', '-c', 'core.fsmonitor=false'])
+      // A file-system monitor or hook named in the repository's own Git config would run on the Host,
+      // and a replacement object would make one commit read as another.
+      expect(args.slice(0, 4)).toEqual(['--no-replace-objects', '--no-optional-locks', '-c', 'core.fsmonitor=false'])
       const hooks = args.find(arg => arg.startsWith('core.hooksPath='))?.slice('core.hooksPath='.length) ?? ''
       // Hooks are looked up in a directory the Host owns and keeps empty.
       expect(hooks.startsWith(harness.repo)).toBe(false)

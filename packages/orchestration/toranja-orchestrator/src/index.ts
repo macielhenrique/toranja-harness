@@ -7,7 +7,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
-import { lstat, readFile, realpath, stat } from 'node:fs/promises'
+import { lstat, readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -28,6 +28,7 @@ import {
   DEFAULT_CLASSIFICATION_RULES,
   canonicalProtectedPattern,
   classifyTask,
+  isProtectedPath,
   normalizeWriteScope,
   scopeContains,
   scopeWithin,
@@ -113,6 +114,10 @@ const UNTRACKED_CONTENT_LIMIT = 5 * 1024 * 1024
 /** Bytes of untracked files read in one fingerprint; past it, the rest are compared by size and time. */
 const UNTRACKED_CONTENT_BUDGET = 64 * 1024 * 1024
 const GIT_GRACE_MS = 3_000
+/** Longest one Git command of the Host may run before it is stopped and counts as a failed reading. */
+const GIT_TIMEOUT_MS = 60_000
+/** Largest file of a Git directory compared by content; a larger one is compared by size and times. */
+const GIT_FILE_LIMIT = 1024 * 1024
 /** Index and tree modes of a symbolic link and of a submodule. */
 const LINK_MODES = new Set(['120000', '160000'])
 /** Task levels from lowest to highest. */
@@ -124,6 +129,8 @@ const PLAN_HISTORY = 24
 /** Option labels of the plan review put to the user. */
 const APPROVE_PLAN = 'Aprovar e executar'
 const REVISE_PLAN = 'Revisar o plano'
+/** Level of a plan as the approval question names it. */
+const LEVEL_NAMES: Record<TaskLevel, string> = { simple: 'simples', moderate: 'moderado', complex: 'complexo' }
 /** Most paths a write-scope failure names. */
 const SCOPE_REPORT_LIMIT = 5
 /** Whether paths compare without regard to case, as the platform's default file system does. */
@@ -542,6 +549,18 @@ interface RoutedRequest {
   readonly writeScope?: readonly string[]
   /** Approved plan the run works under. */
   readonly planId?: string
+  /** Key of the rules and policy a writing run was admitted under; a reservation under another key is refused. */
+  readonly rulesKey?: string
+}
+
+/** What a writing role was admitted under. */
+interface WriteAdmission {
+  readonly writeScope?: readonly string[]
+  readonly planId?: string
+  /** Key of the rules and policy the admission was decided under; set for every writing role. */
+  readonly rulesKey?: string
+  /** Spend the direct budget the admission holds once an agent started, or give it back. */
+  readonly settle?: (started: boolean) => void
 }
 
 /** What a write-scope check compares before and after a run. */
@@ -552,6 +571,12 @@ interface ScopeSnapshot {
   readonly index: ReadonlyMap<string, string>
   /** Changed, hidden, untracked, and ignored entries by path, compared as {@link entryFacts} reads them. */
   readonly files: ReadonlyMap<string, string>
+  /** Ignored entries as Git lists them, a directory collapsed to one entry. */
+  readonly ignored: ReadonlySet<string>
+  /** Configuration, exclude file, and hooks of the common Git directory, each read as data. */
+  readonly gitFiles: ReadonlyMap<string, string>
+  /** Every ref and the object it names. */
+  readonly refs: ReadonlyMap<string, string>
 }
 
 /** A submitted plan with the rules it was decided under. */
@@ -564,6 +589,14 @@ interface PlanRecord extends ToranjaPlanStatus {
 
 /** NUL-separated Git output as a sorted list without empty entries. */
 const zList = (listing: Buffer): string[] => listing.toString('utf8').split('\0').filter(Boolean).sort()
+/** Keys whose value differs between two readings, including keys only one has, sorted. */
+const changedKeys = (was: ReadonlyMap<string, string>, is: ReadonlyMap<string, string>): string[] =>
+  [...new Set([...was.keys(), ...is.keys()])].filter(key => was.get(key) !== is.get(key)).sort()
+/** Items of a write-scope failure, at most {@link SCOPE_REPORT_LIMIT} of them named. */
+const listed = (items: readonly string[]): string => {
+  const more = items.length - SCOPE_REPORT_LIMIT
+  return `${items.slice(0, SCOPE_REPORT_LIMIT).join(', ')}${more > 0 ? ` (and ${more} more)` : ''}`
+}
 
 /** Git worktree and branch created for one implementer. */
 /** Worktree names this plugin creates: creation time and a sequence number, both in base 36. */
@@ -922,9 +955,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     args: readonly string[],
     overrides: readonly string[] = [],
   ): Promise<Buffer | undefined> => {
+    const signal = AbortSignal.timeout(GIT_TIMEOUT_MS)
     const child = ctx.subprocess.spawn({
       argv: [
-        gitExecutable, '--no-optional-locks',
+        // Replacement objects are refs the repository's writers control; they could make one commit read as another.
+        gitExecutable, '--no-replace-objects', '--no-optional-locks',
         '-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${noHooks}`,
         ...overrides.flatMap(override => ['-c', override]),
         ...args,
@@ -932,12 +967,24 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       cwd,
       stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
       graceMs: GIT_GRACE_MS,
+      signal,
     })
+    // The abort stops the command; a pipe a leftover process still holds is let go too.
+    const release = (): void => { child.stdout?.destroy() }
+    signal.addEventListener('abort', release, { once: true })
     child.stderr?.resume()
-    const chunks: Buffer[] = []
-    for await (const chunk of child.stdout as NonNullable<typeof child.stdout>) chunks.push(chunk as Buffer)
-    const outcome = await child.done
-    return outcome.exitCode === 0 ? Buffer.concat(chunks) : undefined
+    try {
+      const chunks: Buffer[] = []
+      for await (const chunk of child.stdout as NonNullable<typeof child.stdout>) chunks.push(chunk as Buffer)
+      const outcome = await child.done
+      return outcome.exitCode === 0 && !signal.aborted ? Buffer.concat(chunks) : undefined
+    } catch (error: unknown) {
+      // A command stopped at the time limit is a reading that failed.
+      if (signal.aborted) return undefined
+      throw error
+    } finally {
+      signal.removeEventListener('abort', release)
+    }
   }
   /**
    * Hash every untracked file by content, and each ignored file or collapsed
@@ -1101,28 +1148,61 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   }
   /**
+   * Describe one file of a Git directory as data, never following or running
+   * it: a regular file up to the size limit by its content hash, anything
+   * else by its type, size, and times.
+   */
+  const gitFileFacts = async (path: string): Promise<string> => {
+    const entry = await lstat(path).catch(() => undefined)
+    if (entry === undefined) return 'missing'
+    if (!entry.isFile() || entry.size > GIT_FILE_LIMIT) {
+      return `${entry.isFile() ? 'large' : 'not-a-file'}:${entry.size}:${entry.mtimeMs}:${entry.ctimeMs}`
+    }
+    return createHash('sha256').update(await readFile(path)).digest('hex')
+  }
+  /** The configuration, exclude file, and hooks of a common Git directory, by name. */
+  const gitFiles = async (common: string): Promise<Map<string, string>> => {
+    const hooks = await readdir(join(common, 'hooks')).catch(() => [])
+    const names = ['config', 'info/exclude', ...hooks.sort().map(name => `hooks/${name}`)]
+    return new Map(await Promise.all(names.map(async name => [name, await gitFileFacts(join(common, name))] as const)))
+  }
+  /** Lane branches by when their lane stopped being in use, on {@link laneClock}; `undefined` while in use. */
+  const laneEnds = new Map<string, number | undefined>()
+  let laneClock = 0
+  /** Whether a lane branch was in use at any moment after `since`, so its own run, not another, answers for it. */
+  const laneBusySince = (ref: string, since: number): boolean => laneEnds.has(ref) && (laneEnds.get(ref) ?? Infinity) > since
+  /**
    * Read what a write-scope check compares, with the same precautions as the
    * working-tree fingerprint. Returns undefined when Git fails.
-   * @param scope - Git arguments selecting a worktree by its recorded Git directory.
+   * @param scope - Git arguments selecting the Git directory and work tree found before the run.
    * @param branch - Branch whose tip is compared besides the checked-out commit.
+   * @param common - Common Git directory found before the run.
    */
-  const readScope = async (cwd: string, scope: readonly string[], branch: string | undefined): Promise<ScopeSnapshot | undefined> => {
+  const readScope = async (
+    cwd: string,
+    scope: readonly string[],
+    branch: string | undefined,
+    common: string,
+  ): Promise<ScopeSnapshot | undefined> => {
     try {
       const filters = await filtersOff(cwd, scope)
       if (filters === undefined) return undefined
       const off = filters.overrides
-      const [head, tip, changed, untracked, ignored, index] = await Promise.all([
+      // Ignore rules come only from the repository: a file outside it, which a run could also write, would hide new files.
+      const listing = [...off, `core.excludesFile=${join(noHooks, 'exclude')}`]
+      const [head, tip, changed, untracked, ignored, index, refs] = await Promise.all([
         gitOutput(cwd, [...scope, 'rev-parse', '--verify', 'HEAD']),
         branch === undefined ? Promise.resolve(Buffer.alloc(0)) : gitOutput(cwd, [...scope, 'rev-parse', '--verify', `refs/heads/${branch}`]),
         // A submodule would be inspected with its own configuration; its entry in the index is compared instead.
         gitOutput(cwd, [...scope, 'diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', 'HEAD'], off),
-        gitOutput(cwd, [...scope, 'ls-files', '--others', '--exclude-standard', '-z'], off),
-        gitOutput(cwd, [...scope, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], off),
+        gitOutput(cwd, [...scope, 'ls-files', '--others', '--exclude-standard', '-z'], listing),
+        gitOutput(cwd, [...scope, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], listing),
         gitOutput(cwd, [...scope, 'ls-files', '-s', '-v', '-z'], off),
+        gitOutput(cwd, [...scope, 'for-each-ref', '--format=%(refname) %(objectname)']),
       ])
       if (
         head === undefined || tip === undefined || changed === undefined
-        || untracked === undefined || ignored === undefined || index === undefined
+        || untracked === undefined || ignored === undefined || index === undefined || refs === undefined
       ) {
         return undefined
       }
@@ -1141,6 +1221,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         commits: [head, tip].map(commit => commit.toString('utf8').trim()).filter(Boolean),
         index: entries,
         files: new Map(files),
+        ignored: new Set(zList(ignored)),
+        gitFiles: await gitFiles(common),
+        refs: new Map(refs.toString('utf8').split('\n').filter(Boolean).map((line) => {
+          const space = line.lastIndexOf(' ')
+          return [line.slice(0, space), line.slice(space + 1)] as const
+        })),
       }
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: write scope could not be read in ${cwd}: ${String(error)}`)
@@ -1148,10 +1234,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   }
   /**
-   * Capture a tree before a writing run. The returned check lists every path
-   * the run changed, through the working tree, the index, or a commit, and
-   * reports a link or submodule among them, or a path outside the write scope.
-   * Nothing is undone.
+   * Whether an ignored entry is protected: it or a directory above it matches
+   * a protected pattern, or, for a directory, a pattern anchored at the root
+   * names a path inside it. Patterns with `**\/` are not looked for inside an
+   * ignored directory, whose content is not read.
+   */
+  const protectedIgnored = (path: string): boolean => {
+    const { protectedPaths } = classificationRules
+    if (isProtectedPath(path, protectedPaths)) return true
+    const folded = path.normalize('NFC').toUpperCase().toLowerCase()
+    return path.endsWith('/')
+      && protectedPaths.some(pattern => !pattern.startsWith('**/') && pattern.normalize('NFC').toUpperCase().toLowerCase().startsWith(folded))
+  }
+  /**
+   * Capture a tree before a writing run. The returned check reports a run
+   * that moved the Git directory, changed the configuration, exclude file,
+   * or hooks, or changed a ref other than its own branch; then it lists every
+   * path the run changed, through the working tree, the index, or a commit,
+   * and reports a link or submodule among them, or a path outside the write
+   * scope. An entry Git ignores counts only when it is protected or the run
+   * changed an ignore file. Nothing is undone.
    */
   const guardScope = async (
     cwd: string,
@@ -1160,25 +1262,52 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     role: Role,
   ): Promise<() => Promise<string | undefined>> => {
     const unreadable = 'write scope could not be verified'
-    const scope = lane === undefined ? [] : [`--git-dir=${lane.gitDir}`, `--work-tree=${lane.path}`]
+    const laneScope = lane === undefined ? [] : [`--git-dir=${lane.gitDir}`, `--work-tree=${lane.path}`]
     // Git can refuse for a moment while another command changes the repository, so a failed reading is tried once more.
+    const locate = async (): Promise<string | undefined> => {
+      const once = (): Promise<Buffer | undefined> => gitOutput(cwd, [
+        ...laneScope, 'rev-parse', '--path-format=absolute', '--absolute-git-dir', '--show-toplevel', '--git-common-dir',
+      ])
+      return (await once() ?? await once())?.toString('utf8')
+    }
+    const located = await locate()
+    const [gitDir, top, common] = located?.trim().split('\n') ?? []
+    if (gitDir === undefined || top === undefined || common === undefined) return () => Promise.resolve(unreadable)
+    // Found once, before the run: a `.git` entry or `core.worktree` the run changes cannot redirect the reading after it.
+    const scope = lane === undefined ? [`--git-dir=${gitDir}`, `--work-tree=${top}`] : laneScope
     const read = async (): Promise<ScopeSnapshot | undefined> =>
-      await readScope(cwd, scope, lane?.branch) ?? await readScope(cwd, scope, lane?.branch)
+      await readScope(cwd, scope, lane?.branch, common) ?? await readScope(cwd, scope, lane?.branch, common)
+    // The run may move its own branch: the one checked out, and the worktree's.
+    const ownRefs = new Set([
+      (await gitOutput(cwd, [...scope, 'symbolic-ref', '-q', 'HEAD']))?.toString('utf8').trim(),
+      lane === undefined ? undefined : `refs/heads/${lane.branch}`,
+    ])
+    const lanesSince = laneClock
     const before = await read()
     if (before === undefined) return () => Promise.resolve(unreadable)
     return async () => {
+      const relocated = await locate()
+      if (relocated === undefined) return unreadable
+      if (relocated !== located) return `${role} changed the Git directory`
       const after = await read()
       if (after === undefined) return unreadable
+      const gitState = changedKeys(before.gitFiles, after.gitFiles)
+      if (gitState.length > 0) return `${role} changed Git configuration or hooks: ${listed(gitState)}`
+      const refs = changedKeys(before.refs, after.refs).filter(ref => !ownRefs.has(ref) && !laneBusySince(ref, lanesSince))
+      if (refs.length > 0) return `${role} changed other branches or refs: ${listed(refs)}`
       const changed = new Set<string>()
       const linked = new Set<string>()
       const linkMode = (entry: string | undefined): boolean =>
         entry !== undefined && entry.split(';').some(stage => LINK_MODES.has(stage.split(' ')[1] ?? ''))
-      for (const [was, is] of [[before.index, after.index], [before.files, after.files]] as const) {
-        for (const path of new Set([...was.keys(), ...is.keys()])) {
-          if (was.get(path) === is.get(path)) continue
-          changed.add(path)
-          if (linkMode(before.index.get(path)) || linkMode(after.index.get(path))) linked.add(path)
-        }
+      const count = (path: string): void => {
+        changed.add(path)
+        if (linkMode(before.index.get(path)) || linkMode(after.index.get(path))) linked.add(path)
+      }
+      for (const path of changedKeys(before.index, after.index)) count(path)
+      const ignored = new Set<string>()
+      for (const path of changedKeys(before.files, after.files)) {
+        if (before.ignored.has(path) || after.ignored.has(path)) ignored.add(path)
+        else count(path)
       }
       const base = before.commits[0]
       for (const commit of new Set(after.commits)) {
@@ -1193,6 +1322,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           if ((fields[index] ?? '').slice(1).split(' ').slice(0, 2).some(mode => LINK_MODES.has(mode))) linked.add(path)
         }
       }
+      // A changed ignore file can turn any new file into an ignored one, so ignored entries then count as any other.
+      const rulesChanged = [...changed, ...ignored].some(path => /(?:^|\/)\.gitignore$/iu.test(path))
+      for (const path of ignored) if (rulesChanged || protectedIgnored(path)) count(path)
       const paths = [...changed].sort()
       // Git may list the files under a directory link as if they were the
       // project's own, so the path and each directory above it are looked at.
@@ -1216,9 +1348,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         if (link !== undefined) return `${role} changed a link or submodule: ${link}`
       }
       const outside = paths.filter(path => !scopeContains(writeScope, path, CASE_INSENSITIVE))
-      if (outside.length === 0) return undefined
-      const more = outside.length - SCOPE_REPORT_LIMIT
-      return `${role} wrote outside the approved scope: ${outside.slice(0, SCOPE_REPORT_LIMIT).join(', ')}${more > 0 ? ` (and ${more} more)` : ''}`
+      return outside.length === 0 ? undefined : `${role} wrote outside the approved scope: ${listed(outside)}`
     }
   }
   /** Start one routed delegation on the provider instance that enforces its route. */
@@ -1322,6 +1452,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const name = `${Date.now().toString(36)}-${(++laneSequence).toString(36)}p${process.pid.toString(36)}`
     const path = join(laneRoot(project), name)
     const branch = `toranja/${name}`
+    let lane: IsolatedLane | undefined
     try {
       const head = await gitOutput(project.path, ['rev-parse', 'HEAD'])
       // The checkout would run the repository's smudge filters on the Host.
@@ -1329,6 +1460,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (head === undefined || filters === undefined) return undefined
       // The lock names this process, so a later start can tell a worktree in use from one left behind.
       const owner = `toranja-orchestrator host=${hostname()} pid=${process.pid}`
+      // From here the branch is in use, so a scope check running meanwhile does not blame its run for it.
+      laneEnds.set(`refs/heads/${branch}`, undefined)
       const added = await gitOutput(
         project.path,
         ['worktree', 'add', '-q', '--lock', '--reason', owner, '-b', branch, path, 'HEAD'],
@@ -1347,10 +1480,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }
         return undefined
       }
-      return { project, path, branch, base, gitDir: gitDir.toString('utf8').trim() }
+      lane = { project, path, branch, base, gitDir: gitDir.toString('utf8').trim() }
+      return lane
     } catch (error: unknown) {
       ctx.logger.warn(`toranja-orchestrator: worktree for project ${project.id} could not be created: ${String(error)}`)
       return undefined
+    } finally {
+      if (lane === undefined && laneEnds.has(`refs/heads/${branch}`)) laneEnds.set(`refs/heads/${branch}`, ++laneClock)
     }
   }
   /**
@@ -1365,6 +1501,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const removed = await removeUntouched(lane)
     // A worktree that is kept is no longer in use, so the user can manage it with plain Git commands.
     if (!removed) await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
+    laneEnds.set(`refs/heads/${lane.branch}`, ++laneClock)
     return removed
   }
   const removeUntouched = async (lane: IsolatedLane): Promise<boolean> => {
@@ -1519,11 +1656,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     for (const [index, provider] of providers.entries()) {
       const route = routeFor(request.role, provider)
       try {
-        lease ??= requiredAt(
-          ledger.reserveBatch([reservation(request.project, route, request.description, request.lane, request)]),
-          0,
-          'delegation reservation',
-        )
+        if (lease === undefined) {
+          assertAdmitted(request.rulesKey)
+          lease = requiredAt(
+            ledger.reserveBatch([reservation(request.project, route, request.description, request.lane, request)]),
+            0,
+            'delegation reservation',
+          )
+        }
         const launched = await launch({
           // An isolated implementer works in its worktree, not the project's tree.
           project: request.lane === undefined ? request.project : { ...request.project, path: request.lane.path },
@@ -1796,6 +1936,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   /** Key of the classification rules and approval policy in force; a plan decided under another key is stale. */
   const rulesKey = (): string =>
     createHash('sha256').update(JSON.stringify([classificationRules, live().approvalPolicy])).digest('hex')
+  /**
+   * Refuse to reserve a writer admitted under a policy no longer in force: it
+   * would run under the wrong check. Called right before the reservation, with
+   * nothing awaited in between.
+   */
+  const assertAdmitted = (admittedUnder: string | undefined): void => {
+    if (admittedUnder !== undefined && admittedUnder !== rulesKey()) {
+      throw new Error('the approval policy changed while the task was starting; delegate it again')
+    }
+  }
   /** Keep the newest plans, dropping the oldest ones that are no longer approved first. */
   const recordPlan = (plan: PlanRecord): void => {
     plans.set(plan.id, plan)
@@ -1806,16 +1956,25 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
   /** Files simple tasks wrote directly in each project since its last passing delivery gate. */
   const directSpent = new Map<string, Set<string>>()
+  /** Files of simple delegations admitted but not yet started; they count against the budget until settled. */
+  const directHeld = new Set<{ readonly project: string; readonly files: readonly string[] }>()
+  /** Files of moderate plans the policy approved in each project since its last reset. */
+  const investigatedSpent = new Map<string, Set<string>>()
+  /** When each project's budgets were last reset by a passing gate over a delegated implementer. */
+  const lastReset = new Map<string, string>()
+  /** Plan each investigation task supports; an investigation backs one plan only. */
+  const evidenceUse = new Map<string, string>()
   const fileKey = (path: string): string => CASE_INSENSITIVE ? path.toLowerCase() : path
   /**
    * Classify a task with its project's direct budget: a simple task whose
    * files, together with those simple tasks wrote directly since the last
-   * passing gate, exceed `maxDirectFiles` is moderate.
+   * passing gate or are about to, exceed `maxDirectFiles` is moderate.
    */
   const classifyScoped = (projectId: string, task: string, writeScope: readonly string[], raise?: TaskLevel): TaskClassification => {
     const result = classifyTask({ task, writeScope, ...raise === undefined ? {} : { raise } }, classificationRules)
     if (result.level !== 'simple') return result
-    const files = new Set([...directSpent.get(projectId) ?? [], ...writeScope.filter(entry => !entry.endsWith('/')).map(fileKey)])
+    const held = [...directHeld].filter(claim => claim.project === projectId).flatMap(claim => claim.files)
+    const files = new Set([...directSpent.get(projectId) ?? [], ...held, ...writeScope.filter(entry => !entry.endsWith('/')).map(fileKey)])
     if (files.size <= classificationRules.maxDirectFiles) return result
     return { level: 'moderate', path: 'investigate', reasons: [...result.reasons, `direct budget of ${classificationRules.maxDirectFiles} files exceeded`] }
   }
@@ -1832,8 +1991,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * Admit a writing role under the approval policy. While it is on, the
    * write scope is required, the project must be a Git work tree the check
    * can read, and the task needs an approved plan unless `auto` takes it as
-   * simple, in which case its files are spent from the direct budget.
-   * @returns The scope and plan the task runs under; empty while the policy is off or the role does not write.
+   * simple, in which case its files are held from the direct budget until
+   * `settle` spends them or gives them back.
+   * @returns The scope, plan, and rules key the task runs under; empty when the role does not write.
    */
   const admitWrite = async (
     project: ResolvedProject,
@@ -1841,21 +2001,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     task: string,
     rawScope: readonly string[] | undefined,
     planId: string | undefined,
-  ): Promise<{ readonly writeScope?: readonly string[]; readonly planId?: string }> => {
+  ): Promise<WriteAdmission> => {
+    if (roleAccess(role) !== 'write') return {}
     const policy = live().approvalPolicy
-    if (policy === 'off' || roleAccess(role) !== 'write') return {}
+    const key = rulesKey()
+    if (policy === 'off') return { rulesKey: key }
     if (rawScope === undefined) throw new Error(`writeScope is required for ${role} while the approval policy is ${policy}`)
     const writeScope = normalizeWriteScope(rawScope)
     if (!await checkableTree(project.path)) {
       throw new Error(`project ${project.id} is not the top level of a Git work tree with a commit, so what ${role} writes cannot be checked; ${role} does not run there while the approval policy is ${policy}`)
     }
-    // Nothing below awaits, so two delegations cannot both spend the same direct budget.
+    // Nothing below awaits, so two delegations cannot both take the same direct budget.
     const { level, path, reasons } = classifyScoped(project.id, task, writeScope)
     if (planId === undefined && policy === 'auto' && path === 'direct') {
-      const spent = directSpent.get(project.id) ?? new Set<string>()
-      for (const entry of writeScope) spent.add(fileKey(entry))
-      directSpent.set(project.id, spent)
-      return { writeScope }
+      const claim = { project: project.id, files: writeScope.map(fileKey) }
+      directHeld.add(claim)
+      return {
+        writeScope,
+        rulesKey: key,
+        settle: (started) => {
+          if (!directHeld.delete(claim) || !started) return
+          const spent = directSpent.get(project.id) ?? new Set<string>()
+          for (const file of claim.files) spent.add(file)
+          directSpent.set(project.id, spent)
+        },
+      }
     }
     const why = reasons.length === 0 ? level : `${level}: ${reasons.join('; ')}`
     if (planId === undefined) {
@@ -1875,7 +2045,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (TASK_LEVELS.indexOf(level) > TASK_LEVELS.indexOf(plan.level)) {
       throw new Error(`the task is ${why}, above plan ${planId} approved as ${plan.level}; submit a plan at level ${level}`)
     }
-    return { writeScope, planId }
+    return { writeScope, planId, rulesKey: key }
   }
   const startCodexAndWait = async (
     request: ToranjaCodexDelegationRequest,
@@ -2102,7 +2272,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (text.length > maxTaskChars) throw new Error(`submit_project_plan plan exceeds ${maxTaskChars} characters`)
       const writeScope = normalizeWriteScope(args.writeScope)
       const evidenceTaskIds = [...new Set((args.evidenceTaskIds ?? []).map(id => id.trim()))]
-      const { level, path, reasons } = classifyScoped(project.id, text, writeScope, args.level)
+      const scoped = classifyScoped(project.id, text, writeScope, args.level)
+      // Moderate plans the policy approves share one budget, so many of them cannot add up to a complex change unseen.
+      const investigated = new Set([...investigatedSpent.get(project.id) ?? [], ...writeScope.map(fileKey)])
+      const { maxInvestigatedFiles } = classificationRules
+      const { level, path, reasons }: TaskClassification = scoped.level === 'moderate' && investigated.size > maxInvestigatedFiles
+        ? { level: 'complex', path: 'approve', reasons: [...scoped.reasons, `investigated budget of ${maxInvestigatedFiles} files exceeded`] }
+        : scoped
       const policy = live().approvalPolicy
       // The key is taken before any question, so a policy changed while the user decides makes the plan stale.
       const key = rulesKey()
@@ -2120,23 +2296,34 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         createdAt: new Date().toISOString(),
         rulesKey: key,
       }
+      // Set once the evidence is valid: from then on, a decision uses it up.
+      let evidenceValid = false
       const decide = (state: 'approved' | 'rejected', decidedBy: 'policy' | 'user', error?: string): string => {
         Object.assign(plan, { state, decidedBy, decidedAt: new Date().toISOString() }, error === undefined ? {} : { error })
         recordPlan(plan)
+        if (evidenceValid) for (const id of evidenceTaskIds) evidenceUse.set(id, plan.id)
         if (error !== undefined) throw new Error(`plan ${plan.id} rejected: ${error}`)
         return JSON.stringify({ planId: plan.id, state, decidedBy, level, path, reasons, writeScope })
       }
       const tasks = ledger.tasks()
       for (const id of evidenceTaskIds) {
+        const used = evidenceUse.get(id)
+        if (used !== undefined) {
+          return decide('rejected', 'policy', `evidence task ${id} already supports plan ${used}; delegate a new investigation for this plan and pass its taskId`)
+        }
         const task = tasks.find(candidate => candidate.id === id)
         if (task?.projectId !== project.id || !READING_ROLES.has(task.role) || task.state !== 'completed') {
           return decide('rejected', 'policy', `evidence task ${id} is not a completed reading task of project ${project.id}; delegate a reader in this project first and pass its taskId`)
         }
       }
+      evidenceValid = true
       if (path !== 'direct' && evidenceTaskIds.length === 0) {
         return decide('rejected', 'policy', `a ${level} plan needs investigation in evidenceTaskIds; delegate a reader in this project first and pass its taskId`)
       }
-      if (policy === 'off' || (policy === 'auto' && path !== 'approve')) return decide('approved', 'policy')
+      if (policy === 'off' || (policy === 'auto' && path !== 'approve')) {
+        if (policy === 'auto' && level === 'moderate') investigatedSpent.set(project.id, investigated)
+        return decide('approved', 'policy')
+      }
       const interaction = ctx.get('userQuestions')
       if (interaction === undefined) return decide('rejected', 'policy', 'no user-questions channel is available to approve the plan')
       let answer: AskUserQuestionAnswer
@@ -2145,15 +2332,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           questions: [{
             id: plan.id,
             header: 'Aprovação do plano',
-            question: `Aprovar este plano para o projeto ${project.title}?`,
+            question: `Aprovar este plano ${LEVEL_NAMES[level]} que escreve em ${writeScope.length} ${writeScope.length === 1 ? 'caminho' : 'caminhos'} no projeto ${project.title}?`,
+            // The decision comes before the plan, so a long plan cannot push it out of view.
             detail: [
-              text,
-              '',
-              '---',
               `- Nível: ${level}`,
               `- Motivos: ${reasons.length === 0 ? 'nenhum' : reasons.join('; ')}`,
-              `- Escopo de escrita: ${writeScope.join(', ')}`,
+              `- Escopo de escrita (${writeScope.length}): ${writeScope.join(', ')}`,
               `- Evidências: ${evidenceTaskIds.length === 0 ? 'nenhuma' : evidenceTaskIds.join(', ')}`,
+              '',
+              '---',
+              '',
+              text,
             ].join('\n'),
             options: [
               { label: APPROVE_PLAN, description: 'O implementador pode alterar o escopo de escrita acima.' },
@@ -2216,69 +2405,77 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (selected.length === 0) throw new Error('delegate_project_task: no connected provider is available')
       assertProvidersAllowed(live().mode, selected)
       const { project, description, task } = validateAssignment(args)
-      const approval = await admitWrite(project, role, task, args.writeScope, args.planId)
-      // Each implementer gets a worktree of its own when the deployment asks for it.
-      const lanes = await Promise.all(selected.map(() => role === 'implementer' ? isolate(project) : Promise.resolve(undefined)))
-      let leases: ReservationLease[]
+      const { settle: settleBudget, ...approval } = await admitWrite(project, role, task, args.writeScope, args.planId)
+      // The direct budget is spent only once an agent started; any earlier failure gives it back.
+      let agentStarted = false
       try {
-        leases = ledger.reserveBatch(selected.map((provider, index) =>
-          reservation(project, routeFor(role, provider), description, lanes[index], approval)))
-      } catch (error: unknown) {
-        for (const lane of lanes) if (lane !== undefined) await releaseLane(lane)
-        throw error
-      }
-      const requestFor = (lane: IsolatedLane | undefined): RoutedRequest => {
-        const place = lane === undefined ? project : { ...project, path: lane.path }
-        return {
-          project,
-          role,
-          description,
-          prompt: route => rolePrompt(place, route, task, live().profile),
-          label: provider => `${project.title}: ${description} (${provider})`,
-          parent,
-          signal: exec.signal,
-          delivery: 'parent',
-          ...lane === undefined ? {} : { lane },
-          ...approval,
-        }
-      }
-      const results = await Promise.all(selected.map(async (first, index) => {
-        const lane = lanes[index]
+        // Each implementer gets a worktree of its own when the deployment asks for it.
+        const lanes = await Promise.all(selected.map(() => role === 'implementer' ? isolate(project) : Promise.resolve(undefined)))
+        let leases: ReservationLease[]
         try {
-          const started = await startRouted(
-            requestFor(lane),
-            candidatesFor(first, args.provider === undefined, role),
-            requiredAt(leases, index, 'delegation reservation'),
-          )
-          const { route } = started
-          settleInBackground(started)
-          return {
-            ok: true as const,
-            provider: route.provider,
-            providerName: started.providerName,
-            tier: route.tier,
-            access: route.access,
-            ...route.model === undefined ? {} : { model: route.model },
-            ...route.effort === undefined ? {} : { effort: route.effort },
-            ...started.fallbackFrom.length === 0 ? {} : { fallbackFrom: started.fallbackFrom },
-            taskId: started.lease.taskId,
-            subagentId: started.activation.childId,
-            // The change stays on this branch, in this worktree, until it is reviewed and merged.
-            ...lane === undefined ? {} : { worktree: lane.path, branch: lane.branch },
-          }
+          assertAdmitted(approval.rulesKey)
+          leases = ledger.reserveBatch(selected.map((provider, index) =>
+            reservation(project, routeFor(role, provider), description, lanes[index], approval)))
         } catch (error: unknown) {
-          if (lane !== undefined) await releaseLane(lane)
-          if (!(error instanceof RoutedStartError)) throw error
-          return { ok: false as const, attempts: error.attempts }
+          for (const lane of lanes) if (lane !== undefined) await releaseLane(lane)
+          throw error
         }
-      }))
-      const activations = results.filter(result => result.ok)
-      const failures = results.flatMap(result => result.ok ? [] : result.attempts)
-        .map(attempt => ({ ...attempt, providerName: providerName(attempt.provider) }))
-      if (activations.length === 0) {
-        throw new Error(`no project agent started: ${failures.map(failure => `${failure.provider}: ${failure.error}`).join('; ')}`)
+        const requestFor = (lane: IsolatedLane | undefined): RoutedRequest => {
+          const place = lane === undefined ? project : { ...project, path: lane.path }
+          return {
+            project,
+            role,
+            description,
+            prompt: route => rolePrompt(place, route, task, live().profile),
+            label: provider => `${project.title}: ${description} (${provider})`,
+            parent,
+            signal: exec.signal,
+            delivery: 'parent',
+            ...lane === undefined ? {} : { lane },
+            ...approval,
+          }
+        }
+        const results = await Promise.all(selected.map(async (first, index) => {
+          const lane = lanes[index]
+          try {
+            const started = await startRouted(
+              requestFor(lane),
+              candidatesFor(first, args.provider === undefined, role),
+              requiredAt(leases, index, 'delegation reservation'),
+            )
+            const { route } = started
+            agentStarted = true
+            settleInBackground(started)
+            return {
+              ok: true as const,
+              provider: route.provider,
+              providerName: started.providerName,
+              tier: route.tier,
+              access: route.access,
+              ...route.model === undefined ? {} : { model: route.model },
+              ...route.effort === undefined ? {} : { effort: route.effort },
+              ...started.fallbackFrom.length === 0 ? {} : { fallbackFrom: started.fallbackFrom },
+              taskId: started.lease.taskId,
+              subagentId: started.activation.childId,
+              // The change stays on this branch, in this worktree, until it is reviewed and merged.
+              ...lane === undefined ? {} : { worktree: lane.path, branch: lane.branch },
+            }
+          } catch (error: unknown) {
+            if (lane !== undefined) await releaseLane(lane)
+            if (!(error instanceof RoutedStartError)) throw error
+            return { ok: false as const, attempts: error.attempts }
+          }
+        }))
+        const activations = results.filter(result => result.ok)
+        const failures = results.flatMap(result => result.ok ? [] : result.attempts)
+          .map(attempt => ({ ...attempt, providerName: providerName(attempt.provider) }))
+        if (activations.length === 0) {
+          throw new Error(`no project agent started: ${failures.map(failure => `${failure.provider}: ${failure.error}`).join('; ')}`)
+        }
+        return JSON.stringify({ project: project.id, role, activations, failures })
+      } finally {
+        settleBudget?.(agentStarted)
       }
-      return JSON.stringify({ project: project.id, role, activations, failures })
     },
   }))
 
@@ -2289,7 +2486,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       project: { type: 'string', required: true, description: 'Project lane id from list_project_lanes.' },
       implementationSummary: { type: 'string', required: true, description: 'What changed, including relevant files and claimed validation.' },
       acceptanceCriteria: { type: 'string', required: true, description: 'Concrete conditions that must all hold before delivery.' },
-      implementationTaskId: { type: 'string', description: 'taskId returned by the delegate_project_task implementer run under review. Supply it so the reviewer runs on a different provider; omit it only when no delegated implementer wrote the change.' },
+      implementationTaskId: { type: 'string', description: 'taskId returned by the delegate_project_task implementer run under review. Supply it so the reviewer runs on a different provider and, when the gate passes, the project\'s budgets reset and its approved plans close; omit it only when no delegated implementer wrote the change.' },
     },
     output: {
       schema: { type: 'string' },
@@ -2399,13 +2596,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }
       }))
       const passed = results.every(result => result.stopReason === 'completed' && result.verdict === 'pass')
-      if (passed) {
-        // The delivery is done: its plans are spent and simple tasks start a new budget.
+      // Only a gate over a delegated implementer started since the last reset ends a delivery; otherwise
+      // the leader could reset its own budgets with a gate over nothing.
+      const budgetReset = passed && implementation !== undefined && implementation.startedAt > (lastReset.get(project.id) ?? '')
+      if (budgetReset) {
+        // The delivery is done: its plans are spent and simple tasks and moderate plans start new budgets.
         const closedAt = new Date().toISOString()
         for (const plan of plans.values()) {
           if (plan.project === project.id && plan.state === 'approved') Object.assign(plan, { state: 'closed', decidedAt: closedAt })
         }
         directSpent.delete(project.id)
+        investigatedSpent.delete(project.id)
+        lastReset.set(project.id, closedAt)
       }
       let replan: Record<string, unknown> | undefined
       if (replanOnGateFailure && results.some(result => result.verdict === 'fail')) {
@@ -2453,6 +2655,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         project: project.id,
         passed,
         decision: passed ? 'ready' : 'not-ready',
+        budgetReset,
         ...implementerProvider === undefined
           ? {}
           : {

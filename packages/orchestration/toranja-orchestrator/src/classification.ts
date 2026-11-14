@@ -53,6 +53,9 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRules = {
 // Windows opens a reserved device name, with or without an extension, instead of a file.
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]|conin\$|conout\$)$/iu
 
+/** Case folding through upper case, so letters such as `ſ` and `ı` meet `s` and `i` as a file system may fold them. */
+const foldCase = (value: string): string => value.toUpperCase().toLowerCase()
+
 /**
  * Normalize one project-relative path: NFC, `/` separators, no leading `./`
  * and no duplicate slashes. A trailing `/` is kept (a directory) and an empty
@@ -60,9 +63,10 @@ const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]|conin\$
  * platform, since one repository can be checked out on Windows.
  * @param raw - Path as written.
  * @returns The normalized path.
- * @throws When the path is empty or absolute, or has a `.` or `..` segment, or has a segment Windows reads as
- * another name: it ends in a dot or space, starts with a space, holds `:` or a control character, is a `~` plus
- * digit short name, or is a reserved device name.
+ * @throws When the path is empty or absolute, or has a `.`, `..`, or `.git` segment, or has a segment Windows reads
+ * as another name: it ends in a dot or space, starts with a space, holds `:`, a control character, or an invisible
+ * format character, is a `~` plus digit short name, or is a reserved device name, even with spaces before its
+ * extension.
  */
 export function normalizeRelativePath(raw: string): string {
   const quoted = JSON.stringify(raw)
@@ -76,9 +80,10 @@ export function normalizeRelativePath(raw: string): string {
   if (segments.some(segment => segment === '..' || segment === '.')) {
     throw new Error(`path ${quoted} must not contain a "." or ".." segment`)
   }
-  if (segments.some(segment => /[. ]$|^ |[:\p{Cc}]|~\d/u.test(segment) || RESERVED_NAME.test(segment.split('.')[0] ?? ''))) {
+  if (segments.some(segment => /[. ]$|^ |[:\p{Cc}\p{Cf}]|~\d/u.test(segment) || RESERVED_NAME.test((segment.split('.')[0] ?? '').trimEnd()))) {
     throw new Error(`path ${quoted} has a segment that Windows reads as another name`)
   }
+  if (segments.some(segment => foldCase(segment) === '.git')) throw new Error(`path ${quoted} must not name the Git directory`)
   return segments.length === 0 ? './' : segments.join('/') + (directory ? '/' : '')
 }
 
@@ -112,7 +117,7 @@ function tryNormalize(path: string): string | undefined {
   }
 }
 
-const fold = (value: string, caseInsensitive: boolean): string => caseInsensitive ? value.toLowerCase() : value
+const fold = (value: string, caseInsensitive: boolean): string => caseInsensitive ? foldCase(value) : value
 
 /**
  * Whether a write scope covers a path.
@@ -148,19 +153,27 @@ export function scopeWithin(inner: readonly string[], outer: readonly string[], 
  * `**\/` prefix is anchored at the project root; with it, the pattern matches
  * at any depth. A final `/` marks a directory pattern (the path must be it or
  * inside it), and a final `*` on the last segment matches a name prefix.
+ * Each pattern is first brought to the form of {@link canonicalProtectedPattern}.
  * @param path - Project-relative file path, or directory entry with a trailing `/`. A path that does not normalize counts as protected.
- * @param patterns - Protected path patterns.
- * @returns True when a pattern matches or the path does not normalize.
+ * @param patterns - Protected path patterns. A pattern that does not normalize protects every path.
+ * @returns True when a pattern matches, a pattern does not normalize, or the path does not normalize.
  */
 export function isProtectedPath(path: string, patterns: readonly string[]): boolean {
   const normalized = tryNormalize(path)
   if (normalized === undefined) return true
-  const target = normalized.toLowerCase().split('/')
+  const target = foldCase(normalized).split('/')
   const isDirectory = target.at(-1) === ''
   const segments = normalized === './' ? [] : isDirectory ? target.slice(0, -1) : target
   return patterns.some((raw) => {
-    const anywhere = raw.startsWith('**/')
-    const body = (anywhere ? raw.slice(3) : raw).normalize('NFC').toLowerCase()
+    let pattern: string
+    try {
+      pattern = canonicalProtectedPattern(raw)
+    } catch {
+      return true
+    }
+    const anywhere = pattern.startsWith('**/')
+    const body = foldCase(anywhere ? pattern.slice(3) : pattern)
+    if (body === './') return true
     const directoryPattern = body.endsWith('/')
     const wanted = (directoryPattern ? body.slice(0, -1) : body).split('/')
     const last = wanted.length - 1
@@ -202,7 +215,7 @@ const normalizeText = (value: string): string =>
 
 /** A term matches as the start of a word: nothing but a non-letter before it, anything after. */
 function mentionsTerm(text: string, term: string): boolean {
-  const words = term.normalize('NFKC').toLowerCase().trim().split(/\s+/u).map(escapeRegExp)
+  const words = normalizeText(term).trim().split(/\s+/u).map(escapeRegExp)
   return new RegExp(`(?<!\\p{L})${words.join('\\s+')}`, 'u').test(text)
 }
 
