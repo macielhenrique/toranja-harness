@@ -5,6 +5,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type {
   ToranjaOrchestrationStatus,
+  ToranjaPlanStatus,
   ToranjaProviderId,
   ToranjaProviderStatus,
   ToranjaSettingsRequest,
@@ -86,8 +87,15 @@ function mount(initial = status(), refreshMs?: number) {
       return Promise.resolve(current)
     }),
     updateSettings: vi.fn((request: ToranjaSettingsRequest) => {
-      const { tierModels: _tierModels, ...settings } = request
-      current = { ...current, ...settings }
+      const { tierModels: _tierModels, maxDirectFiles, maxInvestigatedFiles, ...settings } = request
+      current = {
+        ...current,
+        ...settings,
+        classification: {
+          maxDirectFiles: maxDirectFiles ?? current.classification.maxDirectFiles,
+          maxInvestigatedFiles: maxInvestigatedFiles ?? current.classification.maxInvestigatedFiles,
+        },
+      }
       return Promise.resolve(current)
     }),
     probeProviders: vi.fn(() => Promise.resolve(current)),
@@ -214,6 +222,117 @@ describe('Orchestrator settings page: mode, team size, and profile', () => {
     fireEvent.click(within(size).getByRole('button', { name: 'Aumentar a equipe' }))
     expect((await screen.findByRole('alert')).textContent).toContain('teamSize must not exceed 3')
     expect(within(size).getByText('2')).toBeTruthy()
+  })
+})
+
+describe('Orchestrator settings page: approval', () => {
+  const policies = (): Promise<HTMLElement> => screen.findByRole('radiogroup', { name: 'Política de aprovação' })
+  const plan = (rest: Partial<ToranjaPlanStatus>): ToranjaPlanStatus => ({
+    id: 'plan-1',
+    project: 'demo',
+    title: 'Corrigir o typo',
+    level: 'simple',
+    path: 'direct',
+    reasons: [],
+    writeScope: ['tracked.txt'],
+    evidenceTaskIds: [],
+    state: 'approved',
+    decidedBy: 'policy',
+    createdAt: '2026-11-12T00:00:00.000Z',
+    ...rest,
+  })
+
+  it('shows the policy in force and changes it through updateSettings alone', async () => {
+    const host = mount()
+    const group = await policies()
+    expect(within(group).getByRole('radio', { name: 'Desligada' }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByText(/todo implementador declara os arquivos que vai escrever/)).toBeTruthy()
+    fireEvent.click(within(group).getByRole('radio', { name: 'Automática' }))
+    await waitFor(() => { expect(host.updateSettings).toHaveBeenCalledWith({ approvalPolicy: 'auto' }) })
+    await waitFor(() => {
+      expect(within(group).getByRole('radio', { name: 'Automática' }).getAttribute('aria-checked')).toBe('true')
+    })
+    expect(screen.getByText(/pergunta a você nos casos complexos/)).toBeTruthy()
+    fireEvent.click(within(group).getByRole('radio', { name: 'Sempre perguntar' }))
+    await waitFor(() => { expect(host.updateSettings).toHaveBeenLastCalledWith({ approvalPolicy: 'always' }) })
+    expect(host.setMode).not.toHaveBeenCalled()
+  })
+
+  it('offers the file limits only while the policy is on', async () => {
+    mount()
+    const group = await policies()
+    expect(screen.queryByRole('group', { name: 'Arquivos sem plano' })).toBeNull()
+    expect(screen.queryByRole('group', { name: 'Arquivos com investigação' })).toBeNull()
+    fireEvent.click(within(group).getByRole('radio', { name: 'Automática' }))
+    expect(within(await screen.findByRole('group', { name: 'Arquivos sem plano' })).getByText('3')).toBeTruthy()
+    expect(within(screen.getByRole('group', { name: 'Arquivos com investigação' })).getByText('10')).toBeTruthy()
+    fireEvent.click(within(group).getByRole('radio', { name: 'Desligada' }))
+    await waitFor(() => { expect(screen.queryByRole('group', { name: 'Arquivos sem plano' })).toBeNull() })
+  })
+
+  it('changes each limit one file at a time', async () => {
+    const host = mount(status({ approvalPolicy: 'auto' }))
+    const direct = await screen.findByRole('group', { name: 'Arquivos sem plano' })
+    const investigated = screen.getByRole('group', { name: 'Arquivos com investigação' })
+    fireEvent.click(within(direct).getByRole('button', { name: 'Aumentar o limite de arquivos sem plano' }))
+    await waitFor(() => { expect(host.updateSettings).toHaveBeenCalledWith({ maxDirectFiles: 4 }) })
+    await waitFor(() => { expect(within(direct).getByText('4')).toBeTruthy() })
+    fireEvent.click(within(investigated).getByRole('button', { name: 'Diminuir o limite de arquivos com investigação' }))
+    await waitFor(() => { expect(host.updateSettings).toHaveBeenLastCalledWith({ maxInvestigatedFiles: 9 }) })
+    fireEvent.click(within(investigated).getByRole('button', { name: 'Aumentar o limite de arquivos com investigação' }))
+    await waitFor(() => { expect(host.updateSettings).toHaveBeenLastCalledWith({ maxInvestigatedFiles: 10 }) })
+  })
+
+  it('disables the step that would put the limits out of order, or a limit under one', async () => {
+    mount(status({ approvalPolicy: 'auto', classification: { maxDirectFiles: 5, maxInvestigatedFiles: 5 } }))
+    const direct = await screen.findByRole('group', { name: 'Arquivos sem plano' })
+    const investigated = screen.getByRole('group', { name: 'Arquivos com investigação' })
+    const disabled = (group: HTMLElement, name: string): boolean => within(group).getByRole<HTMLButtonElement>('button', { name }).disabled
+    expect(disabled(direct, 'Aumentar o limite de arquivos sem plano')).toBe(true)
+    expect(disabled(direct, 'Diminuir o limite de arquivos sem plano')).toBe(false)
+    expect(disabled(investigated, 'Diminuir o limite de arquivos com investigação')).toBe(true)
+    expect(disabled(investigated, 'Aumentar o limite de arquivos com investigação')).toBe(false)
+    cleanup()
+    mount(status({ approvalPolicy: 'auto', classification: { maxDirectFiles: 1, maxInvestigatedFiles: 10 } }))
+    expect(disabled(await screen.findByRole('group', { name: 'Arquivos sem plano' }), 'Diminuir o limite de arquivos sem plano')).toBe(true)
+  })
+
+  it('lists the recent plans read-only, with level, state, who decided, and why a plan was rejected', async () => {
+    mount(status({
+      plans: [
+        plan({ id: 'a', title: 'Trocar o cabeçalho', level: 'complex', state: 'rejected', decidedBy: 'user', error: 'o usuário não aprovou o plano' }),
+        plan({ id: 'b', level: 'moderate', project: 'outro' }),
+        plan({ id: 'c', state: 'closed', decidedBy: 'user' }),
+      ],
+    }))
+    const items = within(await screen.findByRole('list', { name: 'Planos recentes' })).getAllByRole('listitem')
+    expect(items).toHaveLength(3)
+    expect(items[0]?.textContent).toContain('Trocar o cabeçalho')
+    expect(items[0]?.textContent).toContain('Complexa')
+    expect(items[0]?.textContent).toContain('Rejeitado por você')
+    expect(items[0]?.textContent).toContain('o usuário não aprovou o plano')
+    expect(items[1]?.textContent).toContain('outro')
+    expect(items[1]?.textContent).toContain('Moderada')
+    expect(items[1]?.textContent).toContain('Aprovado pela política')
+    expect(items[2]?.textContent).toContain('Simples')
+    expect(items[2]?.textContent).toContain('Fechado')
+    expect(items[2]?.textContent).not.toContain('por você')
+    expect(within(items[0]!).queryByRole('button')).toBeNull()
+  })
+
+  it('says so when there is no plan yet', async () => {
+    mount()
+    expect(await screen.findByText('Nenhum plano nesta execução.')).toBeTruthy()
+    expect(screen.queryByRole('list', { name: 'Planos recentes' })).toBeNull()
+  })
+
+  it('shows why the Host refused a limit and keeps what it has stored', async () => {
+    const host = mount(status({ approvalPolicy: 'auto' }))
+    host.updateSettings.mockRejectedValueOnce(new Error('maxInvestigatedFiles must not be below maxDirectFiles'))
+    const direct = await screen.findByRole('group', { name: 'Arquivos sem plano' })
+    fireEvent.click(within(direct).getByRole('button', { name: 'Aumentar o limite de arquivos sem plano' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('maxInvestigatedFiles must not be below maxDirectFiles')
+    expect(within(direct).getByText('3')).toBeTruthy()
   })
 })
 

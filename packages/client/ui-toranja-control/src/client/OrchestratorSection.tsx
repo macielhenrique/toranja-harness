@@ -1,4 +1,4 @@
-/** The Orchestrator settings page: providers, routing mode, team, roles, fallback, and tier models. */
+/** The Orchestrator settings page: providers, routing mode, team, approval, roles, fallback, and tier models. */
 
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import type {
@@ -19,6 +19,7 @@ import {
   formatTeamSizeHint,
 } from './locales.ts'
 import { ModePicker, ProviderList, TeamSizeStepper } from './OrchestratorControls.tsx'
+import { OrchestratorApproval } from './OrchestratorApproval.tsx'
 import { OrchestratorRouting } from './OrchestratorRouting.tsx'
 import css from './OrchestratorSection.module.css'
 
@@ -195,6 +196,8 @@ export function OrchestratorSection({
             </div>
             <p className={css.hint}>{PROFILE_OPTIONS.find(option => option.profile === status.profile)?.description}</p>
           </section>
+
+          <OrchestratorApproval status={status} busy={busy} change={change} />
 
           <OrchestratorRouting status={status} busy={busy} save={save} />
         </>

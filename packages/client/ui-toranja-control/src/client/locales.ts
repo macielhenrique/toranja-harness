@@ -2,8 +2,10 @@
 
 import type {
   ToranjaAgentMode,
+  ToranjaApprovalPolicy,
   ToranjaExecutionProfile,
   ToranjaModelTier,
+  ToranjaPlanState,
   ToranjaProviderConnection,
   ToranjaProviderId,
   ToranjaProviderStatus,
@@ -210,6 +212,59 @@ export const PROFILE_OPTIONS: ReadonlyArray<{
   { profile: 'equilibrado', label: 'Equilibrado', description: 'Leitura no modelo leve; todo o resto no avançado.' },
   { profile: 'qualidade', label: 'Qualidade', description: 'Como o equilibrado, com planejamento, arquitetura e revisão no modelo máximo.' },
 ]
+
+/** Static Portuguese (Brazil) copy for the approval group of the Orchestrator settings page. */
+export const APPROVAL_COPY = {
+  heading: 'Aprovação',
+  policyAria: 'Política de aprovação',
+  hint: 'Com a aprovação ligada, todo implementador declara os arquivos que vai escrever e é conferido depois.',
+  directHeading: 'Arquivos sem plano',
+  directHint: 'Até quantos arquivos uma tarefa pode escrever sem um plano aprovado.',
+  decreaseDirect: 'Diminuir o limite de arquivos sem plano',
+  increaseDirect: 'Aumentar o limite de arquivos sem plano',
+  investigatedHeading: 'Arquivos com investigação',
+  investigatedHint: 'Até quantos arquivos um plano pode escrever, com investigação, sem virar complexo e passar por você.',
+  decreaseInvestigated: 'Diminuir o limite de arquivos com investigação',
+  increaseInvestigated: 'Aumentar o limite de arquivos com investigação',
+  plansHeading: 'Planos recentes',
+  plansEmpty: 'Nenhum plano nesta execução.',
+} as const
+
+/** Selectable approval policies and what each does. */
+export const APPROVAL_OPTIONS: ReadonlyArray<{
+  policy: ToranjaApprovalPolicy
+  label: string
+  description: string
+}> = [
+  { policy: 'off', label: 'Desligada', description: 'O Toranja não exige plano nem escopo de escrita.' },
+  { policy: 'auto', label: 'Automática', description: 'Aprova sozinho o que é simples ou moderado com investigação; pergunta a você nos casos complexos.' },
+  { policy: 'always', label: 'Sempre perguntar', description: 'Todo plano passa por você antes de o implementador começar.' },
+]
+
+/** Localized labels for the level a plan was classified at. */
+export const PLAN_LEVEL_LABELS: Readonly<Record<'simple' | 'moderate' | 'complex', string>> = {
+  simple: 'Simples',
+  moderate: 'Moderada',
+  complex: 'Complexa',
+}
+
+/**
+ * Format the state of a plan with who decided it.
+ * @param state - Lifecycle state of the plan.
+ * @param decidedBy - Whether the Host's policy or the user decided.
+ * @returns Localized state; a closed plan names no one, since it was spent by a passing delivery gate.
+ */
+export function formatPlanDecision(state: ToranjaPlanState, decidedBy: 'policy' | 'user'): string {
+  const by = decidedBy === 'user' ? 'por você' : 'pela política'
+  switch (state) {
+    case 'approved':
+      return `Aprovado ${by}`
+    case 'rejected':
+      return `Rejeitado ${by}`
+    case 'closed':
+      return 'Fechado'
+  }
+}
 
 /**
  * Format the accessible name of a provider's sign-in button.

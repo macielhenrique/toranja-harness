@@ -89,6 +89,10 @@ export interface ToranjaSettingsRequest {
   readonly onboarded?: boolean
   /** When a writing role needs an approved plan and when the user is asked. */
   readonly approvalPolicy?: ToranjaApprovalPolicy
+  /** Most files a task may write and stay simple; positive, and not above `maxInvestigatedFiles`. */
+  readonly maxDirectFiles?: number
+  /** Most files a task may write without becoming complex; positive, and not below `maxDirectFiles`. */
+  readonly maxInvestigatedFiles?: number
 }
 
 /** Request to change the routing mode, optionally together with other settings. */

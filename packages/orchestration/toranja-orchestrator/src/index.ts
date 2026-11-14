@@ -384,7 +384,8 @@ export class ToranjaOrchestrationController extends TypertRemoteService {
 
   /**
    * Change the execution profile, fallback order, provider per role,
-   * cross-review setting, team size, or tier models, and store the result
+   * cross-review setting, team size, tier models, approval policy, or the file
+   * limits of the task classification, and store the result
    * durably. The routing mode is left as stored, so a caller holding an older
    * snapshot does not undo a mode chosen meanwhile. A change applies to tasks
    * started afterwards; a running task keeps the route it started with.
@@ -674,6 +675,9 @@ interface LiveSettings {
   /** Tier models in force per provider: the user's over the deployment's. */
   readonly models: ReadonlyMap<RunProvider, ProviderModels>
   readonly approvalPolicy: ToranjaApprovalPolicy
+  /** File limits in force: the user's over the deployment's `classification`. */
+  readonly maxDirectFiles: number
+  readonly maxInvestigatedFiles: number
 }
 
 interface ProviderRouting {
@@ -835,6 +839,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     teamSize: configuredLimits.maxConcurrentPerProject,
     models: modelsInForce(undefined),
     approvalPolicy: config.approvalPolicy ?? 'off',
+    maxDirectFiles: classificationRules.maxDirectFiles,
+    maxInvestigatedFiles: classificationRules.maxInvestigatedFiles,
   } satisfies LiveSettings
   // The stored global is the only source of the live routing: every reader
   // resolves it over the deployment defaults, so a change is visible to
@@ -845,6 +851,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const stored = domain.global.get()
     if (stored !== resolvedFrom) {
       resolvedFrom = stored
+      const maxDirectFiles = stored.maxDirectFiles ?? defaults.maxDirectFiles
       resolved = {
         mode: stored.mode ?? defaults.mode,
         profile: stored.profile ?? defaults.profile,
@@ -858,10 +865,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         teamSize: Math.min(stored.teamSize ?? defaults.teamSize, maxTeamSize),
         models: stored.tierModels === undefined ? defaults.models : storedModelsInForce(stored.tierModels),
         approvalPolicy: stored.approvalPolicy ?? defaults.approvalPolicy,
+        maxDirectFiles,
+        // The deployment may have lowered its limit below the stored direct limit since.
+        maxInvestigatedFiles: Math.max(stored.maxInvestigatedFiles ?? defaults.maxInvestigatedFiles, maxDirectFiles),
       }
     }
     return resolved
   }
+  /** Classification rules in force: the deployment's, with the file limits the user set. */
+  const rulesInForce = (): ClassificationRules => ({
+    ...classificationRules,
+    maxDirectFiles: live().maxDirectFiles,
+    maxInvestigatedFiles: live().maxInvestigatedFiles,
+  })
   const replanOnGateFailure = config.replanOnGateFailure ?? true
   const providerName = (provider: RunProvider): string => {
     switch (provider) {
@@ -2043,10 +2059,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       teamSize: live().teamSize,
       onboarded: domain.global.get().onboarded === true,
       approvalPolicy: live().approvalPolicy,
-      classification: {
-        maxDirectFiles: classificationRules.maxDirectFiles,
-        maxInvestigatedFiles: classificationRules.maxInvestigatedFiles,
-      },
+      classification: { maxDirectFiles: live().maxDirectFiles, maxInvestigatedFiles: live().maxInvestigatedFiles },
       plans: [...plans.values()].reverse().map(({ rulesKey: _key, ...plan }) => ({ ...plan })),
       active: ledger.activeCount,
       limits: { ...limitsFor(live().teamSize), maxTeamSize },
@@ -2088,7 +2101,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const plans = new Map<string, PlanRecord>()
   /** Key of the classification rules and approval policy in force; a plan decided under another key is stale. */
   const rulesKey = (): string =>
-    createHash('sha256').update(JSON.stringify([classificationRules, live().approvalPolicy])).digest('hex')
+    createHash('sha256').update(JSON.stringify([rulesInForce(), live().approvalPolicy])).digest('hex')
   /**
    * Refuse to reserve a writer admitted under a policy no longer in force: it
    * would run under the wrong check. Called right before the reservation, with
@@ -2126,12 +2139,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * passing gate or are about to, exceed `maxDirectFiles` is moderate.
    */
   const classifyScoped = (projectId: string, task: string, writeScope: readonly string[], raise?: TaskLevel): TaskClassification => {
-    const result = classifyTask({ task, writeScope, ...raise === undefined ? {} : { raise } }, classificationRules)
+    const { maxDirectFiles } = live()
+    const result = classifyTask({ task, writeScope, ...raise === undefined ? {} : { raise } }, rulesInForce())
     if (result.level !== 'simple') return result
     const held = [...directHeld].filter(claim => claim.project === projectId).flatMap(claim => claim.files)
     const files = new Set([...directSpent.get(projectId) ?? [], ...held, ...writeScope.filter(entry => !entry.endsWith('/')).map(fileKey)])
-    if (files.size <= classificationRules.maxDirectFiles) return result
-    return { level: 'moderate', path: 'investigate', reasons: [...result.reasons, `direct budget of ${classificationRules.maxDirectFiles} files exceeded`] }
+    if (files.size <= maxDirectFiles) return result
+    return { level: 'moderate', path: 'investigate', reasons: [...result.reasons, `direct budget of ${maxDirectFiles} files exceeded`] }
   }
   /** Whether a directory is the top level of a Git work tree with a commit, so its writes can be listed. */
   const checkableTree = async (path: string): Promise<boolean> => {
@@ -2278,6 +2292,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (request.teamSize !== undefined && positiveInteger('teamSize', request.teamSize) > maxTeamSize) {
       throw new Error(`toranja-orchestrator: teamSize must not exceed ${maxTeamSize}, the deployment's maxTeamSize`)
     }
+    const maxDirectFiles = request.maxDirectFiles === undefined ? undefined : positiveInteger('maxDirectFiles', request.maxDirectFiles)
+    const maxInvestigatedFiles = request.maxInvestigatedFiles === undefined
+      ? undefined
+      : positiveInteger('maxInvestigatedFiles', request.maxInvestigatedFiles)
+    if ((maxInvestigatedFiles ?? live().maxInvestigatedFiles) < (maxDirectFiles ?? live().maxDirectFiles)) {
+      throw new Error('toranja-orchestrator: maxInvestigatedFiles must not be below maxDirectFiles')
+    }
     const next: ToranjaOrchestrationState = {
       ...stored,
       // The mode changes only when the request names one, so a setting changed
@@ -2291,6 +2312,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ...tierModels === undefined ? {} : { tierModels },
       ...request.onboarded === undefined ? {} : { onboarded: request.onboarded },
       ...request.approvalPolicy === undefined ? {} : { approvalPolicy: request.approvalPolicy },
+      ...maxDirectFiles === undefined ? {} : { maxDirectFiles },
+      ...maxInvestigatedFiles === undefined ? {} : { maxInvestigatedFiles },
     }
     // Validate before storing. The live routing derives from the stored
     // value, so a failed write leaves the routing in force untouched.
@@ -2391,7 +2414,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         if (project === undefined) throw new Error(`unknown Toranja project lane ${JSON.stringify(args.project)}`)
         const writeScope = normalizeWriteScope(args.writeScope)
         const { level, path, reasons } = classifyScoped(project.id, args.task, writeScope, args.level)
-        const { maxDirectFiles, maxInvestigatedFiles } = classificationRules
+        const { maxDirectFiles, maxInvestigatedFiles } = live()
         return JSON.stringify({
           project: project.id,
           level,
@@ -2430,7 +2453,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const scoped = classifyScoped(project.id, text, writeScope, args.level)
       // Moderate plans the policy approves share one budget, so many of them cannot add up to a complex change unseen.
       const investigated = new Set([...investigatedSpent.get(project.id) ?? [], ...writeScope.map(fileKey)])
-      const { maxInvestigatedFiles } = classificationRules
+      const { maxInvestigatedFiles } = live()
       const { level, path, reasons }: TaskClassification = scoped.level === 'moderate' && investigated.size > maxInvestigatedFiles
         ? { level: 'complex', path: 'approve', reasons: [...scoped.reasons, `investigated budget of ${maxInvestigatedFiles} files exceeded`] }
         : scoped

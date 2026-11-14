@@ -114,6 +114,49 @@ describe('Toranja approval policy', () => {
   })
 })
 
+describe('Toranja classification limits the user sets', () => {
+  it('stores the limits, reports them in the status, and keeps them after a restart', async () => {
+    const disk = new MemoryMediaPool()
+    const harness = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    await harness.update({ maxDirectFiles: 5 })
+    expect(harness.status().classification).toEqual({ maxDirectFiles: 5, maxInvestigatedFiles: 10 })
+    await harness.update({ maxDirectFiles: 2, maxInvestigatedFiles: 4 })
+    const restarted = await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)
+    expect(restarted.status().classification).toEqual({ maxDirectFiles: 2, maxInvestigatedFiles: 4 })
+  })
+
+  it('rejects a limit that is not a positive integer or that puts the investigated limit below the direct one', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await expect(harness.update({ maxDirectFiles: 0 })).rejects.toThrow('maxDirectFiles must be a positive safe integer')
+    await expect(harness.update({ maxInvestigatedFiles: 2.5 })).rejects.toThrow('maxInvestigatedFiles must be a positive safe integer')
+    await expect(harness.update({ maxDirectFiles: 11 })).rejects.toThrow('maxInvestigatedFiles must not be below maxDirectFiles')
+    await expect(harness.update({ maxInvestigatedFiles: 2 })).rejects.toThrow('maxInvestigatedFiles must not be below maxDirectFiles')
+    await expect(harness.update({ maxDirectFiles: 6, maxInvestigatedFiles: 5 })).rejects.toThrow('maxInvestigatedFiles must not be below maxDirectFiles')
+    expect(harness.status().classification).toEqual({ maxDirectFiles: 3, maxInvestigatedFiles: 10 })
+    await harness.update({ maxDirectFiles: 12, maxInvestigatedFiles: 12 })
+    expect(harness.status().classification).toEqual({ maxDirectFiles: 12, maxInvestigatedFiles: 12 })
+  })
+
+  it('classifies with the limits in force and refuses a plan approved under the old limit', async () => {
+    const asker = questions(approving)
+    const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' }, ['codex', 'antigravity'], new MemoryMediaPool(), asker.service)
+    const reader = await investigate(harness)
+    const { planId } = await submit(harness, { writeScope: ['a.txt', 'b.txt'], evidenceTaskIds: [reader] })
+    expect(harness.status().plans[0]).toMatchObject({ level: 'simple', state: 'approved' })
+    await harness.update({ maxDirectFiles: 1 })
+    await expect(delegate(harness, { role: 'implementer', writeScope: ['a.txt'], planId })).rejects.toThrow('was approved under other rules; submit it again')
+    const again = await submit(harness, { writeScope: ['a.txt', 'b.txt'], evidenceTaskIds: [await investigate(harness)] })
+    expect(harness.status().plans[0]).toMatchObject({ id: again.planId, level: 'moderate' })
+  })
+
+  it('keeps the investigated limit at or above the direct one when the deployment lowers it after a larger value was stored', async () => {
+    const disk = new MemoryMediaPool()
+    await (await mount({ routing: ROUTING }, ['codex', 'antigravity'], disk)).update({ maxDirectFiles: 8 })
+    const restarted = await mount({ routing: ROUTING, classification: { maxInvestigatedFiles: 5 } }, ['codex', 'antigravity'], disk)
+    expect(restarted.status().classification).toEqual({ maxDirectFiles: 8, maxInvestigatedFiles: 8 })
+  })
+})
+
 describe('Toranja write-scope check in the project tree', () => {
   const run = async (sideEffect: (cwd: string) => void, writeScope = ['tracked.txt'], before?: (repo: string) => void) => {
     const harness = await mount({ routing: ROUTING, approvalPolicy: 'auto' })

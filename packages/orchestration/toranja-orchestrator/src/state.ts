@@ -32,6 +32,8 @@ export const toranjaOrchestrationState = z.object({
   onboarded: z.boolean().optional(),
   tierModels: z.partialRecord(provider, z.partialRecord(z.enum(['light', 'advanced', 'max']), tierModel)).optional(),
   approvalPolicy: z.enum(['off', 'auto', 'always']).optional(),
+  maxDirectFiles: z.number().int().positive().optional(),
+  maxInvestigatedFiles: z.number().int().positive().optional(),
 })
 
 /** Stored orchestration state inferred from {@link toranjaOrchestrationState}. */
