@@ -1249,6 +1249,15 @@ describe('Toranja routed delegation', () => {
         expect(await swept(again)).toEqual([{ ...left[0], inUse: true }, { project: 'demo', branch: 'toranja/ok-name' }])
       })
 
+      it('still reports the branch of a registered worktree whose directory was removed by hand, and keeps it', async () => {
+        const { repo, worktreeRoot, left, toranjaBranches } = await restarted([undefined])
+        // Removed without `git worktree prune`: the registration stays in .git/worktrees.
+        rmSync(left[0]?.worktree ?? '', { recursive: true, force: true })
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        expect(await swept(again)).toEqual([{ project: 'demo', branch: left[0]?.branch }])
+        expect(toranjaBranches()).toEqual([left[0]?.branch])
+      })
+
       it('leaves alone a worktree whose owner is still running', async () => {
         const { harness, left, toranjaBranches } = await restarted([process.pid])
         // In use by a running Toranja: never removed, and reported as such so nothing stays out of sight.

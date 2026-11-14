@@ -1749,13 +1749,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const [realRoot, realCommon] = await Promise.all([canonical(laneRoot(project)), canonical(common.toString('utf8').trim())])
     if (realRoot === undefined || realCommon === undefined) return []
     const kept: ToranjaLeftoverWorktree[] = []
-    const listedBranches = new Set<string>()
     for (const record of listing.toString('utf8').split('\0\0')) {
       const fields = record.split('\0')
       const listed = fields.find(field => field.startsWith('worktree '))?.slice('worktree '.length)
       const branch = fields.find(field => field.startsWith('branch refs/heads/toranja/'))?.slice('branch refs/heads/'.length)
       const name = branch?.slice('toranja/'.length)
-      if (branch !== undefined) listedBranches.add(branch)
       if (listed === undefined || branch === undefined || name === undefined || !LANE_NAME.test(name)) continue
       const path = join(laneRoot(project), name)
       const real = await canonical(path)
@@ -1781,11 +1779,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (released === 'branch kept') kept.push({ project: project.id, branch })
       else if (released === 'kept') kept.push({ project: project.id, worktree: path, branch })
     }
-    // A branch whose worktree is gone has no listing left to find it by; it is only reported, never deleted.
+    // A branch with no usable worktree (gone, invalid registration) is only reported, never deleted; one already reported above is skipped.
+    const reported = new Set(kept.map(left => left.branch))
     const refs = await gitOutput(project.path, ['for-each-ref', '--format=%(refname)', 'refs/heads/toranja/'])
     for (const ref of refs?.toString('utf8').split('\n') ?? []) {
       const branch = ref.slice('refs/heads/'.length)
-      if (ref.startsWith('refs/heads/toranja/') && LANE_NAME.test(branch.slice('toranja/'.length)) && !listedBranches.has(branch) && !lanesInUse.has(ref)) {
+      if (ref.startsWith('refs/heads/toranja/') && LANE_NAME.test(branch.slice('toranja/'.length)) && !reported.has(branch) && !lanesInUse.has(ref)) {
         kept.push({ project: project.id, branch })
       }
     }
