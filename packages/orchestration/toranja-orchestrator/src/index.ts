@@ -5,10 +5,10 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { constants, existsSync, mkdtempSync, rmSync, type Stats } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
-import { lstat, readdir, readFile, realpath, stat } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, join } from 'node:path'
+import { lstat, open, readdir, readFile, readlink, realpath } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -118,6 +118,13 @@ const GIT_GRACE_MS = 3_000
 const GIT_TIMEOUT_MS = 60_000
 /** Largest file of a Git directory compared by content; a larger one is compared by size and times. */
 const GIT_FILE_LIMIT = 1024 * 1024
+/** Most entries of a Git directory's `hooks/` a reading compares; past it the reading fails. */
+const HOOKS_LIMIT = 256
+/** Most ended implementer lanes remembered for the write-scope checks still running. */
+const LANE_HISTORY = 256
+/** Flags that open a file without following a link or waiting on a pipe; the typings list flags Windows does not define. */
+const { O_NOFOLLOW = 0, O_NONBLOCK = 0 } = constants as Partial<typeof constants>
+const READ_FLAGS = constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK
 /** Index and tree modes of a symbolic link and of a submodule. */
 const LINK_MODES = new Set(['120000', '160000'])
 /** Task levels from lowest to highest. */
@@ -131,6 +138,17 @@ const APPROVE_PLAN = 'Aprovar e executar'
 const REVISE_PLAN = 'Revisar o plano'
 /** Level of a plan as the approval question names it. */
 const LEVEL_NAMES: Record<TaskLevel, string> = { simple: 'simples', moderate: 'moderado', complex: 'complexo' }
+/** Where a write scope writes, as the approval question says it: whole directories apart from files, or the whole project. */
+const writes = (scope: readonly string[], project: string): string => {
+  if (scope.includes('./')) return `no projeto ${project} inteiro`
+  const directories = scope.filter(entry => entry.endsWith('/')).length
+  const files = scope.length - directories
+  const parts = [
+    ...directories === 0 ? [] : [`${directories} ${directories === 1 ? 'diretório inteiro' : 'diretórios inteiros'}`],
+    ...files === 0 ? [] : [`${files} ${files === 1 ? 'arquivo' : 'arquivos'}`],
+  ]
+  return `em ${parts.join(' e ')} no projeto ${project}`
+}
 /** Most paths a write-scope failure names. */
 const SCOPE_REPORT_LIMIT = 5
 /** Whether paths compare without regard to case, as the platform's default file system does. */
@@ -573,7 +591,7 @@ interface ScopeSnapshot {
   readonly files: ReadonlyMap<string, string>
   /** Ignored entries as Git lists them, a directory collapsed to one entry. */
   readonly ignored: ReadonlySet<string>
-  /** Configuration, exclude file, and hooks of the common Git directory, each read as data. */
+  /** Configuration, exclude and attributes files, and hooks of the Git directories, each read as data. */
   readonly gitFiles: ReadonlyMap<string, string>
   /** Every ref and the object it names. */
   readonly refs: ReadonlyMap<string, string>
@@ -1001,10 +1019,42 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return hash.digest('hex')
   }
   /**
+   * Look at one entry without following a link or blocking on a pipe. A
+   * regular file of up to `limit` bytes is read through a descriptor checked
+   * to hold one, so an entry swapped after it was looked at is never read as
+   * a file; anything else is described by its facts alone.
+   * @returns The entry's facts and the hash of its content when it was read, or undefined when nothing is there.
+   */
+  const readEntry = async (path: string, limit: number): Promise<{ readonly entry: Stats; readonly hash?: string } | undefined> => {
+    const seen = await lstat(path).catch(() => undefined)
+    if (seen === undefined || !seen.isFile() || seen.size > limit) return seen === undefined ? undefined : { entry: seen }
+    // Where the platform has no O_NOFOLLOW, a link put here meanwhile is opened; the descriptor is checked either way.
+    const handle = await open(path, READ_FLAGS).catch(() => undefined)
+    if (handle === undefined) {
+      const again = await lstat(path).catch(() => undefined)
+      return again === undefined ? undefined : { entry: again }
+    }
+    try {
+      const entry = await handle.stat()
+      if (!entry.isFile() || entry.size > limit) return { entry }
+      // At most the size checked is read, however much the file grows meanwhile.
+      const content = Buffer.alloc(entry.size)
+      let filled = 0
+      while (filled < content.length) {
+        const { bytesRead } = await handle.read(content, filled, content.length - filled, filled)
+        if (bytesRead === 0) break
+        filled += bytesRead
+      }
+      return { entry, hash: createHash('sha256').update(content.subarray(0, filled)).digest('hex') }
+    } finally {
+      await handle.close()
+    }
+  }
+  /**
    * Describe each entry of a working tree: a regular file listed by content
    * by its content hash, any other entry by size, modification time, and
    * change time. A file over the size limit, or past the reading budget, is
-   * described like an entry not read by content.
+   * described like an entry not read by content. A link is described, never followed.
    */
   const entryFacts = async (
     cwd: string,
@@ -1015,18 +1065,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const described: [string, string][] = []
     for (const [paths, byContent] of groups) {
       for (const path of paths) {
-        const facts = await stat(join(cwd, path)).then(
-          async (entry) => {
-            if (!byContent || !entry.isFile() || entry.size > UNTRACKED_CONTENT_LIMIT || entry.size > budget) {
-              // The change time moves on every write and cannot be put back as the modification time can.
-              return `${entry.size}:${entry.mtimeMs}:${entry.ctimeMs}`
-            }
-            budget -= entry.size
-            return createHash('sha256').update(await readFile(join(cwd, path))).digest('hex')
-          },
-          () => 'missing',
-        )
-        described.push([path, facts])
+        const read = await readEntry(join(cwd, path), byContent ? Math.min(UNTRACKED_CONTENT_LIMIT, budget) : -1)
+        if (read?.hash !== undefined) budget -= read.entry.size
+        // The change time moves on every write and cannot be put back as the modification time can.
+        described.push([path, read === undefined ? 'missing' : read.hash ?? `${read.entry.size}:${read.entry.mtimeMs}:${read.entry.ctimeMs}`])
       }
     }
     return described
@@ -1093,14 +1135,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const hidden = index.toString('utf8').split('\0').filter(entry => /^[a-zS] /u.test(entry))
       const state = createHash('sha256').update(filters.names.join('\0')).update('\0\0')
       for (const entry of hidden) {
-        // Only a regular file is opened: a pipe put in its place would hold the Host.
-        const file = join(cwd, entry.slice(2))
-        const content = await stat(file).then(
-          async facts => facts.isFile()
-            ? createHash('sha256').update(await readFile(file)).digest('hex')
-            : `not-a-file:${facts.size}:${facts.mtimeMs}`,
-          () => 'missing',
-        )
+        // Only a regular file is read: a pipe put in its place would hold the Host.
+        const read = await readEntry(join(cwd, entry.slice(2)), Infinity)
+        const content = read === undefined ? 'missing' : read.hash ?? `not-a-file:${read.entry.size}:${read.entry.mtimeMs}`
         state.update(`${entry}\0${content}\0`)
       }
       return {
@@ -1153,36 +1190,68 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * else by its type, size, and times.
    */
   const gitFileFacts = async (path: string): Promise<string> => {
-    const entry = await lstat(path).catch(() => undefined)
-    if (entry === undefined) return 'missing'
-    if (!entry.isFile() || entry.size > GIT_FILE_LIMIT) {
-      return `${entry.isFile() ? 'large' : 'not-a-file'}:${entry.size}:${entry.mtimeMs}:${entry.ctimeMs}`
-    }
-    return createHash('sha256').update(await readFile(path)).digest('hex')
+    const read = await readEntry(path, GIT_FILE_LIMIT)
+    if (read === undefined) return 'missing'
+    const { entry, hash } = read
+    if (hash !== undefined) return `${entry.mode}:${hash}`
+    const target = entry.isSymbolicLink() ? await readlink(path).catch(() => '') : ''
+    return `${entry.isFile() ? 'large' : 'not-a-file'}:${entry.mode}:${entry.size}:${entry.mtimeMs}:${entry.ctimeMs}:${target}`
   }
-  /** The configuration, exclude file, and hooks of a common Git directory, by name. */
-  const gitFiles = async (common: string): Promise<Map<string, string>> => {
-    const hooks = await readdir(join(common, 'hooks')).catch(() => [])
-    const names = ['config', 'info/exclude', ...hooks.sort().map(name => `hooks/${name}`)]
-    return new Map(await Promise.all(names.map(async name => [name, await gitFileFacts(join(common, name))] as const)))
+  /**
+   * The configuration, per-worktree configuration, exclude and attributes
+   * files, and hooks of a common Git directory, by name, the hooks directory
+   * itself, and the per-worktree configuration of a linked worktree's own Git
+   * directory. Only a missing hooks directory means no hooks: any other
+   * failure to list it, or more than {@link HOOKS_LIMIT} entries, fails the reading.
+   */
+  const gitFiles = async (common: string, gitDir: string): Promise<Map<string, string>> => {
+    const hooks = await readdir(join(common, 'hooks')).catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return []
+      throw error
+    })
+    if (hooks.length > HOOKS_LIMIT) throw new Error(`${join(common, 'hooks')} has more than ${HOOKS_LIMIT} entries`)
+    const files = new Map<string, string>()
+    for (const name of ['config', 'config.worktree', 'info/exclude', 'info/attributes', 'hooks', ...hooks.sort().map(hook => `hooks/${hook}`)]) {
+      files.set(name, await gitFileFacts(join(common, name)))
+    }
+    const own = relative(common, gitDir).replaceAll('\\', '/')
+    if (own !== '') files.set(`${own}/config.worktree`, await gitFileFacts(join(gitDir, 'config.worktree')))
+    return files
   }
   /** Lane branches by when their lane stopped being in use, on {@link laneClock}; `undefined` while in use. */
   const laneEnds = new Map<string, number | undefined>()
   let laneClock = 0
   /** Whether a lane branch was in use at any moment after `since`, so its own run, not another, answers for it. */
   const laneBusySince = (ref: string, since: number): boolean => laneEnds.has(ref) && (laneEnds.get(ref) ?? Infinity) > since
+  /** Mark a lane branch no longer in use, keeping only the {@link LANE_HISTORY} that ended last. */
+  const endLane = (ref: string): void => {
+    // Moved to the end, so the entries are in the order their lanes ended.
+    laneEnds.delete(ref)
+    laneEnds.set(ref, ++laneClock)
+    // shortcut: a check running since before a dropped lane ended blames its run for that branch; raise LANE_HISTORY past that many.
+    let ended = [...laneEnds.values()].filter(end => end !== undefined).length
+    for (const [key, end] of laneEnds) {
+      if (ended <= LANE_HISTORY) break
+      if (end !== undefined) {
+        laneEnds.delete(key)
+        ended--
+      }
+    }
+  }
   /**
    * Read what a write-scope check compares, with the same precautions as the
    * working-tree fingerprint. Returns undefined when Git fails.
    * @param scope - Git arguments selecting the Git directory and work tree found before the run.
    * @param branch - Branch whose tip is compared besides the checked-out commit.
    * @param common - Common Git directory found before the run.
+   * @param gitDir - Git directory of the work tree found before the run.
    */
   const readScope = async (
     cwd: string,
     scope: readonly string[],
     branch: string | undefined,
     common: string,
+    gitDir: string,
   ): Promise<ScopeSnapshot | undefined> => {
     try {
       const filters = await filtersOff(cwd, scope)
@@ -1222,7 +1291,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         index: entries,
         files: new Map(files),
         ignored: new Set(zList(ignored)),
-        gitFiles: await gitFiles(common),
+        gitFiles: await gitFiles(common, gitDir),
         refs: new Map(refs.toString('utf8').split('\n').filter(Boolean).map((line) => {
           const space = line.lastIndexOf(' ')
           return [line.slice(0, space), line.slice(space + 1)] as const
@@ -1276,19 +1345,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // Found once, before the run: a `.git` entry or `core.worktree` the run changes cannot redirect the reading after it.
     const scope = lane === undefined ? [`--git-dir=${gitDir}`, `--work-tree=${top}`] : laneScope
     const read = async (): Promise<ScopeSnapshot | undefined> =>
-      await readScope(cwd, scope, lane?.branch, common) ?? await readScope(cwd, scope, lane?.branch, common)
+      await readScope(cwd, scope, lane?.branch, common, gitDir) ?? await readScope(cwd, scope, lane?.branch, common, gitDir)
     // The run may move its own branch: the one checked out, and the worktree's.
     const ownRefs = new Set([
       (await gitOutput(cwd, [...scope, 'symbolic-ref', '-q', 'HEAD']))?.toString('utf8').trim(),
       lane === undefined ? undefined : `refs/heads/${lane.branch}`,
     ])
+    // A worktree's reading goes through the Git directory recorded for it, so its `.git` entry is compared directly.
+    const pointer = async (): Promise<string | undefined> => lane === undefined ? undefined : await gitFileFacts(join(lane.path, '.git'))
     const lanesSince = laneClock
+    const pointerBefore = await pointer()
     const before = await read()
     if (before === undefined) return () => Promise.resolve(unreadable)
     return async () => {
       const relocated = await locate()
       if (relocated === undefined) return unreadable
-      if (relocated !== located) return `${role} changed the Git directory`
+      if (relocated !== located || await pointer() !== pointerBefore) return `${role} changed the Git directory`
       const after = await read()
       if (after === undefined) return unreadable
       const gitState = changedKeys(before.gitFiles, after.gitFiles)
@@ -1342,7 +1414,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }
         return undefined
       }
-      for (const path of paths) {
+      // A link is never exempt as an ignored entry: it can lead the project anywhere.
+      for (const path of [...paths, ...[...ignored].sort()]) {
         if (linked.has(path)) return `${role} changed a link or submodule: ${path}`
         const link = await linkOnDisk(path)
         if (link !== undefined) return `${role} changed a link or submodule: ${link}`
@@ -1486,7 +1559,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ctx.logger.warn(`toranja-orchestrator: worktree for project ${project.id} could not be created: ${String(error)}`)
       return undefined
     } finally {
-      if (lane === undefined && laneEnds.has(`refs/heads/${branch}`)) laneEnds.set(`refs/heads/${branch}`, ++laneClock)
+      if (lane === undefined && laneEnds.has(`refs/heads/${branch}`)) endLane(`refs/heads/${branch}`)
     }
   }
   /**
@@ -1501,7 +1574,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const removed = await removeUntouched(lane)
     // A worktree that is kept is no longer in use, so the user can manage it with plain Git commands.
     if (!removed) await gitOutput(lane.project.path, ['worktree', 'unlock', lane.path])
-    laneEnds.set(`refs/heads/${lane.branch}`, ++laneClock)
+    endLane(`refs/heads/${lane.branch}`)
     return removed
   }
   const removeUntouched = async (lane: IsolatedLane): Promise<boolean> => {
@@ -1728,10 +1801,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     void awaitRouted(started).then(async ({ run, result, violation, error }) => {
       const { lane } = run.request
       if (lane !== undefined && await releaseLane(lane)) ledger.dropWorktree(run.lease.taskId)
-      run.lease.settle(
-        result?.stopReason === 'completed' && violation === undefined,
-        violation ?? error ?? result?.diagnostic ?? result?.stopReason,
-      )
+      const success = result?.stopReason === 'completed' && violation === undefined
+      run.lease.settle(success, violation ?? error ?? result?.diagnostic ?? result?.stopReason)
+      // A failed writer leaves nothing to review; what it spent stays until the next reset.
+      if (!success) unreviewed.get(run.request.project.id)?.delete(run.lease.taskId)
     })
   }
 
@@ -1960,8 +2033,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const directHeld = new Set<{ readonly project: string; readonly files: readonly string[] }>()
   /** Files of moderate plans the policy approved in each project since its last reset. */
   const investigatedSpent = new Map<string, Set<string>>()
-  /** When each project's budgets were last reset by a passing gate over a delegated implementer. */
-  const lastReset = new Map<string, string>()
+  /** Writing tasks started in each project since its last reset that no passing gate named yet; a failed one leaves at once. */
+  const unreviewed = new Map<string, Set<string>>()
+  /** Writing delegations of each project admitted and still starting. */
+  const admitting = new Map<string, number>()
   /** Plan each investigation task supports; an investigation backs one plan only. */
   const evidenceUse = new Map<string, string>()
   const fileKey = (path: string): string => CASE_INSENSITIVE ? path.toLowerCase() : path
@@ -2306,6 +2381,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         return JSON.stringify({ planId: plan.id, state, decidedBy, level, path, reasons, writeScope })
       }
       const tasks = ledger.tasks()
+      // An investigation that left the task history can no longer be offered as evidence, so its entry goes too.
+      const known = new Set(tasks.map(task => task.id))
+      for (const id of evidenceUse.keys()) if (!known.has(id)) evidenceUse.delete(id)
       for (const id of evidenceTaskIds) {
         const used = evidenceUse.get(id)
         if (used !== undefined) {
@@ -2322,6 +2400,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
       if (policy === 'off' || (policy === 'auto' && path !== 'approve')) {
         if (policy === 'auto' && level === 'moderate') investigatedSpent.set(project.id, investigated)
+        // Its implementer spends nothing under the plan, so many simple plans cannot add up to a larger change unseen.
+        if (policy === 'auto' && path === 'direct') {
+          directSpent.set(project.id, new Set([...directSpent.get(project.id) ?? [], ...writeScope.map(fileKey)]))
+        }
         return decide('approved', 'policy')
       }
       const interaction = ctx.get('userQuestions')
@@ -2332,7 +2414,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           questions: [{
             id: plan.id,
             header: 'Aprovação do plano',
-            question: `Aprovar este plano ${LEVEL_NAMES[level]} que escreve em ${writeScope.length} ${writeScope.length === 1 ? 'caminho' : 'caminhos'} no projeto ${project.title}?`,
+            question: `Aprovar este plano ${LEVEL_NAMES[level]} que escreve ${writes(writeScope, project.title)}?`,
             // The decision comes before the plan, so a long plan cannot push it out of view.
             detail: [
               `- Nível: ${level}`,
@@ -2408,6 +2490,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const { settle: settleBudget, ...approval } = await admitWrite(project, role, task, args.writeScope, args.planId)
       // The direct budget is spent only once an agent started; any earlier failure gives it back.
       let agentStarted = false
+      const writing = roleAccess(role) === 'write'
+      if (writing) admitting.set(project.id, (admitting.get(project.id) ?? 0) + 1)
       try {
         // Each implementer gets a worktree of its own when the deployment asks for it.
         const lanes = await Promise.all(selected.map(() => role === 'implementer' ? isolate(project) : Promise.resolve(undefined)))
@@ -2445,6 +2529,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             )
             const { route } = started
             agentStarted = true
+            if (writing) unreviewed.set(project.id, (unreviewed.get(project.id) ?? new Set()).add(started.lease.taskId))
             settleInBackground(started)
             return {
               ok: true as const,
@@ -2475,6 +2560,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         return JSON.stringify({ project: project.id, role, activations, failures })
       } finally {
         settleBudget?.(agentStarted)
+        if (writing) admitting.set(project.id, (admitting.get(project.id) ?? 1) - 1)
       }
     },
   }))
@@ -2486,7 +2572,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       project: { type: 'string', required: true, description: 'Project lane id from list_project_lanes.' },
       implementationSummary: { type: 'string', required: true, description: 'What changed, including relevant files and claimed validation.' },
       acceptanceCriteria: { type: 'string', required: true, description: 'Concrete conditions that must all hold before delivery.' },
-      implementationTaskId: { type: 'string', description: 'taskId returned by the delegate_project_task implementer run under review. Supply it so the reviewer runs on a different provider and, when the gate passes, the project\'s budgets reset and its approved plans close; omit it only when no delegated implementer wrote the change.' },
+      implementationTaskId: { type: 'string', description: 'taskId returned by the delegate_project_task implementer run under review. Supply it so the reviewer runs on a different provider and, when the gate passes, the implementer counts as reviewed; once every implementer started since the last reset is reviewed and none is running, the project\'s budgets reset and its approved plans close. Omit it only when no delegated implementer wrote the change.' },
     },
     output: {
       schema: { type: 'string' },
@@ -2596,9 +2682,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }
       }))
       const passed = results.every(result => result.stopReason === 'completed' && result.verdict === 'pass')
-      // Only a gate over a delegated implementer started since the last reset ends a delivery; otherwise
-      // the leader could reset its own budgets with a gate over nothing.
-      const budgetReset = passed && implementation !== undefined && implementation.startedAt > (lastReset.get(project.id) ?? '')
+      // A passing gate over a writer started since the last reset marks it reviewed. The delivery ends only
+      // when no writer is left unreviewed, running, or starting; otherwise the leader could reset budgets
+      // other writers spent with a gate over a trivial one, or over nothing.
+      const pending = unreviewed.get(project.id)
+      const reviewed = passed && implementation !== undefined && pending?.delete(implementation.id) === true
+      const writing = (admitting.get(project.id) ?? 0) > 0
+        || ledger.tasks().some(task => task.projectId === project.id && task.state === 'active' && roleAccess(task.role) === 'write')
+      const budgetReset = reviewed && pending.size === 0 && !writing
       if (budgetReset) {
         // The delivery is done: its plans are spent and simple tasks and moderate plans start new budgets.
         const closedAt = new Date().toISOString()
@@ -2607,7 +2698,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }
         directSpent.delete(project.id)
         investigatedSpent.delete(project.id)
-        lastReset.set(project.id, closedAt)
       }
       let replan: Record<string, unknown> | undefined
       if (replanOnGateFailure && results.some(result => result.verdict === 'fail')) {

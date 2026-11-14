@@ -47,7 +47,10 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRules = {
     'auth', 'autentic', 'autoriz', 'deploy', 'releas', 'production', 'produç', 'produc', 'force', 'rm -r', 'rm -f',
     'chmod', 'chown', 'sudo',
   ],
-  protectedPaths: ['.github/', '**/.env*', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/migrations/'],
+  protectedPaths: [
+    '.github/', '.vscode/', '.idea/', '.husky/', '.claude/', '.cursor/', '**/.env*', '**/.envrc', '**/.npmrc', '**/.gitattributes',
+    '**/.gitmodules', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/migrations/',
+  ],
 }
 
 // Windows opens a reserved device name, with or without an extension, instead of a file.

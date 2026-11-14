@@ -199,7 +199,10 @@ describe('classifyTask', () => {
     expect(rules.maxDirectFiles).toBe(3)
     expect(rules.maxInvestigatedFiles).toBe(10)
     expect(rules.riskTerms).toContain('rm -r')
-    expect(rules.protectedPaths).toEqual(['.github/', '**/.env*', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/migrations/'])
+    expect(rules.protectedPaths).toEqual([
+      '.github/', '.vscode/', '.idea/', '.husky/', '.claude/', '.cursor/', '**/.env*', '**/.envrc', '**/.npmrc', '**/.gitattributes',
+      '**/.gitmodules', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/migrations/',
+    ])
   })
 
   it('is simple for a few files without risk', () => {
