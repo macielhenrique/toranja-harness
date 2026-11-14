@@ -334,6 +334,18 @@ describe('Orchestrator settings page: approval', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('maxInvestigatedFiles must not be below maxDirectFiles')
     expect(within(direct).getByText('3')).toBeTruthy()
   })
+
+  it('after a rejection reads the Host again, so a change made by another client shows without waiting', async () => {
+    const host = mount(status({ approvalPolicy: 'auto' }), 60_000)
+    host.updateSettings.mockRejectedValueOnce(new Error('o limite mudou'))
+    const group = await policies()
+    host.set(status({ approvalPolicy: 'always' }))
+    fireEvent.click(within(group).getByRole('radio', { name: 'Desligada' }))
+    await waitFor(() => {
+      expect(within(group).getByRole('radio', { name: 'Sempre perguntar' }).getAttribute('aria-checked')).toBe('true')
+    })
+    expect(screen.getByRole('alert').textContent).toContain('o limite mudou')
+  })
 })
 
 describe('Orchestrator settings page: roles, fallback, and cross-review', () => {

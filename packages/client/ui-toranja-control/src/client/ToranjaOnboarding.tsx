@@ -132,6 +132,14 @@ export function ToranjaOnboarding({
       return true
     } catch (reason) {
       if (mounted.current) setError(reason instanceof Error ? reason.message : ORCHESTRATOR_COPY.saveFailed)
+      // Another client may have changed the Host meanwhile: show what it stores, keeping the error.
+      const reread = ++latest.current
+      try {
+        const stored = await readStatus()
+        if (mounted.current && reread === latest.current) setStatus(stored)
+      } catch {
+        // The last known snapshot stays on screen.
+      }
       return false
     } finally {
       if (mounted.current) setBusy(false)

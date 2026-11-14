@@ -88,6 +88,16 @@ export function OrchestratorSection({
     } catch (reason) {
       // A background refresh that fails keeps the page as it is.
       if (mounted.current && !quiet) setError(reason instanceof Error ? reason.message : failure)
+      if (!quiet) {
+        // Another client may have changed the Host meanwhile: show what it stores, keeping the error.
+        const reread = ++latest.current
+        try {
+          const stored = await readStatus()
+          if (mounted.current && reread === latest.current) setStatus(stored)
+        } catch {
+          // The last known snapshot stays; the next background read retries.
+        }
+      }
       return false
     } finally {
       if (!quiet) {
@@ -96,7 +106,7 @@ export function OrchestratorSection({
         if (mounted.current && pending.current === 0) setBusy(false)
       }
     }
-  }, [])
+  }, [readStatus])
 
   useEffect(() => {
     mounted.current = true
