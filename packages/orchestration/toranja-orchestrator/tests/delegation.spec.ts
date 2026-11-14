@@ -1229,6 +1229,26 @@ describe('Toranja routed delegation', () => {
         expect(existsSync(left[0]?.worktree ?? '')).toBe(false)
       })
 
+      it('keeps reporting a branch Git could not delete after the orchestrator restarts, and never deletes it', async () => {
+        const { harness, repo, worktreeRoot, left, toranjaBranches } = await restarted([deadPid()], (worktree) => {
+          const common = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: worktree }).toString().trim()
+          writeFileSync(join(resolve(worktree, common), 'refs', 'heads', 'toranja', `${basename(worktree)}.lock`), '')
+        })
+        expect(await swept(harness)).toEqual([{ project: 'demo', branch: left[0]?.branch }])
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        expect(await swept(again)).toEqual([{ project: 'demo', branch: left[0]?.branch }])
+        expect(toranjaBranches()).toEqual([left[0]?.branch])
+      })
+
+      it('reports a toranja branch with no worktree only when its name is one this plugin gives, and a live worktree once', async () => {
+        const { repo, worktreeRoot, left } = await restarted([process.pid])
+        for (const name of ['toranja/Bad_Name', 'toranja/three-part-name', 'toranja/nodash', 'toranja/ok-name']) {
+          execFileSync('git', ['branch', name, 'HEAD'], { cwd: repo, stdio: 'ignore' })
+        }
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        expect(await swept(again)).toEqual([{ ...left[0], inUse: true }, { project: 'demo', branch: 'toranja/ok-name' }])
+      })
+
       it('leaves alone a worktree whose owner is still running', async () => {
         const { harness, left, toranjaBranches } = await restarted([process.pid])
         // In use by a running Toranja: never removed, and reported as such so nothing stays out of sight.

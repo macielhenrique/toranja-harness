@@ -204,7 +204,9 @@ project) instead of the project's working tree:
   `git worktree remove` by hand: it holds work, it carries no lock from this
   machine, or it or its Git directory is reached through a link. An entry
   without `worktree` is a branch alone: the directory was removed but Git could
-  not delete the branch.
+  not delete the branch. Such a branch is listed again on every start, until
+  you delete it, because the sweep also lists `toranja/*` branches that no
+  worktree holds; it never deletes them.
 - The change time also moves when another program renames a file or changes
   its permissions, so such a change made during a `read-only` or `execute`
   task to a file compared without reading it counts against that task.
