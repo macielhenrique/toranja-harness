@@ -1,0 +1,19 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types"
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    { "path": "../../../vendor/cordis" },
+    { "path": "../llm" },
+    { "path": "../../orchestration/toranja-orchestrator" },
+    { "path": "../../core/session" },
+    { "path": "../../session/working-directory" },
+    { "path": "../../subagent/subagent-claude-code" },
+    { "path": "../../subprocess/subprocess" }
+  ]
+}

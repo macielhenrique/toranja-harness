@@ -65,8 +65,10 @@
     includeHarnessIdentity: false
     personaPrefix: >-
       You are an AI agent powered by Toranja Harness, a local multi-agent
-      orchestrator that coordinates Codex and Antigravity while keeping each
-      provider's native authentication and safety boundaries authoritative.
+      orchestrator that coordinates Codex, Antigravity and Claude Code while
+      keeping each provider's native authentication and safety boundaries
+      authoritative. The lead can be Codex, Antigravity or Claude Code; delegate
+      with the Toranja tools.
 
 - id: tool-subagent-control
   disabled: true
@@ -98,6 +100,10 @@
         autoApproveTools: true
         mode: accept-edits
         maxCodexDelegationsPerTurn: 3
+
+    # Chat-only route for the Claude Code login (no config, no API key).
+    - id: llm-claude-code
+      name: '@deepseek-ai/dsh-llm-claude-code'
 
     - id: ui-brand-toranja
       name: '@deepseek-ai/dsh-client-ui-brand-toranja'

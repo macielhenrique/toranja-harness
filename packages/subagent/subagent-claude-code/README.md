@@ -112,6 +112,10 @@ This section explains how the provider drives a real Claude Code CLI and where t
 
 A start accepts only a non-empty sequence of text blocks and derives the child cwd from the parent session. It creates a private `AbortController`, calls the official SDK `query()` with the exact concatenated task, and publishes the run only after the SDK's custom-spawn hook has supplied a live CLI handle owned by the subprocess seam. The provider iterates the complete message stream and accepts only a `result` message with `subtype: "success"`, `is_error: false`, and a nonblank `result`, followed by normal iterator completion. Every other outcome maps to a fixed-category `error` diagnostic naming the lifecycle stage and observed process outcome — the category set lives in [`src/run.ts`](src/run.ts). Local cancellation wins the result race and maps to `aborted` without a failure diagnostic.
 
+### Reused exports
+
+Besides the plugin entry, the package exports the process and lifecycle pieces another Claude Code integration reuses instead of copying: `claudeSpawnSpec` and `ManagedClaudeCodeProcess` place an SDK-spawned CLI under `ctx.subprocess`, `disposeClaudeCodeChild` closes a query and waits for its process to exit, `claudeCodeFailureDiagnostic` renders the fixed stage, category, and process facts of a failure, and `CLAUDE_CODE_EFFORTS` with `DEFAULT_DISPOSE_GRACE_MS` carry the accepted reasoning levels and termination grace. [`@deepseek-ai/dsh-llm-claude-code`](../../llm/llm-claude-code/README.md) uses them.
+
 </details>
 
 -----

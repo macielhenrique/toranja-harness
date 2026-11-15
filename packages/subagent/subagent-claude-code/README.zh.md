@@ -112,6 +112,10 @@ Bundle 将 `tool-subagent-claude-code` 作为 Host 条目插入，因此 `subage
 
 一次启动只接受非空的文本块序列，并使用子代理服务选择的子级 cwd。它创建私有 `AbortController`，用精确拼接的任务调用官方 SDK `query()`，并仅在 SDK 的 custom-spawn 钩子已经提供由子进程 seam 管理的活动 CLI 句柄后发布运行。提供方完整迭代消息流，只接受满足 `subtype: "success"`、`is_error: false` 且 `result` 非空白、随后迭代器正常结束的 `result` 消息。其余一切结果都映射为带固定类别的 `error` 诊断，命名生命周期阶段与已观测进程结果——类别集合见 [`src/run.ts`](src/run.ts)。本地取消会在结果竞态中胜出并映射为 `aborted`，且不附带失败诊断。
 
+### 复用的导出
+
+除插件入口外，本包还导出另一个 Claude Code 集成可直接复用而无需复制的进程与生命周期部件：`claudeSpawnSpec` 与 `ManagedClaudeCodeProcess` 把 SDK 启动的 CLI 交给 `ctx.subprocess` 管理，`disposeClaudeCodeChild` 关闭查询并等待其进程退出，`claudeCodeFailureDiagnostic` 输出失败的固定阶段、类别与进程事实，`CLAUDE_CODE_EFFORTS` 与 `DEFAULT_DISPOSE_GRACE_MS` 给出可接受的推理等级与终止宽限时间。[`@deepseek-ai/dsh-llm-claude-code`](../../llm/llm-claude-code/README.zh.md) 使用这些导出。
+
 </details>
 
 -----

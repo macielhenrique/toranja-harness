@@ -12,6 +12,11 @@ assinaturas e sem depender de uma assinatura DeepSeek.
 
 - conversa principal alternável entre Codex e Antigravity, cada um usando seu
   próprio login local e seus próprios limites;
+- conversa principal também pelo Claude Code (login oficial do CLI `claude`,
+  sem chave de API), usando só as ferramentas do Toranja, sem ferramentas
+  próprias nem MCPs/plugins do usuário; mantém uma sessão contínua por conversa
+  e a reabre com o histórico quando ele muda (compactação, troca de provedor,
+  reinício do app);
 - delegação para Codex e Antigravity, isoladamente ou em equipe;
 - modos **Equipe**, **Só Codex** e **Só Antigravity**, persistidos entre
   reinicializações;
