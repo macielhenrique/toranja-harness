@@ -28,6 +28,10 @@ The single chat currently uses:
 - **Antigravity** as either the primary model or an external
   implementation/review specialist through the installed `agy` CLI and its
   existing local authentication;
+- **Claude Code** as a lead option through the login of the installed `claude` CLI,
+  with no API key. As lead it only answers in text: it has no tools of its own
+  and loads none of the user's MCP servers or plugins. Harness tools for the
+  Claude lead, a continuous session and history are in development;
 - **Agent Teams** for parallel Codex teammates, direct messages, and a shared
   task board.
 
