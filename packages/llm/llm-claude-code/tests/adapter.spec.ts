@@ -72,6 +72,8 @@ function scriptQuery(script: Script, after: 'end' | 'hang' | Error = 'end', outc
 }
 
 let exitOutcome: SubprocessOutcome | undefined
+/** When set, `done` of every fake CLI process rejects with it, as a provider failure does. */
+let exitFailure: Error | undefined
 /** When set, `waitForExit()` of every fake CLI process resolves only once this settles. */
 let exitConfirmed: Promise<void> | undefined
 
@@ -85,8 +87,12 @@ function fakeSubprocess(specs: SubprocessSpawnSpec[]): { spawn: (spec: Subproces
     spawn(spec) {
       specs.push(spec)
       let exit: (outcome: SubprocessOutcome) => void = () => undefined
-      const done = new Promise<SubprocessOutcome>((resolve) => { exit = resolve })
-      queueMicrotask(() => { if (exitOutcome !== undefined) exit(exitOutcome) })
+      let fail: (error: Error) => void = () => undefined
+      const done = new Promise<SubprocessOutcome>((resolve, reject) => { exit = resolve; fail = reject })
+      queueMicrotask(() => {
+        if (exitFailure !== undefined) fail(exitFailure)
+        else if (exitOutcome !== undefined) exit(exitOutcome)
+      })
       const handle: Partial<SubprocessHandle> = {
         stdin: new PassThrough(),
         stdout: new PassThrough(),
@@ -140,6 +146,7 @@ async function collect(adapter: LlmAdapter, options: GenerateOptions): Promise<S
 beforeEach(() => {
   sdk.query.mockReset()
   exitOutcome = undefined
+  exitFailure = undefined
   exitConfirmed = undefined
 })
 
@@ -1195,5 +1202,253 @@ describe('ClaudeCodeAdapter history reconciliation', () => {
     await collect(adapter, withTools([user('oi')]))
     await collect(adapter, withTools([user('oi'), asks({ type: 'text', text: 'Vou delegar.' }, call('toolu_1')), toolResult('toolu_1', 'feito')]))
     expect(sdk.query).toHaveBeenCalledOnce()
+  })
+})
+
+const ABORTED_FINISH = { type: 'finish', reason: { kind: 'aborted' } }
+const partialText = [
+  event({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+  event({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'parc' } }),
+]
+
+describe('ClaudeCodeAdapter request and stream edge cases', () => {
+  it('names attachments in the prompt and skips a message left without text', async () => {
+    const { adapter } = harness()
+    const queries = scriptQuery([success()])
+    await collect(adapter, request({
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'veja' }, { type: 'image', attachment: {} }, { type: 'file', attachment: { name: 'a.pdf' } }] },
+        { role: 'assistant', content: [{ type: 'text', text: '' }] },
+        { role: 'user', content: [{ type: 'text', text: 'e agora' }] },
+      ] as unknown as GenerateOptions['messages'],
+    }))
+    expect((await firstPrompt(queries[0]))?.message.content)
+      .toBe('USUÁRIO:\nveja\n[imagem anexada no Toranja Harness]\n[arquivo anexado: a.pdf]\n\nUSUÁRIO:\ne agora')
+  })
+
+  it('ends the input of a query once the query is closed', async () => {
+    const { adapter } = harness()
+    const queries = scriptQuery([success()])
+    await collect(adapter, request())
+    const sent: unknown[] = []
+    for await (const message of queries[0]?.prompt ?? []) sent.push(message.message.content)
+    expect(sent).toEqual(['oi'])
+  })
+
+  it('answers a model it does not list with the same reasoning levels', async () => {
+    const { adapter } = harness()
+    const resolved = await adapter.resolveModel('claude-code-local', 'claude-novo')
+    expect(resolved).toMatchObject({ provider: 'claude-code-local', id: 'claude-novo', name: 'claude-novo' })
+    expect(resolved.reasoning?.efforts).toHaveLength(5)
+  })
+
+  it.each([
+    ['an API error category it does not classify', [apiError('server_error'), failedTurn('API Error: 500')], 'server_error'],
+    ['an API error without category', [failedTurn('API Error: 500')], 'unknown'],
+  ] as const)('reports %s as a generic failure naming the category', async (_label, script, named) => {
+    const { adapter } = harness()
+    scriptQuery(script, 'hang')
+    const failure = failureOf(await finishOf(adapter))
+    expect(failure.code).toBe('CLAUDE_CODE_ERROR')
+    expect(failure.message).toContain(`(${named})`)
+    expect(failure.message).not.toContain('sk-ant')
+  })
+
+  it('reports an error result without error details by its subtype alone', async () => {
+    const { adapter } = harness()
+    scriptQuery([{ type: 'result', subtype: 'error_max_turns', is_error: true, errors: [], usage: {} }])
+    expect(failureOf(await finishOf(adapter)).message).toBe('O Claude Code encerrou o turno com erro (error_max_turns)')
+  })
+
+  it('goes on when the CLI reports a login check without error', async () => {
+    const { adapter } = harness()
+    scriptQuery([{ type: 'auth_status', isAuthenticating: true, output: [] }, ...reply('Olá')])
+    expect(await finishOf(adapter)).toEqual(STOP_FINISH)
+  })
+
+  it('skips a content block of a kind the harness has no use for', async () => {
+    const { adapter } = harness()
+    scriptQuery([
+      event({ type: 'content_block_start', index: 0, content_block: { type: 'redacted_thinking', data: 'x' } }),
+      event({ type: 'content_block_stop', index: 0 }),
+      ...textBlock(1, 'ok'),
+      success({ result: 'ok' }),
+    ])
+    const chunks = await collect(adapter, request())
+    expect(chunks.filter(chunk => chunk.type === 'block-start')).toEqual([{ type: 'block-start', index: 0, blockType: 'text' }])
+    expect(chunks.at(-1)).toEqual(STOP_FINISH)
+  })
+
+  it('hands over a tool call without argument text as an empty object, ignoring other deltas and a usage the CLI left out', async () => {
+    const { adapter } = harness()
+    scriptQuery([
+      event({ type: 'message_start', message: {} }),
+      event({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'mcp__toranja__delegate_project_task', input: {} } }),
+      event({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ignorado' } }),
+      event({ type: 'content_block_stop', index: 0 }),
+      event({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: {} }),
+    ], 'hang')
+    expect(await collect(adapter, withTools([user('oi')]))).toEqual([
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'toolu_1', name: 'delegate_project_task', arguments: '{}' } },
+      TOOL_CALLS_FINISH,
+    ])
+  })
+
+  it.each([
+    ['the stream ends without a result', 'end', 'invalid-result'],
+    ['the stream throws without a process outcome', new Error('stderr: sk-ant-secret'), 'unknown'],
+  ] as const)('reports a turn whose CLI %s with its stage and category', async (_label, after, category) => {
+    const { adapter, warnings } = harness()
+    scriptQuery([], after)
+    const failure = failureOf(await finishOf(adapter))
+    expect(failure.code).toBe('CLAUDE_CODE_ERROR')
+    expect(failure.message).toContain(`stage: query-run; category: ${category}`)
+    expect(failure.message).not.toContain('sk-ant')
+    expect(warnings.length > 0).toBe(after !== 'end')
+  })
+
+  it('reports a CLI process whose exit cannot be observed as a failed turn', async () => {
+    exitFailure = new Error('provider: sk-ant-secret')
+    const { adapter } = harness()
+    scriptQuery([], 'hang')
+    const failure = failureOf(await finishOf(adapter))
+    expect(failure.code).toBe('CLAUDE_CODE_ERROR')
+    expect(failure.message).not.toContain('sk-ant')
+  })
+})
+
+describe('ClaudeCodeAdapter teardown and cancellation edge cases', () => {
+  it('closes a query that never started its process', async () => {
+    const { adapter } = harness()
+    const close = vi.fn()
+    sdk.query.mockImplementation(() => Object.assign((async function* () { yield success({ result: 'ok' }) })(), { interrupt: vi.fn(), close }))
+    expect(await finishOf(adapter)).toEqual(STOP_FINISH)
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('drops a message the CLI had ready when the turn was aborted', async () => {
+    const { adapter } = harness()
+    const ready = [...partialText, event({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ial' } })]
+    let next = 0
+    // Every read is already settled, so a message wins the race against the abort.
+    const fake = {
+      [Symbol.asyncIterator]: (): unknown => fake,
+      next: () => Promise.resolve(next < ready.length ? { done: false, value: ready[next++] } : { done: true, value: undefined }),
+      interrupt: vi.fn(() => Promise.resolve()),
+      close: vi.fn(),
+    }
+    sdk.query.mockImplementation(() => fake)
+    const controller = new AbortController()
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream(request({ signal: controller.signal }))) {
+      chunks.push(chunk)
+      if (chunk.type === 'text-delta') controller.abort()
+    }
+    expect(chunks.map(chunk => chunk.type)).toEqual(['block-start', 'text-delta', 'finish'])
+    expect(chunks.at(-1)).toMatchObject(ABORTED_FINISH)
+  })
+
+  it('finishes as aborted even when the CLI refuses the interrupt', async () => {
+    const { adapter } = harness()
+    const controller = new AbortController()
+    const queries = scriptQuery(partialText, 'hang')
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream(request({ signal: controller.signal }))) {
+      chunks.push(chunk)
+      if (chunk.type === 'text-delta') {
+        queries[0]?.interrupt.mockRejectedValue(new Error('recusado'))
+        controller.abort()
+      }
+    }
+    expect(chunks.at(-1)).toMatchObject(ABORTED_FINISH)
+    await vi.waitFor(() => { expect(queries[0]?.close).toHaveBeenCalled() })
+  })
+
+  it('logs a teardown failure of the CLI process without failing the turn', async () => {
+    const { adapter, dispose, warnings } = harness()
+    sessionQuery([{ script: reply('Olá') }])
+    await collect(adapter, conversation([user('oi')]))
+    let refuse: (error: Error) => void = () => undefined
+    exitConfirmed = new Promise<void>((_resolve, reject) => { refuse = reject })
+    exitConfirmed.catch(() => undefined)
+    const disposal = Promise.resolve(dispose())
+    refuse(new Error('sem confirmação de saída'))
+    await disposal
+    expect(warnings.some(args => String(args[0]).includes('teardown failed'))).toBe(true)
+  })
+
+  it('leaves no session behind when the plugin is disposed during a turn, and opens a new query on the next one', async () => {
+    const { adapter, dispose } = harness()
+    const fakes = sessionQuery([{ script: [], then: 'hang' }, { script: reply('ok') }])
+    const running = collect(adapter, conversation([user('oi')]))
+    await vi.waitFor(() => { expect(fakes).toHaveLength(1) })
+    await dispose()
+    expect(failureOf((await running).at(-1) as StreamChunk).code).toBe('CLAUDE_CODE_ERROR')
+
+    expect(await finishOf(adapter, conversation([user('oi')]))).toEqual(STOP_FINISH)
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[1]?.received).toEqual(['oi'])
+  })
+
+  it('finishes as aborted, opening no query, a turn aborted while it waits for the running one', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá').slice(0, 2), then: 'hang' }])
+    const first = new AbortController()
+    const second = new AbortController()
+    const running = collect(adapter, conversation([user('oi')], { signal: first.signal }))
+    await vi.waitFor(() => { expect(fakes).toHaveLength(1) })
+    const waiting = collect(adapter, conversation([user('oi'), assistant('Olá'), user('mais')], { signal: second.signal }))
+    second.abort()
+    first.abort()
+
+    expect((await waiting).at(-1)).toMatchObject(ABORTED_FINISH)
+    expect((await running).at(-1)).toMatchObject(ABORTED_FINISH)
+    expect(sdk.query).toHaveBeenCalledOnce()
+    expect(fakes[0]?.received).toEqual(['oi'])
+  })
+
+  it('interrupts the reopened query when the turn is aborted while the old one is still closing', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('ok') }])
+    await collect(adapter, conversation([user('oi')]))
+    let confirm: () => void = () => undefined
+    exitConfirmed = new Promise((resolve) => { confirm = resolve })
+    const controller = new AbortController()
+    const reopened = collect(adapter, conversation([user('oi'), assistant('Olá'), user('mais')], { model: 'sonnet', signal: controller.signal }))
+    await vi.waitFor(() => { expect(fakes[0]?.close).toHaveBeenCalled() })
+    controller.abort()
+    confirm()
+
+    expect((await reopened).at(-1)).toMatchObject(ABORTED_FINISH)
+    expect(fakes[1]?.interrupt).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the query after a turn aborted before any content, and sends the next message on it', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: [], then: 'hang' }, { script: reply('ok') }])
+    const controller = new AbortController()
+    const running = collect(adapter, conversation([user('oi')], { signal: controller.signal }))
+    await vi.waitFor(() => { expect(fakes[0]?.received).toEqual(['oi']) })
+    controller.abort()
+    expect((await running).at(-1)).toMatchObject(ABORTED_FINISH)
+
+    expect(await finishOf(adapter, conversation([user('oi'), user('continue')]))).toEqual(STOP_FINISH)
+    expect(sdk.query).toHaveBeenCalledOnce()
+    expect(fakes[0]?.received).toEqual(['oi', 'continue'])
+    expect(fakes[0]?.close).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['ends', 'end'],
+    ['fails', new Error('stderr: sk-ant-secret')],
+  ] as const)('closes the session of an aborted turn whose CLI %s before reporting the interrupted result', async (_label, after) => {
+    const { adapter } = harness()
+    const controller = new AbortController()
+    const queries = scriptQuery(partialText, after)
+    for await (const chunk of adapter.stream(conversation([user('oi')], { signal: controller.signal }))) {
+      if (chunk.type === 'text-delta') controller.abort()
+    }
+    await vi.waitFor(() => { expect(queries[0]?.close).toHaveBeenCalled() })
   })
 })

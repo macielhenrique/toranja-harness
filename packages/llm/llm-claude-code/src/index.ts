@@ -130,8 +130,12 @@ function promptOf(options: GenerateOptions): { readonly system: string; readonly
     else rows.push(`FERRAMENTA:\n${text}`)
   }
   let omitted = 0
-  for (let size = rows.join('\n\n').length; size > MAX_TRANSCRIPT_CHARS && omitted < rows.length - 1; omitted++) {
-    size -= (rows[omitted]?.length ?? 0) + 2
+  let size = rows.join('\n\n').length
+  // The newest row always stays, however long.
+  for (const row of rows.slice(0, -1)) {
+    if (size <= MAX_TRANSCRIPT_CHARS) break
+    size -= row.length + 2
+    omitted++
   }
   const kept = omitted === 0 ? rows : [`[${omitted} mensagens anteriores omitidas da transcrição]`, ...rows.slice(omitted)]
   const conversation = options.messages.filter(message => message.role === 'user' || message.role === 'assistant')
@@ -201,13 +205,16 @@ interface ApiUsage {
   readonly cache_creation_input_tokens?: number | null
 }
 
+/** Usage with every count known, as the CLI reports it. */
+type Counted = Required<Pick<TokenUsage, 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>>
+
 /**
  * Harness usage of API counts, less what earlier steps of the same CLI turn already reported.
  * @param usage - API counts.
  * @param spent - usage already reported for this CLI turn.
  * @returns the remaining usage, never negative.
  */
-function tokenUsage(usage: ApiUsage, spent?: TokenUsage): TokenUsage {
+function tokenUsage(usage: ApiUsage, spent?: Counted): Counted {
   const left = (count: number | null | undefined, already = 0): number => Math.max(0, (count ?? 0) - already)
   return {
     inputTokens: left(usage.input_tokens, spent?.inputTokens),
@@ -217,12 +224,12 @@ function tokenUsage(usage: ApiUsage, spent?: TokenUsage): TokenUsage {
   }
 }
 
-function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+function sumUsage(a: Counted, b: Counted): Counted {
   return {
     inputTokens: a.inputTokens + b.inputTokens,
     outputTokens: a.outputTokens + b.outputTokens,
-    cacheReadTokens: (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0),
-    cacheWriteTokens: (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0),
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
   }
 }
 
@@ -286,7 +293,7 @@ class LiveQuery {
   /** Tool calls of the last step, in model order, that the harness has not answered yet. */
   awaiting: readonly string[] = []
   /** Usage already reported for the steps of the running CLI turn. */
-  spent: TokenUsage = tokenUsage({})
+  spent: Counted = tokenUsage({})
   /** Conversation entries the CLI holds; its length counts the messages delivered. */
   seen: readonly Entry[] = []
   idle: ReturnType<typeof setTimeout> | undefined
@@ -526,8 +533,7 @@ class ClaudeCodeAdapter extends LlmAdapter {
    */
   private async lock(key: string): Promise<() => void> {
     const previous = this.turns.get(key)
-    let release: () => void = () => undefined
-    const current = new Promise<void>((resolve) => { release = resolve })
+    const { promise: current, resolve: release } = Promise.withResolvers<void>()
     this.turns.set(key, current)
     await previous
     return () => {
@@ -574,8 +580,7 @@ class ClaudeCodeAdapter extends LlmAdapter {
     let history: readonly Entry[] = []
     let finish: string | undefined
     const turn: TurnState = { opened: [], completed: false }
-    let stop: (value: typeof STOP) => void = () => undefined
-    const stopped = new Promise<typeof STOP>((resolve) => { stop = resolve })
+    const { promise: stopped, resolve: stop } = Promise.withResolvers<typeof STOP>()
     // Aborting the SDK controller lets the CLI start another paid reply; interrupt stops the turn first.
     const onAbort = (): void => {
       void live?.interrupt()
@@ -653,7 +658,7 @@ class ClaudeCodeAdapter extends LlmAdapter {
       live.seen = turn.opened.length === 0 ? history : [...history, { role: 'assistant', text: reply }]
       const phase = asking ? 'awaiting-tools' : 'idle'
       live.phase = phase
-      live.idle = setTimeout(() => { if (live.phase === phase) void this.forget(key, live) }, asking ? TOOL_CALL_TIMEOUT_MS : IDLE_CLOSE_MS)
+      live.idle = setTimeout(() => { void this.forget(key, live) }, asking ? TOOL_CALL_TIMEOUT_MS : IDLE_CLOSE_MS)
       live.idle.unref()
       return
     }

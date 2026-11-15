@@ -139,6 +139,12 @@ describe('translateTools', () => {
     for (const entry of refused) expect(entry.reason).not.toBe('')
   })
 
+  it('names a tool whose handler cannot be built even when the failure is not an Error', () => {
+    const { tools, refused } = translateTools(schemas.slice(0, 1), () => { throw 'sem handler' })
+    expect(tools).toEqual([])
+    expect(refused).toEqual([{ name: 'list_project_lanes', reason: 'sem handler' }])
+  })
+
   it('marks readOnlyHint only for the tools the caller names', () => {
     const { tools } = translateTools(schemas, noHandler, ['list_project_lanes', 'get_orchestration_status'])
     const hints = Object.fromEntries(tools.map(tool => [tool.name, tool.annotations?.readOnlyHint]))
@@ -280,6 +286,14 @@ describe('createPendingCalls', () => {
     const result = await calls.handlerFor('t')({}, extra('toolu_1'))
     expect(result.isError).toBe(true)
     expect(text(result)).toContain('fila cheia')
+    expect(calls.size).toBe(0)
+  })
+
+  it('turns an onCall that throws a non-Error into an error result with its text', async () => {
+    const calls = createPendingCalls(() => { throw 'fila cheia' })
+    const result = await calls.handlerFor('t')({}, extra('toolu_1'))
+    expect(result.isError).toBe(true)
+    expect(text(result)).toBe('fila cheia')
     expect(calls.size).toBe(0)
   })
 
