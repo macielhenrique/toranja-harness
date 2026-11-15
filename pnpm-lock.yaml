@@ -11111,6 +11111,9 @@ importers:
       '@deepseek-ai/dsh-subagent-claude-code':
         specifier: workspace:*
         version: link:../../subagent/subagent-claude-code
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: workspace:~
