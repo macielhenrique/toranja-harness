@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-当 Toranja Harness 组合需要通过本地 Claude Code CLI 已登录的 Claude 订阅回答对话轮次时，挂载本插件。它注册 `claude-code-local` 路由，提供 `opus`、`sonnet`、`haiku` 别名及其推理等级。每个请求打开一个隔离的 Claude Code 查询，不带工具、宿主设置或 MCP 服务器，流式返回文本和推理，并在结果之后关闭。插件不读取也不复制 API 密钥。目前没有 bundle 挂载本插件。
+当 Toranja Harness 组合需要通过本地 Claude Code CLI 已登录的 Claude 订阅回答对话轮次时，挂载本插件。它注册 `claude-code-local` 路由，提供 `opus`、`sonnet`、`haiku` 别名及其推理等级。每个对话在其各轮之间保持一个隔离的 Claude Code 查询打开，不带工具、宿主设置或 MCP 服务器，并流式返回文本和推理；对话之外的调用打开一个查询，并在结果之后关闭。插件不读取也不复制 API 密钥。目前没有 bundle 挂载本插件。
 
 ## 目录
 
@@ -46,7 +46,7 @@ kind: "package-reference"
 | 成功结果没有任何内容 | `EMPTY_RESPONSE` |
 | `error_*` 结果子类型、其他 API 错误，或 CLI 进程在结果之前结束 | `CLAUDE_CODE_ERROR` |
 
-登录检查只在挂载了 `ctx.toranjaOrchestrator` 时运行；状态未知或没有编排器时查询照常启动，此时由 CLI 自身的身份验证错误生效。中止的 `signal` 会中断该轮、关闭查询，并以类型为 `aborted` 的 `finish` 结束。
+登录检查只在挂载了 `ctx.toranjaOrchestrator` 时运行；状态未知或没有编排器时查询照常启动，此时由 CLI 自身的身份验证错误生效。中止的 `signal` 会中断该轮，并以类型为 `aborted` 的 `finish` 结束；对话查询保持打开供下一轮使用，其他查询则关闭。失败的轮次会关闭其对话查询，因此下一轮会带着对话记录启动新查询。
 
 -----
 
@@ -64,11 +64,15 @@ kind: "package-reference"
 
 ### 查询生命周期
 
-`stream()` 以流式输入调用官方 Agent SDK 的 `query()`，输入一直保持打开直到该轮结束，因为 `interrupt()` 需要它。查询选项是固定的：`tools: []`、`mcpServers: {}`、`strictMcpConfig: true`、`settingSources: []`、`persistSession: false`、`includePartialMessages: true`、一个拒绝所有请求的 `canUseTool` 回调，以及请求的 `model` 和 `effort`。挂载了 `ctx.sessions` 与 `ctx.workingDirectory` 时，工作目录是发起请求的 Session 的工作目录，否则是 Host 进程目录。
+`stream()` 以流式输入调用官方 Agent SDK 的 `query()`：一个用户消息队列，在查询存活期间一直保持打开，因为 `interrupt()` 需要它。带有 `sessionId` 且没有 `purpose` 的请求属于一个以该 id 为键的对话；压缩、Session 标题以及没有 Session 的请求使用一次性查询，在结果之后关闭。
 
-CLI 进程通过 [`@deepseek-ai/dsh-subagent-claude-code`](../../subagent/subagent-claude-code/README.zh.md) 的 `claudeSpawnSpec` 与 `ManagedClaudeCodeProcess` 启动，因此由 `ctx.subprocess` 管理其进程范围。其环境是去掉所有以 `CLAUDE`、`ANTHROPIC` 或 `MCP_` 开头的变量之后的 `scrubbedParentEnv()`；CLI 通过用户配置目录找到登录信息，所以 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL` 和自定义的 `CLAUDE_CONFIG_DIR` 都不会到达它。在结果之后或失败之后，`disposeClaudeCodeChild` 关闭查询并等待进程退出；插件释放时关闭所有仍然打开的查询。
+对话查询以一组配置（工作目录、模型、推理等级与系统提示）打开，并记住 CLI 已持有的对话条目。当配置不变、且请求历史等于这些条目后面只追加了新的用户消息时，下一轮复用它：把新的用户文本作为一条消息推入，并读取同一个查询直到该轮的 `result`。其他任何历史（例如被压缩、编辑或来自其他提供方的历史）或配置变化，都会关闭查询并带着对话记录打开新查询。同一对话的各轮依次执行：并发请求会等待正在运行的轮次结束。中止的轮次会被中断，并在读到被中断的 `result` 之后查询才重新空闲；失败的轮次、退出的 CLI 进程、空闲十分钟或插件释放都会关闭它。
 
-取消时先调用 `interrupt()`，在它完成后、或在 subagent 的释放宽限时间之后再调用 `close()`，因为只中止 SDK 控制器会让 CLI 再开始一次付费回复。
+查询选项是固定的：`tools: []`、`mcpServers: {}`、`strictMcpConfig: true`、`settingSources: []`、`persistSession: false`、`includePartialMessages: true`、一个拒绝所有请求的 `canUseTool` 回调，以及请求的 `model` 和 `effort`。挂载了 `ctx.sessions` 与 `ctx.workingDirectory` 时，工作目录是发起请求的 Session 的工作目录，否则是 Host 进程目录。
+
+CLI 进程通过 [`@deepseek-ai/dsh-subagent-claude-code`](../../subagent/subagent-claude-code/README.zh.md) 的 `claudeSpawnSpec` 与 `ManagedClaudeCodeProcess` 启动，因此由 `ctx.subprocess` 管理其进程范围。其环境是去掉所有以 `CLAUDE`、`ANTHROPIC` 或 `MCP_` 开头的变量之后的 `scrubbedParentEnv()`；CLI 通过用户配置目录找到登录信息，所以 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL` 和自定义的 `CLAUDE_CONFIG_DIR` 都不会到达它。关闭查询时调用 `disposeClaudeCodeChild`，它关闭查询并等待进程退出；插件释放时关闭所有仍然打开的查询。
+
+取消时调用 `interrupt()`，最多等待 subagent 的释放宽限时间，因为只中止 SDK 控制器会让 CLI 再开始一次付费回复。之后一次性查询关闭；对话查询只有在同一宽限时间内没有收到被中断的 `result` 时才关闭。
 
 </details>
 
@@ -85,7 +89,7 @@ Claude Code 收到的是一个自定义系统提示，由 `GenerateOptions.syste
 
 #### Token 影响
 
-每个请求都会重新发送完整的投影历史，因为每次调用都会打开新的 CLI 会话。CLI 会在自定义系统提示之外加入它自己的固定请求框架。
+延续存活对话查询的轮次只发送新的用户文本；CLI 保留之前的各轮。打开查询时（第一轮或重新打开之后）发送完整的投影历史。CLI 会在自定义系统提示之外加入它自己的固定请求框架。
 
 #### KV Cache 影响
 
@@ -110,7 +114,7 @@ Claude Code 收到的是一个自定义系统提示，由 `GenerateOptions.syste
 <a id="known-limitations-and-deferred-work"></a>
 
 - **仅文本**——该路由不提供 harness 工具，来自其他提供方的工具结果消息会从投影历史中丢弃。
-- **没有持续会话**——每个请求启动新的 CLI 进程并重新发送完整历史。
+- **会话只复用简单延续**——历史若不是记住的条目后面追加新用户消息，就会带着完整对话记录重新打开查询，而不是加以协调。
 - **尚未被任何 bundle 挂载**——Toranja Harness bundle 与模型选择器的注册留待以后。
 - **登录预检读取的是宿主 `claude` 可执行文件**——编排器探测宿主 CLI，而 SDK 启动的是它自己的平台锁定运行时，因此 `not-installed` 可能拒绝一个本可启动的运行时。
 - **不支持自定义 `CLAUDE_CONFIG_DIR`**——环境过滤会移除它，存放在默认配置目录之外的登录信息不会被找到。

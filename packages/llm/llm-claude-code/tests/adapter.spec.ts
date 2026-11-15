@@ -427,3 +427,229 @@ describe('ClaudeCodeAdapter login and lifecycle', () => {
     expect(queries[0]?.close).toHaveBeenCalled()
   })
 })
+
+interface SessionTurn {
+  readonly script: Script
+  /** `hang` waits for interrupt (then yields an error result) or close; `die` kills the process and throws. */
+  readonly then?: 'hang' | 'die'
+}
+
+interface FakeSession extends FakeQuery {
+  readonly received: string[]
+}
+
+/** Drive the mocked SDK as a live CLI: every queued user message runs the next scripted turn. */
+function sessionQuery(turns: SessionTurn[]): FakeSession[] {
+  const fakes: FakeSession[] = []
+  sdk.query.mockImplementation(({ prompt, options }: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => {
+    let wake: () => void = () => undefined
+    let interrupted = false
+    let closed = false
+    const fake: FakeSession = {
+      options,
+      prompt,
+      received: [],
+      interrupt: vi.fn(() => {
+        interrupted = true
+        wake()
+        return Promise.resolve(undefined)
+      }),
+      close: vi.fn(() => {
+        closed = true
+        wake()
+      }),
+    }
+    fakes.push(fake)
+    const child = options.spawnClaudeCodeProcess?.({
+      command: 'claude',
+      args: [],
+      ...options.cwd === undefined ? {} : { cwd: options.cwd },
+      env: options.env ?? {},
+      signal: new AbortController().signal,
+    })
+    async function* messages() {
+      for await (const message of prompt) {
+        if (closed) return
+        fake.received.push(message.message.content as string)
+        const turn: SessionTurn = turns.shift() ?? { script: [success()] }
+        interrupted = false
+        for (const scripted of turn.script) yield scripted
+        if (turn.then === 'die') {
+          child?.kill('SIGTERM')
+          throw new Error('stderr: sk-ant-secret')
+        }
+        if (turn.then === 'hang') {
+          await new Promise<void>((resolve) => {
+            wake = resolve
+            if (interrupted || closed) resolve()
+          })
+          if (closed) return
+          yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: [], usage: {} }
+        }
+      }
+    }
+    return Object.assign(messages(), { interrupt: fake.interrupt, close: fake.close })
+  })
+  return fakes
+}
+
+const user = (text: string) => ({ role: 'user', content: [{ type: 'text', text }] })
+const assistant = (text: string) => ({ role: 'assistant', content: [{ type: 'reasoning', text: 'oculto' }, { type: 'text', text }] })
+const reply = (text: string) => [
+  event({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+  event({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }),
+  event({ type: 'content_block_stop', index: 0 }),
+  success({ result: text }),
+]
+
+function conversation(history: readonly Record<string, unknown>[], overrides: Partial<GenerateOptions> = {}): GenerateOptions {
+  return request({ sessionId: 's1' as SessionId, messages: history as unknown as GenerateOptions['messages'], ...overrides })
+}
+
+const transcriptOfSecondTurn = 'USUÁRIO:\noi\n\nASSISTENTE:\nOlá\n\nUSUÁRIO:\nmais'
+const STOP_FINISH = { type: 'finish', reason: { kind: 'stop' } }
+
+describe('ClaudeCodeAdapter live session', () => {
+  it('runs the second turn of a conversation on the same query, sending only the new user message', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('Tudo bem') }])
+    expect(await finishOf(adapter, conversation([user('oi')]))).toEqual(STOP_FINISH)
+    const second = await collect(adapter, conversation([user('oi'), assistant('Olá'), user('como vai?')]))
+
+    expect(sdk.query).toHaveBeenCalledOnce()
+    expect(fakes[0]?.received).toEqual(['oi', 'como vai?'])
+    expect(second.filter(chunk => chunk.type === 'text-delta')).toEqual([{ type: 'text-delta', index: 0, text: 'Tudo bem' }])
+    expect(second.at(-1)).toEqual(STOP_FINISH)
+    expect(fakes[0]?.close).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['model', { model: 'sonnet' }],
+    ['effort', { reasoningEffort: ReasoningEffortId('high') }],
+    ['system prompt', { system: 'Outra instrução.' }],
+  ] as const)('reopens the query with a transcript when the %s changes', async (_label, change) => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('ok') }])
+    await collect(adapter, conversation([user('oi')]))
+    await collect(adapter, conversation([user('oi'), assistant('Olá'), user('mais')], change))
+
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[0]?.close).toHaveBeenCalled()
+    expect(fakes[1]?.received).toEqual([transcriptOfSecondTurn])
+  })
+
+  it('reopens the query when the working directory of the session changes', async () => {
+    let directory = 'C:/a'
+    const session = { id: 's1' }
+    const { adapter } = harness({ sessions: { get: () => session }, workingDirectory: { get: () => directory } })
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('ok') }])
+    await collect(adapter, conversation([user('oi')]))
+    directory = 'C:/b'
+    await collect(adapter, conversation([user('oi'), assistant('Olá'), user('mais')]))
+
+    expect(fakes.map(fake => fake.options.cwd)).toEqual(['C:/a', 'C:/b'])
+  })
+
+  it.each([
+    ['an earlier message was edited', [user('oi editado'), assistant('Olá'), user('mais')]],
+    ['the recorded reply differs', [user('oi'), assistant('Outra resposta'), user('mais')]],
+    ['earlier messages were removed', [user('mais')]],
+    ['the new message is not from the user', [user('oi'), assistant('Olá'), assistant('extra')]],
+  ] as const)('reopens the query when %s', async (_label, history) => {
+    const { adapter } = harness()
+    sessionQuery([{ script: reply('Olá') }, { script: reply('ok') }])
+    await collect(adapter, conversation([user('oi')]))
+    await collect(adapter, conversation(history))
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['compaction', 'session-title'] as const)('keeps a %s call on its own disposable query', async (purpose) => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('resumo') }, { script: reply('ok') }])
+    await collect(adapter, conversation([user('oi')]))
+    await collect(adapter, conversation([user('oi'), assistant('Olá'), user('resuma')], { purpose }))
+    expect(fakes[1]?.close).toHaveBeenCalled()
+    await collect(adapter, conversation([user('oi'), assistant('Olá'), user('mais')]))
+
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[0]?.received).toEqual(['oi', 'mais'])
+  })
+
+  it('makes a concurrent turn of the same conversation wait for the running one', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('ok') }])
+    const finishes = await Promise.all([
+      finishOf(adapter, conversation([user('oi')])),
+      finishOf(adapter, conversation([user('oi'), assistant('Olá'), user('mais')])),
+    ])
+
+    expect(finishes).toEqual([STOP_FINISH, STOP_FINISH])
+    expect(sdk.query).toHaveBeenCalledOnce()
+    expect(fakes[0]?.received).toEqual(['oi', 'mais'])
+  })
+
+  it('interrupts an aborted turn without closing the query and runs the next turn on it', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('parcial').slice(0, 2), then: 'hang' }, { script: reply('ok') }])
+    const controller = new AbortController()
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream(conversation([user('oi')], { signal: controller.signal }))) {
+      chunks.push(chunk)
+      if (chunk.type === 'text-delta') controller.abort()
+    }
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'aborted' } })
+    expect(fakes[0]?.interrupt).toHaveBeenCalledOnce()
+
+    expect(await finishOf(adapter, conversation([user('oi'), assistant('parcial'), user('continue')]))).toEqual(STOP_FINISH)
+    expect(sdk.query).toHaveBeenCalledOnce()
+    expect(fakes[0]?.received).toEqual(['oi', 'continue'])
+    expect(fakes[0]?.close).not.toHaveBeenCalled()
+  })
+
+  it('reports a process that dies mid-turn and reopens the next turn with a transcript', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: [], then: 'die' }, { script: reply('ok') }])
+    await collect(adapter, conversation([user('oi')]))
+    const failure = failureOf(await finishOf(adapter, conversation([user('oi'), assistant('Olá'), user('mais')])))
+    expect(failure.code).toBe('CLAUDE_CODE_ERROR')
+    expect(failure.message).not.toContain('sk-ant')
+    await collect(adapter, conversation([user('oi'), assistant('Olá'), user('mais')]))
+
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[0]?.close).toHaveBeenCalled()
+    expect(fakes[1]?.received).toEqual([transcriptOfSecondTurn])
+  })
+
+  it('closes the session after a failed turn and reopens on the next one', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: [apiError('rate_limit'), failedTurn()] }, { script: reply('ok') }])
+    expect(failureOf(await finishOf(adapter, conversation([user('oi')]))).code).toBe('RATE_LIMIT')
+    await collect(adapter, conversation([user('oi')]))
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[0]?.close).toHaveBeenCalled()
+  })
+
+  it('closes an idle session after ten minutes', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { adapter } = harness()
+      const fakes = sessionQuery([{ script: reply('Olá') }])
+      await collect(adapter, conversation([user('oi')]))
+      vi.advanceTimersByTime(10 * 60_000 - 1)
+      expect(fakes[0]?.close).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(1)
+      expect(fakes[0]?.close).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('closes a live session when the plugin is disposed', async () => {
+    const { adapter, dispose } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }])
+    await collect(adapter, conversation([user('oi')]))
+    expect(fakes[0]?.close).not.toHaveBeenCalled()
+    dispose()
+    expect(fakes[0]?.close).toHaveBeenCalled()
+  })
+})

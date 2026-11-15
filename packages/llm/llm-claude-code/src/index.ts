@@ -143,8 +143,169 @@ interface OpenBlock {
   index?: number
 }
 
+/** An idle conversation query closes after this long without a turn. */
+const IDLE_CLOSE_MS = 10 * 60_000
+const STOP = Symbol('stop')
+const NEVER = new Promise<never>(() => undefined)
+
+/** Conversation entry as the CLI sees it: role and projected text. */
+interface Entry {
+  readonly role: string
+  readonly text: string
+}
+
+function conversationOf(messages: readonly RequestMessage[]): Entry[] {
+  return messages.filter(message => message.role !== 'system' && message.role !== 'developer')
+    .map(message => ({ role: message.role, text: blockText(message) }))
+}
+
+/**
+ * Text of the user messages a history appends to what the CLI already holds.
+ * @param seen - entries the live query already received or produced.
+ * @param history - entries of the new request.
+ * @returns the joined new user text, or undefined unless the history only appends user messages.
+ */
+function appended(seen: readonly Entry[], history: readonly Entry[]): string | undefined {
+  if (history.length <= seen.length) return undefined
+  if (JSON.stringify(history.slice(0, seen.length)) !== JSON.stringify(seen)) return undefined
+  const added = history.slice(seen.length)
+  if (added.some(entry => entry.role !== 'user')) return undefined
+  const text = added.map(entry => entry.text).filter(value => value.length > 0).join('\n\n')
+  return text.length === 0 ? undefined : text
+}
+
+/** What one turn produced, read by the settlement after the stream ends. */
+interface TurnState {
+  /** Harness blocks in index order. */
+  readonly opened: OpenBlock[]
+  /** Whether the CLI reported the turn's result. */
+  completed: boolean
+}
+
+/** One Claude Code query and its CLI process, fed by a queue of user messages. */
+class LiveQuery {
+  phase: 'idle' | 'turn-running' | 'closing' | 'closed' = 'turn-running'
+  /** Conversation entries the CLI holds; its length counts the messages delivered. */
+  seen: readonly Entry[] = []
+  idle: ReturnType<typeof setTimeout> | undefined
+  interrupting: Promise<void> | undefined
+  managed: ManagedClaudeCodeProcess | undefined
+  readonly query: Query
+  private readonly messages: AsyncIterator<SDKMessage>
+  private child: SubprocessHandle | undefined
+  private failure: Promise<never> = NEVER
+  private pending: Promise<IteratorResult<SDKMessage>> | undefined
+  private readonly queued: string[] = []
+  private wake: () => void = () => undefined
+  private ended = false
+  private closing: Promise<void> | undefined
+
+  constructor(private readonly ctx: Context, readonly config: string, options: Options) {
+    this.query = query({
+      // Streaming input keeps the control channel open, which interrupt() requires.
+      prompt: this.input(),
+      options: {
+        ...options,
+        spawnClaudeCodeProcess: (spawn: SpawnOptions) => {
+          const child = ctx.subprocess.spawn(claudeSpawnSpec(spawn, DEFAULT_DISPOSE_GRACE_MS))
+          this.child = child
+          this.managed = new ManagedClaudeCodeProcess(child)
+          this.failure = child.done.then(() => NEVER)
+          void this.failure.catch(() => undefined)
+          const exited = (): void => { if (this.closing === undefined) this.phase = 'closed' }
+          void child.done.then(exited, exited)
+          return this.managed
+        },
+      },
+    })
+    this.messages = this.query[Symbol.asyncIterator]()
+  }
+
+  push(text: string): void {
+    this.queued.push(text)
+    this.wake()
+  }
+
+  private async * input(): AsyncIterable<SDKUserMessage> {
+    for (;;) {
+      const text = this.queued.shift()
+      if (text !== undefined) yield { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null }
+      else if (this.ended) return
+      else await new Promise<void>((resolve) => { this.wake = resolve })
+    }
+  }
+
+  /**
+   * Read the next CLI message unless `stop` settles first; a message still
+   * pending then stays for the next read, so none is lost.
+   * @param stop - settles with STOP to give up waiting.
+   * @returns the iterator result, or STOP.
+   */
+  async read(stop: Promise<typeof STOP>): Promise<IteratorResult<SDKMessage> | typeof STOP> {
+    if (this.pending === undefined) {
+      this.pending = this.messages.next()
+      void this.pending.catch(() => undefined)
+    }
+    const next = await Promise.race([this.pending, this.failure, stop])
+    if (next !== STOP) this.pending = undefined
+    return next
+  }
+
+  /** Interrupt the running turn once, bounded by the dispose grace. */
+  interrupt(): Promise<void> {
+    this.interrupting ??= Promise.race([this.query.interrupt(), delay(DEFAULT_DISPOSE_GRACE_MS, undefined, { ref: false })])
+      .then(() => undefined, () => undefined)
+    return this.interrupting
+  }
+
+  /** Interrupt the turn and read through its result, so the next turn starts on a clean stream. */
+  async recover(): Promise<boolean> {
+    await this.interrupt()
+    const stop = delay(DEFAULT_DISPOSE_GRACE_MS, STOP, { ref: false })
+    try {
+      for (;;) {
+        const next = await this.read(stop)
+        if (next === STOP || next.done === true) return false
+        if (next.value.type === 'result') return true
+      }
+    } catch {
+      return false
+    }
+  }
+
+  close(): Promise<void> {
+    this.closing ??= (async () => {
+      this.phase = 'closing'
+      clearTimeout(this.idle)
+      this.ended = true
+      this.wake()
+      await this.release()
+      this.phase = 'closed'
+    })()
+    return this.closing
+  }
+
+  private async release(): Promise<void> {
+    if (this.child === undefined) {
+      this.query.close()
+      return
+    }
+    try {
+      await disposeClaudeCodeChild(this.query, this.child)
+    } catch (error: unknown) {
+      // The turn already reported its outcome; a teardown failure only reaches the host log.
+      this.ctx.logger.warn('llm-claude-code: Claude Code teardown failed: %o', error)
+    }
+  }
+}
+
 class ClaudeCodeAdapter extends LlmAdapter {
-  private readonly open = new Set<Query>()
+  /** Disposable queries of calls outside a conversation. */
+  private readonly open = new Set<LiveQuery>()
+  /** Live query of each conversation, by session id. */
+  private readonly sessions = new Map<string, LiveQuery>()
+  /** Tail of the turn queue of each conversation. */
+  private readonly turns = new Map<string, Promise<void>>()
 
   constructor(private readonly ctx: Context) { super() }
 
@@ -166,8 +327,9 @@ class ClaudeCodeAdapter extends LlmAdapter {
 
   /** Close every query still open, for plugin disposal. */
   dispose(): void {
-    for (const running of this.open) running.close()
+    for (const live of [...this.open, ...this.sessions.values()]) void live.close()
     this.open.clear()
+    this.sessions.clear()
   }
 
   private cwd(options: GenerateOptions): string {
@@ -183,30 +345,38 @@ class ClaudeCodeAdapter extends LlmAdapter {
     return connection === 'signed-out' || connection === 'not-installed'
   }
 
-  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const signal = options.signal
-    if (aborted(signal)) {
-      yield ABORTED
-      return
+  /** Conversation key of a request; auxiliary calls and calls without a session have none. */
+  private sessionKey(options: GenerateOptions): string | undefined {
+    return options.purpose === undefined && options.sessionId !== undefined ? String(options.sessionId) : undefined
+  }
+
+  /**
+   * Wait for the previous turn of a conversation to settle; turns of one
+   * conversation run one at a time on its single query.
+   * @param key - conversation key.
+   * @returns the release that lets the next turn start.
+   */
+  private async lock(key: string): Promise<() => void> {
+    const previous = this.turns.get(key)
+    let release: () => void = () => undefined
+    const current = new Promise<void>((resolve) => { release = resolve })
+    this.turns.set(key, current)
+    await previous
+    return () => {
+      if (this.turns.get(key) === current) this.turns.delete(key)
+      release()
     }
-    if (this.signedOut()) {
-      yield failed(AUTH_CODE, LOGIN_MESSAGE)
-      return
-    }
-    const { system, prompt } = promptOf(options)
-    let endInput: () => void = () => undefined
-    const inputOpen = new Promise<void>((resolve) => { endInput = resolve })
-    // Streaming input keeps the control channel open, which interrupt() requires.
-    async function* input(): AsyncIterable<SDKUserMessage> {
-      yield { type: 'user', message: { role: 'user', content: prompt }, parent_tool_use_id: null }
-      await inputOpen
-    }
-    let child: SubprocessHandle | undefined
-    let managed: ManagedClaudeCodeProcess | undefined
-    const effort = CLAUDE_CODE_EFFORTS.find(candidate => candidate === options.reasoningEffort)
-    const queryOptions: Options = {
-      cwd: this.cwd(options),
-      model: options.model,
+  }
+
+  private forget(key: string, live: LiveQuery): Promise<void> {
+    if (this.sessions.get(key) === live) this.sessions.delete(key)
+    return live.close()
+  }
+
+  private queryOptions(cwd: string, model: string, effort: ClaudeCodeEffort | undefined, system: string): Options {
+    return {
+      cwd,
+      model,
       ...effort === undefined ? {} : { effort },
       systemPrompt: system,
       tools: [],
@@ -217,148 +387,213 @@ class ClaudeCodeAdapter extends LlmAdapter {
       includePartialMessages: true,
       env: childEnv(),
       canUseTool: () => Promise.resolve({ behavior: 'deny', message: 'Esta rota do Claude Code não oferece ferramentas.' }),
-      spawnClaudeCodeProcess: (spawn: SpawnOptions) => {
-        child = this.ctx.subprocess.spawn(claudeSpawnSpec(spawn, DEFAULT_DISPOSE_GRACE_MS))
-        managed = new ManagedClaudeCodeProcess(child)
-        return managed
-      },
     }
-    const running = query({ prompt: input(), options: queryOptions })
-    this.open.add(running)
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const signal = options.signal
+    if (aborted(signal)) {
+      yield ABORTED
+      return
+    }
+    if (this.signedOut()) {
+      yield failed(AUTH_CODE, LOGIN_MESSAGE)
+      return
+    }
+    const key = this.sessionKey(options)
+    const unlock = key === undefined ? undefined : await this.lock(key)
+    let live: LiveQuery | undefined
+    let history: readonly Entry[] = []
+    let finish: string | undefined
+    const turn: TurnState = { opened: [], completed: false }
+    let stop: (value: typeof STOP) => void = () => undefined
+    const stopped = new Promise<typeof STOP>((resolve) => { stop = resolve })
     // Aborting the SDK controller lets the CLI start another paid reply; interrupt stops the turn first.
     const onAbort = (): void => {
-      void Promise.race([running.interrupt(), delay(DEFAULT_DISPOSE_GRACE_MS, undefined, { ref: false })])
-        .catch(() => undefined)
-        .finally(() => { running.close() })
+      void live?.interrupt()
+      stop(STOP)
     }
     signal?.addEventListener('abort', onAbort, { once: true })
-    const childFailure = child?.done.then(() => new Promise<never>(() => undefined))
-    void childFailure?.catch(() => undefined)
+    try {
+      if (aborted(signal)) {
+        finish = 'aborted'
+        yield ABORTED
+        return
+      }
+      const { system, prompt } = promptOf(options)
+      const effort = CLAUDE_CODE_EFFORTS.find(candidate => candidate === options.reasoningEffort)
+      const cwd = this.cwd(options)
+      const config = JSON.stringify([cwd, options.model, effort ?? null, system])
+      history = conversationOf(options.messages)
+      const kept = key === undefined ? undefined : this.sessions.get(key)
+      const added = kept?.phase === 'idle' && kept.config === config ? appended(kept.seen, history) : undefined
+      if (kept !== undefined && added !== undefined) {
+        live = kept
+      } else {
+        // A changed configuration or a rewritten history reopens with the full transcript.
+        if (kept !== undefined && key !== undefined) await this.forget(key, kept)
+        live = new LiveQuery(this.ctx, config, this.queryOptions(cwd, options.model, effort, system))
+        if (key === undefined) this.open.add(live)
+        else this.sessions.set(key, live)
+      }
+      live.phase = 'turn-running'
+      live.interrupting = undefined
+      clearTimeout(live.idle)
+      live.push(added ?? prompt)
+      if (aborted(signal)) onAbort()
+      for await (const chunk of this.turnChunks(live, signal, stopped, turn)) {
+        if (chunk.type === 'finish') finish = chunk.reason.kind
+        yield chunk
+      }
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+      const settled = live === undefined ? Promise.resolve() : this.settle(key, live, history, finish, turn)
+      // A conversation settles in the background; its next turn waits on the lock.
+      if (unlock === undefined) await settled
+      else void settled.finally(unlock)
+    }
+  }
+
+  /**
+   * Leave a conversation query idle for its next turn, or close it. A failed
+   * turn closes it, because what the CLI then holds is unknown; an aborted turn
+   * keeps it once the interrupted result has been read.
+   */
+  private async settle(
+    key: string | undefined,
+    live: LiveQuery,
+    history: readonly Entry[],
+    finish: string | undefined,
+    turn: TurnState,
+  ): Promise<void> {
+    const keep = key !== undefined && live.phase === 'turn-running' && finish !== 'error'
+      && (finish === 'stop' || finish === 'max-tokens' || turn.completed || await live.recover())
+    if (keep && live.phase === 'turn-running') {
+      const reply = turn.opened.filter(block => block.kind === 'text').map(block => block.text).join('\n').trim()
+      live.seen = turn.opened.length === 0 ? history : [...history, { role: 'assistant', text: reply }]
+      live.phase = 'idle'
+      live.idle = setTimeout(() => { if (live.phase === 'idle') void this.forget(key, live) }, IDLE_CLOSE_MS)
+      live.idle.unref()
+      return
+    }
+    if (live.interrupting !== undefined) await live.interrupting
+    this.open.delete(live)
+    await (key === undefined ? live.close() : this.forget(key, live))
+  }
+
+  /** Stream one turn of `live` until its result, a failure, or `stopped`. */
+  private async * turnChunks(
+    live: LiveQuery,
+    signal: AbortSignal | undefined,
+    stopped: Promise<typeof STOP>,
+    turn: TurnState,
+  ): AsyncIterable<StreamChunk> {
     const blocks = new Map<number, OpenBlock>()
-    let nextIndex = 0
+    const opened = turn.opened
     let apiError: SDKAssistantMessageError | undefined
     let limitRejected = false
     let thrown: unknown
     try {
-      try {
-        const messages: AsyncIterator<SDKMessage> = running[Symbol.asyncIterator]()
-        for (;;) {
-          const next = await (childFailure === undefined ? messages.next() : Promise.race([messages.next(), childFailure]))
-          if (next.done === true || aborted(signal)) break
-          const message = next.value
-          if (message.type === 'stream_event') {
-            const event = message.event
-            if (event.type === 'message_start') {
-              blocks.clear()
-            } else if (event.type === 'content_block_start') {
-              const type = event.content_block.type
-              const kind = type === 'text' ? 'text' : type === 'thinking' ? 'reasoning' : undefined
-              if (kind === undefined) continue
-              const block: OpenBlock = { kind, text: '' }
-              blocks.set(event.index, block)
-              // A thinking block starts on its first visible delta; the CLI may withhold its text.
-              if (kind === 'text') {
-                block.index = nextIndex++
-                yield { type: 'block-start', index: block.index, blockType: kind }
-              }
-            } else if (event.type === 'content_block_delta') {
-              const block = blocks.get(event.index)
-              const delta = event.delta
-              const text = delta.type === 'text_delta' ? delta.text : delta.type === 'thinking_delta' ? delta.thinking : ''
-              if (block === undefined || text.length === 0) continue
-              if (block.index === undefined) {
-                block.index = nextIndex++
-                yield { type: 'block-start', index: block.index, blockType: block.kind }
-              }
-              block.text += text
-              yield { type: block.kind === 'text' ? 'text-delta' : 'reasoning-delta', index: block.index, text }
-            } else if (event.type === 'content_block_stop') {
-              const block = blocks.get(event.index)
-              blocks.delete(event.index)
-              if (block?.index !== undefined) yield { type: 'block-end', index: block.index, block: { type: block.kind, text: block.text } }
+      for (;;) {
+        const next = await live.read(stopped)
+        if (next === STOP || next.done === true) break
+        const message = next.value
+        if (message.type === 'result') turn.completed = true
+        if (aborted(signal)) break
+        if (message.type === 'stream_event') {
+          const event = message.event
+          if (event.type === 'message_start') {
+            blocks.clear()
+          } else if (event.type === 'content_block_start') {
+            const type = event.content_block.type
+            const kind = type === 'text' ? 'text' : type === 'thinking' ? 'reasoning' : undefined
+            if (kind === undefined) continue
+            const block: OpenBlock = { kind, text: '' }
+            blocks.set(event.index, block)
+            // A thinking block starts on its first visible delta; the CLI may withhold its text.
+            if (kind === 'text') {
+              block.index = opened.push(block) - 1
+              yield { type: 'block-start', index: block.index, blockType: kind }
             }
-            continue
+          } else if (event.type === 'content_block_delta') {
+            const block = blocks.get(event.index)
+            const delta = event.delta
+            const text = delta.type === 'text_delta' ? delta.text : delta.type === 'thinking_delta' ? delta.thinking : ''
+            if (block === undefined || text.length === 0) continue
+            if (block.index === undefined) {
+              block.index = opened.push(block) - 1
+              yield { type: 'block-start', index: block.index, blockType: block.kind }
+            }
+            block.text += text
+            yield { type: block.kind === 'text' ? 'text-delta' : 'reasoning-delta', index: block.index, text }
+          } else if (event.type === 'content_block_stop') {
+            const block = blocks.get(event.index)
+            blocks.delete(event.index)
+            if (block?.index !== undefined) yield { type: 'block-end', index: block.index, block: { type: block.kind, text: block.text } }
           }
-          if (message.type === 'assistant' && message.error !== undefined) {
-            apiError = message.error
-            continue
-          }
-          if (message.type === 'rate_limit_event') {
-            if (message.rate_limit_info.status === 'rejected') limitRejected = true
-            continue
-          }
-          if (message.type === 'auth_status') {
-            if (message.error === undefined) continue
-            yield failed(AUTH_CODE, LOGIN_MESSAGE)
-            return
-          }
-          if (message.type !== 'result') continue
-          if (message.subtype !== 'success') {
-            const detail = message.errors.join('; ')
-            yield failed(GENERIC_CODE, `O Claude Code encerrou o turno com erro (${message.subtype})${detail.length === 0 ? '' : `: ${detail}`}`)
-            return
-          }
-          if (message.is_error) {
-            yield turnFailure(apiError, limitRejected, message.result)
-            return
-          }
-          if (nextIndex === 0 && message.result.length > 0) {
-            yield { type: 'block-start', index: 0, blockType: 'text' }
-            yield { type: 'text-delta', index: 0, text: message.result }
-            yield { type: 'block-end', index: 0, block: { type: 'text', text: message.result } }
-            nextIndex = 1
-          }
-          if (nextIndex === 0) {
-            yield failed(EMPTY_RESPONSE_CODE, 'O Claude Code concluiu o turno sem conteúdo.')
-            return
-          }
-          const usage = message.usage
-          yield {
-            type: 'usage',
-            usage: {
-              inputTokens: usage.input_tokens,
-              outputTokens: usage.output_tokens,
-              cacheReadTokens: usage.cache_read_input_tokens,
-              cacheWriteTokens: usage.cache_creation_input_tokens,
-            },
-          }
-          yield { type: 'finish', reason: message.stop_reason === 'max_tokens' ? { kind: 'max-tokens' } : { kind: 'stop' } }
+          continue
+        }
+        if (message.type === 'assistant' && message.error !== undefined) {
+          apiError = message.error
+          continue
+        }
+        if (message.type === 'rate_limit_event') {
+          if (message.rate_limit_info.status === 'rejected') limitRejected = true
+          continue
+        }
+        if (message.type === 'auth_status') {
+          if (message.error === undefined) continue
+          yield failed(AUTH_CODE, LOGIN_MESSAGE)
           return
         }
-      } catch (error: unknown) {
-        thrown = error
-      }
-      if (aborted(signal)) {
-        yield ABORTED
+        if (message.type !== 'result') continue
+        if (message.subtype !== 'success') {
+          const detail = message.errors.join('; ')
+          yield failed(GENERIC_CODE, `O Claude Code encerrou o turno com erro (${message.subtype})${detail.length === 0 ? '' : `: ${detail}`}`)
+          return
+        }
+        if (message.is_error) {
+          yield turnFailure(apiError, limitRejected, message.result)
+          return
+        }
+        if (opened.length === 0 && message.result.length > 0) {
+          opened.push({ kind: 'text', text: message.result, index: 0 })
+          yield { type: 'block-start', index: 0, blockType: 'text' }
+          yield { type: 'text-delta', index: 0, text: message.result }
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: message.result } }
+        }
+        if (opened.length === 0) {
+          yield failed(EMPTY_RESPONSE_CODE, 'O Claude Code concluiu o turno sem conteúdo.')
+          return
+        }
+        const usage = message.usage
+        yield {
+          type: 'usage',
+          usage: {
+            inputTokens: usage.input_tokens,
+            outputTokens: usage.output_tokens,
+            cacheReadTokens: usage.cache_read_input_tokens,
+            cacheWriteTokens: usage.cache_creation_input_tokens,
+          },
+        }
+        yield { type: 'finish', reason: message.stop_reason === 'max_tokens' ? { kind: 'max-tokens' } : { kind: 'stop' } }
         return
       }
-      // Let the managed process publish an exit observed together with the stream end.
-      await Promise.resolve()
-      const outcome = managed?.outcome
-      if (thrown !== undefined) this.ctx.logger.warn('llm-claude-code: Claude Code query failed: %o', thrown)
-      const diagnostic = claudeCodeFailureDiagnostic(outcome === undefined
-        ? { stage: 'query-run', category: thrown === undefined ? 'invalid-result' : 'unknown' }
-        : { stage: 'process', category: 'process', outcome })
-      yield failed(GENERIC_CODE, `O Claude Code encerrou antes de concluir a resposta (${diagnostic}).`)
-    } finally {
-      signal?.removeEventListener('abort', onAbort)
-      endInput()
-      this.open.delete(running)
-      await this.release(running, child)
+    } catch (error: unknown) {
+      thrown = error
     }
-  }
-
-  private async release(running: Query, child: SubprocessHandle | undefined): Promise<void> {
-    if (child === undefined) {
-      running.close()
+    if (aborted(signal)) {
+      yield ABORTED
       return
     }
-    try {
-      await disposeClaudeCodeChild(running, child)
-    } catch (error: unknown) {
-      // The turn already reported its outcome; a teardown failure only reaches the host log.
-      this.ctx.logger.warn('llm-claude-code: Claude Code teardown failed: %o', error)
-    }
+    // Let the managed process publish an exit observed together with the stream end.
+    await Promise.resolve()
+    const outcome = live.managed?.outcome
+    if (thrown !== undefined) this.ctx.logger.warn('llm-claude-code: Claude Code query failed: %o', thrown)
+    const diagnostic = claudeCodeFailureDiagnostic(outcome === undefined
+      ? { stage: 'query-run', category: thrown === undefined ? 'invalid-result' : 'unknown' }
+      : { stage: 'process', category: 'process', outcome })
+    yield failed(GENERIC_CODE, `O Claude Code encerrou antes de concluir a resposta (${diagnostic}).`)
   }
 }
 
