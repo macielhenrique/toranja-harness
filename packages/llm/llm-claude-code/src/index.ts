@@ -1,5 +1,6 @@
-/** Text-only Claude Code model route over the local Claude login for Toranja Harness. */
+/** Claude Code model route over the local Claude login for Toranja Harness, with the harness tools of a conversation. */
 
+import { createHash } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import {
@@ -18,12 +19,17 @@ import {
   LlmAdapter,
   QUOTA_EXCEEDED_CODE,
   ReasoningEffortId,
+  ToolCallId,
+  type ContentBlock,
   type GenerateOptions,
   type LlmModelInfo,
   type LlmProviderInfo,
   type LlmResolvedModelInfo,
   type RequestMessage,
   type StreamChunk,
+  type TokenUsage,
+  type ToolResultMessage,
+  type ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-session'
 import { scrubbedParentEnv, type SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
@@ -38,6 +44,7 @@ import {
 } from '@deepseek-ai/dsh-subagent-claude-code'
 import type {} from '@deepseek-ai/dsh-toranja-orchestrator'
 import type {} from '@deepseek-ai/dsh-working-directory'
+import { BRIDGE_SERVER_NAME, createBridgeServer, type BridgeResult } from './bridge.ts'
 
 export const name = 'llm-claude-code'
 export const inject = ['llm', 'subprocess']
@@ -62,18 +69,25 @@ const MODELS: readonly LlmModelInfo[] = ([
   provider: PROVIDER,
   id,
   name: modelName,
-  description: 'Usa o login e os limites da assinatura local do Claude Code, sem ferramentas.',
+  description: 'Usa o login e os limites da assinatura local do Claude Code; recebe só as ferramentas do Toranja Harness.',
   inputModalities: ['text'] as const,
 }))
 
-function blockText(message: RequestMessage): string {
-  return message.content.flatMap((block) => {
+function contentText(content: readonly ContentBlock[]): string {
+  return content.flatMap((block) => {
     if (block.type === 'text') return [block.text]
-    if (block.type === 'tool-call') return [`[chamada de ferramenta: ${block.name}]`]
+    if (block.type === 'tool-call') return [`[chamada de ferramenta ${block.name} (${block.id}): ${block.arguments}]`]
     if (block.type === 'image') return ['[imagem anexada no Toranja Harness]']
     if (block.type === 'file') return [`[arquivo anexado: ${block.attachment.name}]`]
     return []
   }).join('\n').trim()
+}
+
+/** Text of a message as the CLI sees it; a tool result names the call it answers. */
+function blockText(message: RequestMessage): string {
+  const text = contentText(message.content)
+  if (message.role !== 'tool') return text
+  return `[resultado da chamada ${message.toolCallId}${message.isError === true ? ', com erro' : ''}]\n${text}`.trim()
 }
 
 /**
@@ -91,7 +105,7 @@ function promptOf(options: GenerateOptions): { readonly system: string; readonly
     if (message.role === 'system' || message.role === 'developer') system.push(text)
     else if (message.role === 'user') rows.push(`USUÁRIO:\n${text}`)
     else if (message.role === 'assistant') rows.push(`ASSISTENTE:\n${text}`)
-    // shortcut: tool-result messages are dropped because this route offers no tools; carry them when harness tools reach Claude Code.
+    else rows.push(`FERRAMENTA:\n${text}`)
   }
   const conversation = options.messages.filter(message => message.role === 'user' || message.role === 'assistant')
   const lone = conversation.length === 1 && conversation[0]?.role === 'user' ? conversation[0] : undefined
@@ -137,14 +151,64 @@ function turnFailure(apiError: SDKAssistantMessageError | undefined, limitReject
 }
 
 interface OpenBlock {
-  readonly kind: 'text' | 'reasoning'
+  readonly kind: 'text' | 'reasoning' | 'tool-call'
+  /** Text so far; for a tool call, its raw JSON arguments. */
   text: string
   /** Harness block index, assigned when the block starts. */
   index?: number
+  /** `tool_use` id and harness tool name of a tool call. */
+  readonly call?: { readonly id: string; readonly name: string }
+}
+
+function blockOf({ kind, text, call }: OpenBlock): ContentBlock {
+  return call === undefined
+    ? { type: kind === 'reasoning' ? 'reasoning' : 'text', text }
+    : { type: 'tool-call', id: ToolCallId(call.id), name: call.name, arguments: text === '' ? '{}' : text }
+}
+
+/** Token counts as the Anthropic API reports them; a stream delta leaves unknown counts null. */
+interface ApiUsage {
+  readonly input_tokens?: number | null
+  readonly output_tokens?: number | null
+  readonly cache_read_input_tokens?: number | null
+  readonly cache_creation_input_tokens?: number | null
+}
+
+/**
+ * Harness usage of API counts, less what earlier steps of the same CLI turn already reported.
+ * @param usage - API counts.
+ * @param spent - usage already reported for this CLI turn.
+ * @returns the remaining usage, never negative.
+ */
+function tokenUsage(usage: ApiUsage, spent?: TokenUsage): TokenUsage {
+  const left = (count: number | null | undefined, already = 0): number => Math.max(0, (count ?? 0) - already)
+  return {
+    inputTokens: left(usage.input_tokens, spent?.inputTokens),
+    outputTokens: left(usage.output_tokens, spent?.outputTokens),
+    cacheReadTokens: left(usage.cache_read_input_tokens, spent?.cacheReadTokens),
+    cacheWriteTokens: left(usage.cache_creation_input_tokens, spent?.cacheWriteTokens),
+  }
+}
+
+function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0),
+    cacheWriteTokens: (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0),
+  }
 }
 
 /** An idle conversation query closes after this long without a turn. */
 const IDLE_CLOSE_MS = 10 * 60_000
+/**
+ * Wall-clock limit of one harness tool call, as the CLI enforces it on the bridge. Generous because the
+ * harness may hold a call for human approval; past it the CLI hands the model an error and the late result is dropped.
+ */
+const TOOL_CALL_TIMEOUT_MS = 30 * 60_000
+/** Prefix the CLI gives the tools of the bridge server. */
+const TOOL_PREFIX = `mcp__${BRIDGE_SERVER_NAME}__`
+const ENDED_MESSAGE = 'A conversa do Claude Code foi encerrada antes do resultado desta ferramenta.'
 const STOP = Symbol('stop')
 const NEVER = new Promise<never>(() => undefined)
 
@@ -154,24 +218,17 @@ interface Entry {
   readonly text: string
 }
 
-function conversationOf(messages: readonly RequestMessage[]): Entry[] {
-  return messages.filter(message => message.role !== 'system' && message.role !== 'developer')
-    .map(message => ({ role: message.role, text: blockText(message) }))
-}
-
 /**
- * Text of the user messages a history appends to what the CLI already holds.
+ * Messages a history appends to what the CLI already holds.
  * @param seen - entries the live query already received or produced.
- * @param history - entries of the new request.
- * @returns the joined new user text, or undefined unless the history only appends user messages.
+ * @param history - entries of the new request, one per message of `said`.
+ * @param said - conversation messages of the new request.
+ * @returns the appended messages; none unless the history starts with `seen` and goes past it.
  */
-function appended(seen: readonly Entry[], history: readonly Entry[]): string | undefined {
-  if (history.length <= seen.length) return undefined
-  if (JSON.stringify(history.slice(0, seen.length)) !== JSON.stringify(seen)) return undefined
-  const added = history.slice(seen.length)
-  if (added.some(entry => entry.role !== 'user')) return undefined
-  const text = added.map(entry => entry.text).filter(value => value.length > 0).join('\n\n')
-  return text.length === 0 ? undefined : text
+function appended(seen: readonly Entry[], history: readonly Entry[], said: readonly RequestMessage[]): readonly RequestMessage[] {
+  if (history.length <= seen.length) return []
+  if (JSON.stringify(history.slice(0, seen.length)) !== JSON.stringify(seen)) return []
+  return said.slice(seen.length)
 }
 
 /** What one turn produced, read by the settlement after the stream ends. */
@@ -184,7 +241,12 @@ interface TurnState {
 
 /** One Claude Code query and its CLI process, fed by a queue of user messages. */
 class LiveQuery {
-  phase: 'idle' | 'turn-running' | 'closing' | 'closed' = 'turn-running'
+  /** `awaiting-tools`: the CLI turn stopped on tool calls the harness has yet to answer. */
+  phase: 'idle' | 'turn-running' | 'awaiting-tools' | 'closing' | 'closed' = 'turn-running'
+  /** Tool calls of the last step, in model order, that the harness has not answered yet. */
+  awaiting: readonly string[] = []
+  /** Usage already reported for the steps of the running CLI turn. */
+  spent: TokenUsage = tokenUsage({})
   /** Conversation entries the CLI holds; its length counts the messages delivered. */
   seen: readonly Entry[] = []
   idle: ReturnType<typeof setTimeout> | undefined
@@ -199,20 +261,44 @@ class LiveQuery {
   private wake: () => void = () => undefined
   private ended = false
   private closing: Promise<void> | undefined
+  /** Harness names of the tools the bridge serves. */
+  readonly served: ReadonlySet<string>
+  private readonly bridge: ReturnType<typeof createBridgeServer> | undefined
+  /** Results that came before the CLI called their handler: without readOnlyHint it calls one handler at a time. */
+  private readonly early = new Map<string, BridgeResult>()
 
-  constructor(private readonly ctx: Context, readonly config: string, options: Options) {
+  constructor(private readonly ctx: Context, readonly config: string, options: Options, tools: readonly ToolSchema[] = []) {
+    this.bridge = tools.length === 0
+      ? undefined
+      : createBridgeServer({ tools, onCall: ({ id }) => { this.deliver(id) }, timeoutMs: TOOL_CALL_TIMEOUT_MS })
+    const refused = new Set(this.bridge?.refused.map(({ name: tool, reason }) => {
+      ctx.logger.warn('llm-claude-code: tool %s is not offered to Claude Code: %s', tool, reason)
+      return tool
+    }))
+    this.served = new Set(tools.map(tool => tool.name).filter(tool => !refused.has(tool)))
+    const allowed = [...this.served].map(tool => TOOL_PREFIX + tool)
     this.query = query({
       // Streaming input keeps the control channel open, which interrupt() requires.
       prompt: this.input(),
       options: {
         ...options,
+        ...this.bridge === undefined ? {} : {
+          mcpServers: { [BRIDGE_SERVER_NAME]: this.bridge.server },
+          allowedTools: allowed,
+          canUseTool: (tool: string, input: Record<string, unknown>) => Promise.resolve(allowed.includes(tool)
+            ? { behavior: 'allow' as const, updatedInput: input }
+            : { behavior: 'deny' as const, message: 'Esta ferramenta não está disponível nesta conversa.' }),
+        },
         spawnClaudeCodeProcess: (spawn: SpawnOptions) => {
           const child = ctx.subprocess.spawn(claudeSpawnSpec(spawn, DEFAULT_DISPOSE_GRACE_MS))
           this.child = child
           this.managed = new ManagedClaudeCodeProcess(child)
           this.failure = child.done.then(() => NEVER)
           void this.failure.catch(() => undefined)
-          const exited = (): void => { if (this.closing === undefined) this.phase = 'closed' }
+          const exited = (): void => {
+            this.bridge?.rejectAll(ENDED_MESSAGE)
+            if (this.closing === undefined) this.phase = 'closed'
+          }
           void child.done.then(exited, exited)
           return this.managed
         },
@@ -221,9 +307,40 @@ class LiveQuery {
     this.messages = this.query[Symbol.asyncIterator]()
   }
 
+  /** Start a CLI turn with a user message. */
   push(text: string): void {
+    this.awaiting = []
+    this.early.clear()
+    this.spent = tokenUsage({})
     this.queued.push(text)
     this.wake()
+  }
+
+  /**
+   * Hand the harness results to the waiting calls; a call the harness left without a result fails.
+   * @param results - tool messages the harness appended after the step.
+   */
+  answer(results: readonly ToolResultMessage[]): void {
+    const given = new Map(results.map(message => [String(message.toolCallId), {
+      content: contentText(message.content),
+      ...message.isError === true ? { isError: true } : {},
+    }]))
+    for (const id of given.keys()) {
+      if (!this.awaiting.includes(id)) this.ctx.logger.warn('llm-claude-code: ignoring a result for unknown tool call %s', id)
+    }
+    for (const id of this.awaiting) {
+      const result = given.get(id) ?? { content: 'Sem resultado do harness para esta chamada.', isError: true }
+      if (this.bridge?.resolve(id, result) !== true) this.early.set(id, result)
+    }
+    this.awaiting = []
+  }
+
+  /** Release a call whose handler arrived after the harness answered it. */
+  private deliver(id: string): void {
+    const result = this.early.get(id)
+    if (result === undefined) return
+    this.early.delete(id)
+    this.bridge?.resolve(id, result)
   }
 
   private async * input(): AsyncIterable<SDKUserMessage> {
@@ -276,6 +393,7 @@ class LiveQuery {
   close(): Promise<void> {
     this.closing ??= (async () => {
       this.phase = 'closing'
+      this.bridge?.rejectAll(ENDED_MESSAGE)
       clearTimeout(this.idle)
       this.ended = true
       this.wake()
@@ -423,23 +541,31 @@ class ClaudeCodeAdapter extends LlmAdapter {
       const { system, prompt } = promptOf(options)
       const effort = CLAUDE_CODE_EFFORTS.find(candidate => candidate === options.reasoningEffort)
       const cwd = this.cwd(options)
-      const config = JSON.stringify([cwd, options.model, effort ?? null, system])
-      history = conversationOf(options.messages)
+      // Tools ride only on a conversation, whose query outlives the step that asks for them.
+      const tools = key === undefined ? [] : options.tools ?? []
+      const config = JSON.stringify([cwd, options.model, effort ?? null, system, createHash('sha256').update(JSON.stringify(tools)).digest('hex')])
+      const said = options.messages.filter(message => message.role !== 'system' && message.role !== 'developer')
+      history = said.map(message => ({ role: message.role, text: blockText(message) }))
       const kept = key === undefined ? undefined : this.sessions.get(key)
-      const added = kept?.phase === 'idle' && kept.config === config ? appended(kept.seen, history) : undefined
-      if (kept !== undefined && added !== undefined) {
+      const added = kept?.config === config ? appended(kept.seen, history, said) : []
+      const text = added.every(message => message.role === 'user') ? added.map(blockText).filter(value => value.length > 0).join('\n\n') : ''
+      const results = added.filter((message): message is ToolResultMessage => message.role === 'tool')
+      // An idle query takes new user text; one stopped on tool calls takes only their results.
+      const answering = kept?.phase === 'awaiting-tools' && results.length > 0 && results.length === added.length
+      if (kept !== undefined && (answering || (kept.phase === 'idle' && text.length > 0))) {
         live = kept
       } else {
         // A changed configuration or a rewritten history reopens with the full transcript.
         if (kept !== undefined && key !== undefined) await this.forget(key, kept)
-        live = new LiveQuery(this.ctx, config, this.queryOptions(cwd, options.model, effort, system))
+        live = new LiveQuery(this.ctx, config, this.queryOptions(cwd, options.model, effort, system), tools)
         if (key === undefined) this.open.add(live)
         else this.sessions.set(key, live)
       }
       live.phase = 'turn-running'
       live.interrupting = undefined
       clearTimeout(live.idle)
-      live.push(added ?? prompt)
+      if (answering) live.answer(results)
+      else live.push(live === kept ? text : prompt)
       if (aborted(signal)) onAbort()
       for await (const chunk of this.turnChunks(live, signal, stopped, turn)) {
         if (chunk.type === 'finish') finish = chunk.reason.kind
@@ -466,13 +592,16 @@ class ClaudeCodeAdapter extends LlmAdapter {
     finish: string | undefined,
     turn: TurnState,
   ): Promise<void> {
+    // A step that asks for tools keeps the CLI turn open for the results, unless it was interrupted meanwhile.
+    const asking = finish === 'tool-calls' && live.interrupting === undefined
     const keep = key !== undefined && live.phase === 'turn-running' && finish !== 'error'
-      && (finish === 'stop' || finish === 'max-tokens' || turn.completed || await live.recover())
+      && (asking || finish === 'stop' || finish === 'max-tokens' || turn.completed || await live.recover())
     if (keep && live.phase === 'turn-running') {
-      const reply = turn.opened.filter(block => block.kind === 'text').map(block => block.text).join('\n').trim()
+      const reply = contentText(turn.opened.map(blockOf))
       live.seen = turn.opened.length === 0 ? history : [...history, { role: 'assistant', text: reply }]
-      live.phase = 'idle'
-      live.idle = setTimeout(() => { if (live.phase === 'idle') void this.forget(key, live) }, IDLE_CLOSE_MS)
+      const phase = asking ? 'awaiting-tools' : 'idle'
+      live.phase = phase
+      live.idle = setTimeout(() => { if (live.phase === phase) void this.forget(key, live) }, asking ? TOOL_CALL_TIMEOUT_MS : IDLE_CLOSE_MS)
       live.idle.unref()
       return
     }
@@ -490,6 +619,9 @@ class ClaudeCodeAdapter extends LlmAdapter {
   ): AsyncIterable<StreamChunk> {
     const blocks = new Map<number, OpenBlock>()
     const opened = turn.opened
+    /** Tool calls the current assistant message made, and its usage so far. */
+    let asked: string[] = []
+    let usage: ApiUsage = {}
     let apiError: SDKAssistantMessageError | undefined
     let limitRejected = false
     let thrown: unknown
@@ -504,8 +636,32 @@ class ClaudeCodeAdapter extends LlmAdapter {
           const event = message.event
           if (event.type === 'message_start') {
             blocks.clear()
+            asked = []
+            usage = event.message.usage
+          } else if (event.type === 'message_delta') {
+            usage = { ...usage, ...Object.fromEntries(Object.entries(event.usage).filter(([, count]) => typeof count === 'number')) }
+            // The SDK's own signal that the message ends asking for tools; the CLI then waits on the handlers.
+            if (event.delta.stop_reason !== 'tool_use' || asked.length === 0) continue
+            const step = tokenUsage(usage)
+            live.spent = sumUsage(live.spent, step)
+            live.awaiting = asked
+            if (Object.keys(usage).length > 0) yield { type: 'usage', usage: step }
+            yield { type: 'finish', reason: { kind: 'tool-calls' } }
+            return
           } else if (event.type === 'content_block_start') {
-            const type = event.content_block.type
+            const content = event.content_block
+            if (content.type === 'tool_use') {
+              // Only the tools the bridge serves reach the harness; the CLI answers any other call itself.
+              const tool = content.name.slice(TOOL_PREFIX.length)
+              if (!content.name.startsWith(TOOL_PREFIX) || !live.served.has(tool)) continue
+              const block: OpenBlock = { kind: 'tool-call', text: '', call: { id: content.id, name: tool } }
+              blocks.set(event.index, block)
+              block.index = opened.push(block) - 1
+              asked.push(content.id)
+              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+              continue
+            }
+            const type = content.type
             const kind = type === 'text' ? 'text' : type === 'thinking' ? 'reasoning' : undefined
             if (kind === undefined) continue
             const block: OpenBlock = { kind, text: '' }
@@ -518,6 +674,10 @@ class ClaudeCodeAdapter extends LlmAdapter {
           } else if (event.type === 'content_block_delta') {
             const block = blocks.get(event.index)
             const delta = event.delta
+            if (block?.kind === 'tool-call') {
+              if (delta.type === 'input_json_delta') block.text += delta.partial_json
+              continue
+            }
             const text = delta.type === 'text_delta' ? delta.text : delta.type === 'thinking_delta' ? delta.thinking : ''
             if (block === undefined || text.length === 0) continue
             if (block.index === undefined) {
@@ -529,7 +689,7 @@ class ClaudeCodeAdapter extends LlmAdapter {
           } else if (event.type === 'content_block_stop') {
             const block = blocks.get(event.index)
             blocks.delete(event.index)
-            if (block?.index !== undefined) yield { type: 'block-end', index: block.index, block: { type: block.kind, text: block.text } }
+            if (block?.index !== undefined) yield { type: 'block-end', index: block.index, block: blockOf(block) }
           }
           continue
         }
@@ -566,16 +726,8 @@ class ClaudeCodeAdapter extends LlmAdapter {
           yield failed(EMPTY_RESPONSE_CODE, 'O Claude Code concluiu o turno sem conteúdo.')
           return
         }
-        const usage = message.usage
-        yield {
-          type: 'usage',
-          usage: {
-            inputTokens: usage.input_tokens,
-            outputTokens: usage.output_tokens,
-            cacheReadTokens: usage.cache_read_input_tokens,
-            cacheWriteTokens: usage.cache_creation_input_tokens,
-          },
-        }
+        // The result counts the whole CLI turn, so the steps that asked for tools are taken out.
+        yield { type: 'usage', usage: tokenUsage(message.usage, live.spent) }
         yield { type: 'finish', reason: message.stop_reason === 'max_tokens' ? { kind: 'max-tokens' } : { kind: 'stop' } }
         return
       }

@@ -1,15 +1,26 @@
 import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Context } from '@deepseek-ai/cordis'
-import { ReasoningEffortId, type GenerateOptions, type LlmAdapter, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { Context } from '@deepseek-ai/cordis'
+import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import LlmRuntime, { createUserMessage, ReasoningEffortId, type GenerateOptions, type LlmAdapter, type StreamChunk, type ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { SubprocessHandle, SubprocessOutcome, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 
 const sdk = vi.hoisted(() => ({ query: vi.fn() }))
-vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: sdk.query }))
+// The real server factory stays, spied, so the fake CLI can reach the handlers of the bridge server it was given.
+vi.mock('@anthropic-ai/claude-agent-sdk', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@anthropic-ai/claude-agent-sdk')>()
+  return { ...actual, query: sdk.query, createSdkMcpServer: vi.fn(actual.createSdkMcpServer) }
+})
+const { createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk')
 
-const { apply } = await import('../src/index.ts')
+const claudeCode = await import('../src/index.ts')
+const { apply } = claudeCode
 
 type Script = readonly Record<string, unknown>[]
 
@@ -24,6 +35,8 @@ interface Harness {
   adapter: LlmAdapter
   specs: SubprocessSpawnSpec[]
   dispose: () => void
+  /** Arguments of every logger.warn call. */
+  warnings: unknown[][]
 }
 
 /** Drive the mocked SDK: each query spawns through the shared hook and yields `script`. */
@@ -63,8 +76,29 @@ const orchestrator = (connection: string) => ({
   toranjaOrchestrator: { status: () => ({ providers: [{ id: 'claude-code', connection }] }) },
 })
 
+/** A subprocess service whose CLI processes exit only when terminated or when `exitOutcome` is set. */
+function fakeSubprocess(specs: SubprocessSpawnSpec[]): { spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle } {
+  return {
+    spawn(spec) {
+      specs.push(spec)
+      let exit: (outcome: SubprocessOutcome) => void = () => undefined
+      const done = new Promise<SubprocessOutcome>((resolve) => { exit = resolve })
+      queueMicrotask(() => { if (exitOutcome !== undefined) exit(exitOutcome) })
+      const handle: Partial<SubprocessHandle> = {
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        done,
+        terminate: () => { exit({ exitCode: null, signal: 'SIGTERM' }) },
+        waitForExit: () => Promise.resolve(true),
+      }
+      return handle as SubprocessHandle
+    },
+  }
+}
+
 function harness(services: Record<string, unknown> = {}): Harness {
   const specs: SubprocessSpawnSpec[] = []
+  const warnings: unknown[][] = []
   let adapter: LlmAdapter | undefined
   let disposer: (() => void) | undefined
   const ctx: Context = {
@@ -77,27 +111,12 @@ function harness(services: Record<string, unknown> = {}): Harness {
         return () => undefined
       },
     },
-    logger: { warn: () => undefined },
-    subprocess: {
-      spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
-        specs.push(spec)
-        let exit: (outcome: SubprocessOutcome) => void = () => undefined
-        const done = new Promise<SubprocessOutcome>((resolve) => { exit = resolve })
-        queueMicrotask(() => { if (exitOutcome !== undefined) exit(exitOutcome) })
-        const handle: Partial<SubprocessHandle> = {
-          stdin: new PassThrough(),
-          stdout: new PassThrough(),
-          done,
-          terminate: () => { exit({ exitCode: null, signal: 'SIGTERM' }) },
-          waitForExit: () => Promise.resolve(true),
-        }
-        return handle as SubprocessHandle
-      },
-    },
+    logger: { warn: (...args: unknown[]) => { warnings.push(args) } },
+    subprocess: fakeSubprocess(specs),
   } as never
   apply(ctx)
   if (adapter === undefined || disposer === undefined) throw new Error('adapter not registered')
-  return { adapter, specs, dispose: disposer }
+  return { adapter, specs, dispose: disposer, warnings }
 }
 
 function request(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
@@ -436,7 +455,27 @@ interface SessionTurn {
 
 interface FakeSession extends FakeQuery {
   readonly received: string[]
+  /** What each MCP handler the fake CLI called returned, by tool_use id. */
+  readonly results: Map<string, { content: { text: string }[]; isError?: boolean }>
+  /** Kill the CLI process. */
+  readonly kill: () => void
 }
+
+type ToolHandler = (args: Record<string, unknown>, extra: unknown) => Promise<{ content: { text: string }[]; isError?: boolean }>
+
+/** The handlers of the bridge server handed to `options`, by harness tool name. */
+function bridgeHandlers(options: Options): Map<string, ToolHandler> {
+  const server = options.mcpServers?.toranja
+  const calls = vi.mocked(createSdkMcpServer).mock
+  const index = calls.results.findIndex(result => result.value === server)
+  const tools = index === -1 ? [] : calls.calls[index]?.[0].tools ?? []
+  return new Map(tools.map(tool => [tool.name, tool.handler as unknown as ToolHandler]))
+}
+
+/** Fake CLI step: call a bridge handler without blocking the stream, as the CLI does. */
+const invoke = (id: string, name = 'delegate_project_task', input: Record<string, unknown> = { project: 'p' }) => ({ fake: 'invoke', id, name, input })
+/** Fake CLI step: wait until the handler of `id` returns, then report the tool result. */
+const settle = (id: string) => ({ fake: 'settle', id })
 
 /** Drive the mocked SDK as a live CLI: every queued user message runs the next scripted turn. */
 function sessionQuery(turns: SessionTurn[]): FakeSession[] {
@@ -445,17 +484,23 @@ function sessionQuery(turns: SessionTurn[]): FakeSession[] {
     let wake: () => void = () => undefined
     let interrupted = false
     let closed = false
+    // interrupt() and close() abort the signal of every handler still running (L0).
+    const calls = new AbortController()
     const fake: FakeSession = {
       options,
       prompt,
       received: [],
+      results: new Map(),
+      kill: () => { child?.kill('SIGTERM') },
       interrupt: vi.fn(() => {
         interrupted = true
+        calls.abort()
         wake()
         return Promise.resolve(undefined)
       }),
       close: vi.fn(() => {
         closed = true
+        calls.abort()
         wake()
       }),
     }
@@ -467,13 +512,31 @@ function sessionQuery(turns: SessionTurn[]): FakeSession[] {
       env: options.env ?? {},
       signal: new AbortController().signal,
     })
+    const running = new Map<string, Promise<unknown>>()
+    const handlers = bridgeHandlers(options)
     async function* messages() {
       for await (const message of prompt) {
         if (closed) return
         fake.received.push(message.message.content as string)
         const turn: SessionTurn = turns.shift() ?? { script: [success()] }
         interrupted = false
-        for (const scripted of turn.script) yield scripted
+        for (const scripted of turn.script) {
+          if (scripted.fake === 'invoke') {
+            const { id, name, input } = scripted as ReturnType<typeof invoke>
+            const handler = handlers.get(name)
+            if (handler === undefined) throw new Error(`no bridge handler for ${name}`)
+            const result = handler(input, { signal: calls.signal, _meta: { 'claudecode/toolUseId': id } })
+            running.set(id, result.then((value) => { fake.results.set(id, value) }))
+          } else if (scripted.fake === 'settle') {
+            const id = String(scripted.id)
+            await running.get(id)
+            if (closed) return
+            const result = fake.results.get(id)
+            yield { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: result?.content }] }, parent_tool_use_id: null }
+          } else {
+            yield scripted
+          }
+        }
         if (turn.then === 'die') {
           child?.kill('SIGTERM')
           throw new Error('stderr: sk-ant-secret')
@@ -651,5 +714,275 @@ describe('ClaudeCodeAdapter live session', () => {
     expect(fakes[0]?.close).not.toHaveBeenCalled()
     dispose()
     expect(fakes[0]?.close).toHaveBeenCalled()
+  })
+})
+
+const DELEGATE: ToolSchema = {
+  name: 'delegate_project_task',
+  description: 'Delega uma tarefa a um agente do projeto.',
+  parameters: { type: 'object', properties: { project: { type: 'string' } }, required: ['project'] },
+}
+const TOOLS = [DELEGATE]
+
+/** Stream events of one tool_use block the model writes. */
+const toolUse = (index: number, id: string, input: Record<string, unknown> = { project: 'p' }, name = 'mcp__toranja__delegate_project_task') => [
+  event({ type: 'content_block_start', index, content_block: { type: 'tool_use', id, name, input: {} } }),
+  event({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } }),
+  event({ type: 'content_block_stop', index }),
+]
+const messageStart = event({ type: 'message_start', message: { usage: { input_tokens: 7, output_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 } } })
+/** The end of an assistant message that asks for tools. */
+const asksTools = event({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { input_tokens: null, output_tokens: 5 } })
+const textBlock = (index: number, text: string) => [
+  event({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } }),
+  event({ type: 'content_block_delta', index, delta: { type: 'text_delta', text } }),
+  event({ type: 'content_block_stop', index }),
+]
+const call = (id: string, args = '{"project":"p"}') => ({ type: 'tool-call', id, name: 'delegate_project_task', arguments: args })
+const asks = (...content: Record<string, unknown>[]) => ({ role: 'assistant', content })
+const toolResult = (id: string, text: string, isError?: true) => ({ role: 'tool', toolCallId: id, content: [{ type: 'text', text }], ...isError === undefined ? {} : { isError } })
+const withTools = (history: readonly Record<string, unknown>[], overrides: Partial<GenerateOptions> = {}) =>
+  conversation(history, { tools: TOOLS, ...overrides })
+const TOOL_CALLS_FINISH = { type: 'finish', reason: { kind: 'tool-calls' } }
+/** A CLI turn that asks for `toolu_1`, waits for its result, then replies. */
+const askOnce = (replyText = 'ok'): SessionTurn => ({ script: [...toolUse(0, 'toolu_1'), invoke('toolu_1'), asksTools, settle('toolu_1'), ...reply(replyText)] })
+const answered = [user('oi'), asks(call('toolu_1')), toolResult('toolu_1', 'feito')]
+const resultText = (fake: FakeSession | undefined, id: string) => fake?.results.get(id)?.content[0]?.text
+
+describe('ClaudeCodeAdapter harness tools', () => {
+  it('serves the harness tools through the toranja MCP server and allows only those tools', async () => {
+    const { adapter, warnings } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }])
+    const broken: ToolSchema = { name: 'not_an_object', description: 'd', parameters: { type: 'string' } }
+    await collect(adapter, conversation([user('oi')], { tools: [DELEGATE, broken] }))
+
+    const options = fakes[0]?.options
+    expect(options).toMatchObject({ tools: [], strictMcpConfig: true, allowedTools: ['mcp__toranja__delegate_project_task'] })
+    expect(Object.keys(options?.mcpServers ?? {})).toEqual(['toranja'])
+    expect(vi.mocked(createSdkMcpServer).mock.lastCall?.[0]).toMatchObject({ name: 'toranja', timeout: 30 * 60_000 })
+    expect([...bridgeHandlers(options ?? {}).keys()]).toEqual(['delegate_project_task'])
+    const decide = (name: string) => options?.canUseTool?.(name, {}, { signal: new AbortController().signal, toolUseID: 't' } as never)
+    expect((await decide('mcp__toranja__delegate_project_task'))?.behavior).toBe('allow')
+    for (const denied of ['Bash', 'mcp__toranja__not_an_object', 'mcp__outro__delegate_project_task', 'mcp__toranja__']) {
+      expect((await decide(denied))?.behavior).toBe('deny')
+    }
+    expect(warnings.flat().join(' ')).toContain('not_an_object')
+  })
+
+  it('hands a tool call to the harness and continues the same query with its result', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: [
+      messageStart,
+      ...textBlock(0, 'Vou delegar.'),
+      ...toolUse(1, 'toolu_1'),
+      invoke('toolu_1'),
+      asksTools,
+      event({ type: 'message_stop' }),
+      settle('toolu_1'),
+      ...textBlock(0, 'Delegado.'),
+      success({ result: 'Delegado.', usage: { input_tokens: 20, output_tokens: 9, cache_read_input_tokens: 4, cache_creation_input_tokens: 3 } }),
+    ] }])
+
+    const first = await collect(adapter, withTools([user('oi')]))
+    expect(first.slice(3)).toEqual([
+      { type: 'block-start', index: 1, blockType: 'tool-call' },
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'toolu_1', name: 'delegate_project_task', arguments: '{"project":"p"}' } },
+      { type: 'usage', usage: { inputTokens: 7, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 1 } },
+      TOOL_CALLS_FINISH,
+    ])
+    expect(fakes[0]?.results.has('toolu_1')).toBe(false)
+
+    const history = [user('oi'), asks({ type: 'text', text: 'Vou delegar.' }, call('toolu_1')), toolResult('toolu_1', 'tarefa delegada')]
+    const second = await collect(adapter, withTools(history))
+    expect(fakes[0]?.results.get('toolu_1')).toEqual({ content: [{ type: 'text', text: 'tarefa delegada' }] })
+    expect(second.filter(chunk => chunk.type === 'text-delta')).toEqual([{ type: 'text-delta', index: 0, text: 'Delegado.' }])
+    // The result counts the whole CLI turn; the step already reported is left out.
+    expect(second.slice(-2)).toEqual([{ type: 'usage', usage: { inputTokens: 13, outputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 2 } }, STOP_FINISH])
+    expect(sdk.query).toHaveBeenCalledOnce()
+    expect(fakes[0]?.received).toEqual(['oi'])
+
+    expect(await finishOf(adapter, withTools([...history, assistant('Delegado.'), user('obrigado')]))).toEqual(STOP_FINISH)
+    expect(sdk.query).toHaveBeenCalledOnce()
+    expect(fakes[0]?.received).toEqual(['oi', 'obrigado'])
+  })
+
+  it('answers two calls of one step although the CLI calls the second handler only after the first returns', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: [
+      ...toolUse(0, 'toolu_1', { project: 'a' }),
+      // As in L0, the first handler starts before the model finishes the message.
+      invoke('toolu_1', 'delegate_project_task', { project: 'a' }),
+      ...toolUse(1, 'toolu_2', { project: 'b' }),
+      asksTools,
+      settle('toolu_1'),
+      invoke('toolu_2', 'delegate_project_task', { project: 'b' }),
+      settle('toolu_2'),
+      ...reply('Os dois.'),
+    ] }])
+
+    const first = await collect(adapter, withTools([user('oi')]))
+    const calls = [call('toolu_1', '{"project":"a"}'), call('toolu_2', '{"project":"b"}')]
+    expect(first.flatMap(chunk => chunk.type === 'block-end' ? [chunk.block] : [])).toEqual(calls)
+    expect(first.at(-1)).toEqual(TOOL_CALLS_FINISH)
+
+    const second = await collect(adapter, withTools([user('oi'), asks(...calls), toolResult('toolu_1', 'um'), toolResult('toolu_2', 'dois')]))
+    expect(fakes[0]?.results.get('toolu_1')).toEqual({ content: [{ type: 'text', text: 'um' }] })
+    expect(fakes[0]?.results.get('toolu_2')).toEqual({ content: [{ type: 'text', text: 'dois' }] })
+    expect(second.at(-1)).toEqual(STOP_FINISH)
+    expect(sdk.query).toHaveBeenCalledOnce()
+  })
+
+  it('ignores a result for an unknown call and fails a call the harness left without a result', async () => {
+    const { adapter, warnings } = harness()
+    const fakes = sessionQuery([askOnce()])
+    await collect(adapter, withTools([user('oi')]))
+    const second = await collect(adapter, withTools([user('oi'), asks(call('toolu_1')), toolResult('toolu_9', 'perdido')]))
+
+    expect(fakes[0]?.results.get('toolu_1')).toEqual({ content: [{ type: 'text', text: 'Sem resultado do harness para esta chamada.' }], isError: true })
+    expect(warnings.flat().join(' ')).toContain('toolu_9')
+    expect(second.at(-1)).toEqual(STOP_FINISH)
+    expect(sdk.query).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['a native tool', 'Bash'],
+    ['a tool the bridge refused', 'mcp__toranja__not_an_object'],
+    ['a tool of another server', 'mcp__outro__delegate_project_task'],
+  ])('keeps a call to %s away from the harness and lets the CLI answer it', async (_label, name) => {
+    const { adapter } = harness()
+    sessionQuery([{ script: [...toolUse(0, 'toolu_x', {}, name), asksTools, ...reply('Não consegui.')] }])
+    const broken: ToolSchema = { name: 'not_an_object', description: 'd', parameters: { type: 'string' } }
+    const chunks = await collect(adapter, withTools([user('oi')], { tools: [DELEGATE, broken] }))
+    expect(chunks.filter(chunk => chunk.type === 'block-start')).toEqual([{ type: 'block-start', index: 0, blockType: 'text' }])
+    expect(chunks.at(-1)).toEqual(STOP_FINISH)
+  })
+
+  it('passes an error result to the model as an error', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([askOnce()])
+    await collect(adapter, withTools([user('oi')]))
+    await collect(adapter, withTools([user('oi'), asks(call('toolu_1')), toolResult('toolu_1', 'Error: negado', true)]))
+    expect(fakes[0]?.results.get('toolu_1')).toEqual({ content: [{ type: 'text', text: 'Error: negado' }], isError: true })
+  })
+
+  it.each([
+    ['the tools change', withTools(answered, { tools: [{ ...DELEGATE, description: 'Outra descrição.' }] })],
+    ['the recorded call differs', withTools([user('oi'), asks(call('toolu_1', '{"project":"q"}')), toolResult('toolu_1', 'feito')])],
+    ['a user message follows the results, as after a cancelled step', withTools([...answered, user('continue')])],
+  ] as const)('fails the pending call and reopens with a transcript when %s', async (_label, next) => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([askOnce('velho'), { script: reply('novo') }])
+    await collect(adapter, withTools([user('oi')]))
+    expect(await finishOf(adapter, next)).toEqual(STOP_FINISH)
+
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[0]?.close).toHaveBeenCalled()
+    await vi.waitFor(() => { expect(resultText(fakes[0], 'toolu_1')).toContain('encerrada') })
+    expect(fakes[0]?.results.get('toolu_1')?.isError).toBe(true)
+    expect(fakes[1]?.received[0]).toContain('ASSISTENTE:\n[chamada de ferramenta delegate_project_task (toolu_1): ')
+    expect(fakes[1]?.received[0]).toContain('FERRAMENTA:\n[resultado da chamada toolu_1]\nfeito')
+  })
+
+  it('fails the pending call when the CLI process dies, and reopens on the next request', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([askOnce(), { script: reply('ok') }])
+    await collect(adapter, withTools([user('oi')]))
+    fakes[0]?.kill()
+    await vi.waitFor(() => { expect(fakes[0]?.results.get('toolu_1')?.isError).toBe(true) })
+    expect(resultText(fakes[0], 'toolu_1')).toContain('encerrada')
+
+    expect(await finishOf(adapter, withTools(answered))).toEqual(STOP_FINISH)
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+  })
+
+  it('fails the pending call when the plugin is disposed', async () => {
+    const { adapter, dispose } = harness()
+    const fakes = sessionQuery([askOnce()])
+    await collect(adapter, withTools([user('oi')]))
+    dispose()
+    await vi.waitFor(() => { expect(resultText(fakes[0], 'toolu_1')).toContain('encerrada') })
+  })
+
+  it('interrupts a step cancelled while it streams, abandoning its running call', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: [...toolUse(0, 'toolu_1'), invoke('toolu_1')], then: 'hang' }])
+    const controller = new AbortController()
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream(withTools([user('oi')], { signal: controller.signal }))) {
+      chunks.push(chunk)
+      if (chunk.type === 'block-end') controller.abort()
+    }
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'aborted' } })
+    expect(fakes[0]?.interrupt).toHaveBeenCalledOnce()
+    await vi.waitFor(() => { expect(fakes[0]?.results.get('toolu_1')?.isError).toBe(true) })
+  })
+
+  it.each([
+    ['without tools', {}],
+    ['with an empty tool list', { tools: [] }],
+    ['on an auxiliary call', { tools: TOOLS, purpose: 'compaction' }],
+  ] as const)('opens no MCP server %s', async (_label, overrides) => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }])
+    await collect(adapter, conversation([user('oi')], overrides as Partial<GenerateOptions>))
+    expect(fakes[0]?.options.mcpServers).toEqual({})
+    expect(fakes[0]?.options.allowedTools).toBeUndefined()
+  })
+})
+
+/** Resolve on the next idle transition of `agent`. */
+function idleOf(ctx: Context, agent: Agent): Promise<void> {
+  return new Promise((resolve) => {
+    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
+      if (subject === agent && status === 'idle') {
+        dispose()
+        resolve()
+      }
+    })
+  })
+}
+
+describe('ClaudeCodeAdapter under the agent loop', () => {
+  it('has the harness run the tool the model calls, once, while the CLI only relays the call and its result', async () => {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(LlmRuntime)
+      await ctx.plugin(SessionStore)
+      await ctx.plugin(SessionProjectionRegistry)
+      await ctx.plugin(SystemPrompt)
+      await ctx.plugin(ToolRuntime)
+      await ctx.plugin(AgentRegistry)
+      await ctx.plugin(AgentLoop, { agents: [] })
+      ctx.provide('subprocess', fakeSubprocess([]) as never)
+      await ctx.plugin(claudeCode)
+      const execute = vi.fn((_args: unknown) => Promise.resolve([{ type: 'text' as const, text: 'tarefa delegada' }]))
+      ctx.tools.register(defineContentToolFixture({
+        name: 'delegate_project_task',
+        description: 'Delega uma tarefa a um agente do projeto.',
+        parameters: { project: { type: 'string', required: true } },
+        execute,
+      }))
+      const fakes = sessionQuery([{ script: [
+        ...textBlock(0, 'Vou delegar.'),
+        ...toolUse(1, 'toolu_1'),
+        invoke('toolu_1'),
+        asksTools,
+        settle('toolu_1'),
+        ...reply('Delegado.'),
+      ] }])
+      const agent = await ctx.agentLoop.create(SessionId('claude-code-tools'), { provider: 'claude-code-local', model: 'haiku' })
+      const idle = idleOf(ctx, agent)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'delegue' }], source: { kind: 'user' } }))
+      await idle
+
+      expect(execute).toHaveBeenCalledOnce()
+      expect(execute.mock.calls[0]?.[0]).toEqual({ project: 'p' })
+      expect(fakes[0]?.results.get('toolu_1')).toEqual({ content: [{ type: 'text', text: 'tarefa delegada' }] })
+      expect(sdk.query).toHaveBeenCalledOnce()
+      const replies = agent.session.snapshotEvents().flatMap(event => event.type === 'assistant/message' ? [event.data.message.content] : [])
+      expect(replies.at(-1)).toEqual([{ type: 'text', text: 'Delegado.' }])
+    } finally {
+      await ctx.fiber.dispose()
+    }
   })
 })
