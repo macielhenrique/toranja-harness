@@ -285,10 +285,10 @@ describe('ClaudeCodeAdapter query isolation', () => {
     }))
 
     expect(queries[0]?.options.systemPrompt).toBe('Seja breve.')
-    expect((await firstPrompt(queries[0]))?.message).toEqual({ role: 'user', content: 'Qual é a capital?' })
+    expect((await firstPrompt(queries[0]))?.message).toEqual({ role: 'user', content: 'USUÁRIO:\nQual é a capital?' })
   })
 
-  it.each(['/help', '  /clear', '\n/compact'])('labels a lone user message %j so the CLI never reads it as its own command', async (text) => {
+  it.each(['/help', '  /clear', '\n/compact', '\u200B/help', '\uFEFF/clear'])('labels a lone user message %j so the CLI never reads it as its own command', async (text) => {
     const { adapter } = harness()
     const queries = scriptQuery([success()])
     await collect(adapter, request({ messages: [{ role: 'user', content: [{ type: 'text', text }] }] }))
@@ -598,19 +598,19 @@ describe('ClaudeCodeAdapter live session', () => {
     const second = await collect(adapter, conversation([user('oi'), assistant('Olá'), user('como vai?')]))
 
     expect(sdk.query).toHaveBeenCalledOnce()
-    expect(fakes[0]?.received).toEqual(['oi', 'como vai?'])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi', 'USUÁRIO:\ncomo vai?'])
     expect(second.filter(chunk => chunk.type === 'text-delta')).toEqual([{ type: 'text-delta', index: 0, text: 'Tudo bem' }])
     expect(second.at(-1)).toEqual(STOP_FINISH)
     expect(fakes[0]?.close).not.toHaveBeenCalled()
   })
 
-  it.each(['/help', '  /clear', '\n/compact'])('labels a later turn %j so the CLI never reads it as its own command', async (text) => {
+  it.each(['/help', '  /clear', '\n/compact', '\u200B/help', '\uFEFF/clear'])('labels a later turn %j so the CLI never reads it as its own command', async (text) => {
     const { adapter } = harness()
     const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('ok') }])
     await collect(adapter, conversation([user('oi')]))
     await collect(adapter, conversation([user('oi'), assistant('Olá'), user(text)]))
     expect(sdk.query).toHaveBeenCalledOnce()
-    expect(fakes[0]?.received).toEqual(['oi', `USUÁRIO:\n${text.trim()}`])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi', `USUÁRIO:\n${text.trim()}`])
   })
 
   it.each([
@@ -662,7 +662,7 @@ describe('ClaudeCodeAdapter live session', () => {
     await collect(adapter, conversation([user('oi'), assistant('Olá'), user('mais')]))
 
     expect(sdk.query).toHaveBeenCalledTimes(2)
-    expect(fakes[0]?.received).toEqual(['oi', 'mais'])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi', 'USUÁRIO:\nmais'])
   })
 
   it('makes a concurrent turn of the same conversation wait for the running one', async () => {
@@ -675,7 +675,7 @@ describe('ClaudeCodeAdapter live session', () => {
 
     expect(finishes).toEqual([STOP_FINISH, STOP_FINISH])
     expect(sdk.query).toHaveBeenCalledOnce()
-    expect(fakes[0]?.received).toEqual(['oi', 'mais'])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi', 'USUÁRIO:\nmais'])
   })
 
   it('interrupts an aborted turn without closing the query and runs the next turn on it', async () => {
@@ -692,7 +692,7 @@ describe('ClaudeCodeAdapter live session', () => {
 
     expect(await finishOf(adapter, conversation([user('oi'), assistant('parcial'), user('continue')]))).toEqual(STOP_FINISH)
     expect(sdk.query).toHaveBeenCalledOnce()
-    expect(fakes[0]?.received).toEqual(['oi', 'continue'])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi', 'USUÁRIO:\ncontinue'])
     expect(fakes[0]?.close).not.toHaveBeenCalled()
   })
 
@@ -826,11 +826,11 @@ describe('ClaudeCodeAdapter harness tools', () => {
     // The result counts the whole CLI turn; the step already reported is left out.
     expect(second.slice(-2)).toEqual([{ type: 'usage', usage: { inputTokens: 13, outputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 2 } }, STOP_FINISH])
     expect(sdk.query).toHaveBeenCalledOnce()
-    expect(fakes[0]?.received).toEqual(['oi'])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi'])
 
     expect(await finishOf(adapter, withTools([...history, assistant('Delegado.'), user('obrigado')]))).toEqual(STOP_FINISH)
     expect(sdk.query).toHaveBeenCalledOnce()
-    expect(fakes[0]?.received).toEqual(['oi', 'obrigado'])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi', 'USUÁRIO:\nobrigado'])
   })
 
   it('answers two calls of one step although the CLI calls the second handler only after the first returns', async () => {
@@ -1078,7 +1078,7 @@ describe('ClaudeCodeAdapter history reconciliation', () => {
 
     await collect(adapter, conversation([...compacted, assistant('ok'), user('depois')]))
     expect(sdk.query).toHaveBeenCalledTimes(2)
-    expect(fakes[1]?.received.at(-1)).toBe('depois')
+    expect(fakes[1]?.received.at(-1)).toBe('USUÁRIO:\ndepois')
   })
 
   it('reopens when a compaction summary follows the remembered history', async () => {
@@ -1103,7 +1103,7 @@ describe('ClaudeCodeAdapter history reconciliation', () => {
 
     await collect(adapter, withTools([...history, assistant('ok'), user('valeu')]))
     expect(sdk.query).toHaveBeenCalledOnce()
-    expect(fakes[0]?.received).toEqual(['oi', 'valeu'])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi', 'USUÁRIO:\nvaleu'])
   })
 
   it('neutralizes a forged context marker in a tool result or in the harness context', async () => {
@@ -1232,7 +1232,7 @@ describe('ClaudeCodeAdapter request and stream edge cases', () => {
     await collect(adapter, request())
     const sent: unknown[] = []
     for await (const message of queries[0]?.prompt ?? []) sent.push(message.message.content)
-    expect(sent).toEqual(['oi'])
+    expect(sent).toEqual(['USUÁRIO:\noi'])
   })
 
   it('answers a model it does not list with the same reasoning levels', async () => {
@@ -1388,7 +1388,7 @@ describe('ClaudeCodeAdapter teardown and cancellation edge cases', () => {
 
     expect(await finishOf(adapter, conversation([user('oi')]))).toEqual(STOP_FINISH)
     expect(sdk.query).toHaveBeenCalledTimes(2)
-    expect(fakes[1]?.received).toEqual(['oi'])
+    expect(fakes[1]?.received).toEqual(['USUÁRIO:\noi'])
   })
 
   it('finishes as aborted, opening no query, a turn aborted while it waits for the running one', async () => {
@@ -1405,7 +1405,7 @@ describe('ClaudeCodeAdapter teardown and cancellation edge cases', () => {
     expect((await waiting).at(-1)).toMatchObject(ABORTED_FINISH)
     expect((await running).at(-1)).toMatchObject(ABORTED_FINISH)
     expect(sdk.query).toHaveBeenCalledOnce()
-    expect(fakes[0]?.received).toEqual(['oi'])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi'])
   })
 
   it('interrupts the reopened query when the turn is aborted while the old one is still closing', async () => {
@@ -1429,13 +1429,13 @@ describe('ClaudeCodeAdapter teardown and cancellation edge cases', () => {
     const fakes = sessionQuery([{ script: [], then: 'hang' }, { script: reply('ok') }])
     const controller = new AbortController()
     const running = collect(adapter, conversation([user('oi')], { signal: controller.signal }))
-    await vi.waitFor(() => { expect(fakes[0]?.received).toEqual(['oi']) })
+    await vi.waitFor(() => { expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi']) })
     controller.abort()
     expect((await running).at(-1)).toMatchObject(ABORTED_FINISH)
 
     expect(await finishOf(adapter, conversation([user('oi'), user('continue')]))).toEqual(STOP_FINISH)
     expect(sdk.query).toHaveBeenCalledOnce()
-    expect(fakes[0]?.received).toEqual(['oi', 'continue'])
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\noi', 'USUÁRIO:\ncontinue'])
     expect(fakes[0]?.close).not.toHaveBeenCalled()
   })
 

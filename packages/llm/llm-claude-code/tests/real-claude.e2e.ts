@@ -97,7 +97,14 @@ const TOOLS: ToolSchema[] = [
     parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
   },
 ]
-const SYSTEM = 'Você é um assistente de teste. Responda em português, em no máximo duas frases. Para o tempo de uma cidade, use sempre a ferramenta get_weather; nunca invente o tempo.'
+// Names the init lists that case 9 does not hold against the model, because an honest reply can contain them without
+// knowing any command: the Toranja tool names and server, the model's own name, and plain words that double as built-in
+// command names or that the reply uses to describe the question itself. Every other listed name is checked.
+const NOT_DISTINCTIVE: ReadonlySet<string> = new Set([
+  'add', 'get_weather', 'toranja', 'claude',
+  'help', 'init', 'clear', 'compact', 'context', 'cost', 'model', 'review', 'plan', 'status', 'config', 'memory', 'agents', 'skills', 'commands',
+])
+const SYSTEM ='Você é um assistente de teste. Responda em português, em no máximo duas frases. Para o tempo de uma cidade, use sempre a ferramenta get_weather; nunca invente o tempo.'
 // Fake readings no model could guess, so the final reply must have read the tool result.
 const WEATHER: Readonly<Record<string, string>> = { lisboa: 'granizo roxo, 7 graus', recife: 'neve verde, 41 graus' }
 
@@ -195,8 +202,8 @@ describe.skipIf(!signedIn())(`real Claude Code ${sdkVersion} as the claude-code-
       slash_commands: init?.slash_commands,
       permissionMode: init?.permissionMode,
     }))
-    // Informational: settingSources is empty, so a project command should stay out of the CLI.
-    console.info('[L5] project command marcador in init.slash_commands:', init?.slash_commands.includes('marcador') === true)
+    // settingSources is empty, so a project command must stay out of the CLI.
+    expect(init?.slash_commands).not.toContain('marcador')
     expect([...init?.tools ?? []].sort()).toEqual(['mcp__toranja__add', 'mcp__toranja__get_weather'])
     expect(init?.mcp_servers.map(server => server.name)).toEqual(['toranja'])
     expect(init?.apiKeySource).toBe('none')
@@ -327,16 +334,21 @@ describe.skipIf(!signedIn())(`real Claude Code ${sdkVersion} as the claude-code-
     history.push(reply(blocksOf(chunks)))
   })
 
-  // Informational: whether the model sees the skills, agents, or commands the CLI lists from the user profile.
-  it('9. records which profile skills, agents, or commands the model says it has', async () => {
+  // The init lists the built-in and profile skills, agents, and commands, but the leader has no Skill or Agent tool
+  // (tools: []) and all text arrives labeled, so the model must not know any of them.
+  it('9. the model names no skill, agent, or command the CLI lists in its init', async () => {
     history.push(user('Sem usar ferramentas, liste os nomes exatos de todas as skills, agentes (subagents) e comandos de barra que você tem disponíveis nesta sessão. Se não tiver nenhum, responda apenas: nenhum.'))
     const chunks = await turn()
     expect(finishOf(chunks)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
     history.push(reply(blocksOf(chunks)))
     const init = observed.messages.find((message): message is SDKSystemMessage => message.type === 'system' && message.subtype === 'init')
-    const text = textOf(chunks).toLowerCase()
-    const listed = [...init?.skills ?? [], ...init?.agents ?? [], 'dataviz', 'design-sync', 'code-review', 'simplify', 'loop', 'schedule']
-    console.info('[L5] model on its skills/agents/commands', JSON.stringify({ reply: textOf(chunks), named: [...new Set(listed.filter(name => text.includes(name.toLowerCase())))] }))
+    const said = textOf(chunks)
+    const listed = [...new Set([...init?.skills ?? [], ...init?.agents ?? [], ...init?.slash_commands ?? []])]
+    const checked = listed.filter(name => !NOT_DISTINCTIVE.has(name.toLowerCase()))
+    // Whole word, case-insensitive; a hyphen or colon joins a name (general-purpose, plugin:skill) instead of ending it.
+    const named = checked.filter(name => new RegExp(`(?<![\\w:-])${name.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`)}(?![\\w:-])`, 'i').test(said))
+    console.info('[L5] model on its skills/agents/commands', JSON.stringify({ reply: said, listed: listed.length, checked: checked.length, named }))
+    expect(named).toEqual([])
   })
 
   it('leaves no CLI process running after disposal', async () => {

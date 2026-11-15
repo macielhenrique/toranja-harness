@@ -28,7 +28,16 @@ const SCENARIOS = {
 const DROPPED_KEYS = new Set([
   'memory_paths', 'messaging_socket_path', 'powershell_path', 'slash_commands', 'terminal_slash_commands', 'skills', 'agents', 'plugins',
 ])
-const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
+// Lista de permissão do ambiente do CLI (nomes em maiúsculas): só o que ele precisa para rodar e achar o login local.
+// Chaves, tokens e as variáveis CLAUDE_*, ANTHROPIC_* e MCP_* do ambiente do desenvolvedor ficam de fora.
+const ENV_ALLOWED = new Set([
+  'PATH', 'PATHEXT', // achar executáveis (Path no Windows; a comparação ignora maiúsculas)
+  'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', // onde ficam ~/.claude e o login
+  'APPDATA', 'LOCALAPPDATA', // dados de usuário no Windows
+  'SYSTEMROOT', 'WINDIR', 'COMSPEC', // o Windows e o processamento de subprocessos dependem deles
+  'TEMP', 'TMP', 'TMPDIR', // diretório temporário
+])
+const sleep =(ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
 
 /** Replace identifiers, paths and account data of one recorded event by neutral values; ids keep their uniqueness. */
 function anonymize(events) {
@@ -41,7 +50,7 @@ function anonymize(events) {
   const scrub = (value, key) => {
     if (Array.isArray(value)) return value.map((item) => scrub(item))
     if (value !== null && typeof value === 'object') {
-      if (key === 'rate_limit_info') return { status: value.status, rateLimitType: value.rateLimitType }
+      if (key === 'rate_limit_info') return { status: 'allowed', rateLimitType: value.rateLimitType } // não expõe o estado da cota de quem gravou
       return Object.fromEntries(Object.entries(value).filter(([name]) => !DROPPED_KEYS.has(name)).map(([name, item]) => [name, scrub(item, name)]))
     }
     if (typeof value !== 'string') return value
@@ -69,8 +78,7 @@ function assertClean(lines, scenario) {
 async function record(scenario) {
   const events = []
   const rec = (kind, data = {}) => { events.push({ kind, ...data }) }
-  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
-    !/KEY|TOKEN|SECRET|PASSWORD/i.test(name) && !/^(CLAUDE|ANTHROPIC|MCP_)/i.test(name)))
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => ENV_ALLOWED.has(name.toUpperCase())))
   const weather = tool('get_weather', 'Devolve o tempo atual de uma cidade.', { city: z.string() }, (args, extra) => {
     rec('handler-start', { tool: 'get_weather', args, meta: extra?._meta })
     extra?.signal?.addEventListener?.('abort', () => { rec('signal-abort', { reason: String(extra.signal.reason) }) })
@@ -128,7 +136,7 @@ async function record(scenario) {
 
 const wanted = process.argv.length > 2 ? process.argv.slice(2) : Object.keys(SCENARIOS)
 for (const scenario of wanted) {
-  if (!(scenario in SCENARIOS)) throw new Error(`cenário desconhecido: ${scenario}`)
+  if (!Object.hasOwn(SCENARIOS, scenario)) throw new Error(`cenário desconhecido: ${scenario}`)
   const lines = anonymize(await record(scenario)).map((event) => JSON.stringify(event))
   assertClean(lines, scenario)
   writeFileSync(join(import.meta.dirname, `${scenario}.jsonl`), `${lines.join('\n')}\n`)

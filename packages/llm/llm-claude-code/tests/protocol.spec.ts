@@ -274,7 +274,7 @@ describe('Claude Code protocol: a text turn', () => {
     expect(textOf(chunks)).toBe(resultsOf(events)[0]?.result)
     expect(chunks.at(-2)).toEqual({ type: 'usage', usage: resultUsage(events) })
     expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
-    expect(cli.received).toEqual(['Conte de um a dez.'])
+    expect(cli.received).toEqual(['USUÁRIO:\nConte de um a dez.'])
     expect(warnings).toEqual([])
   })
 })
@@ -384,7 +384,7 @@ describe('Claude Code protocol: an interrupted reply', () => {
     await cli.done
 
     expect(cli.interrupt).toHaveBeenCalledOnce()
-    expect(cli.received).toEqual(['Escreva os números de 1 a 300.', 'Responda apenas: pronto'])
+    expect(cli.received).toEqual(['USUÁRIO:\nEscreva os números de 1 a 300.', 'USUÁRIO:\nResponda apenas: pronto'])
     expect(textOf(next)).toBe(resultsOf(events).at(-1)?.result)
     expect(next.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
     expect(sdk.query).toHaveBeenCalledOnce()

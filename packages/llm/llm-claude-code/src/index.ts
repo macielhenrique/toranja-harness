@@ -111,6 +111,11 @@ function blockText(message: RequestMessage, limited = false): string {
   return `[resultado da chamada ${message.toolCallId}${message.isError === true ? ', com erro' : ''}]\n${limited ? cut(text) : text}`.trim()
 }
 
+/** Text under the transcript user label, which keeps the CLI from reading it as its own `/` command, even behind an invisible character. */
+function asUser(text: string): string {
+  return `USUÁRIO:\n${text}`
+}
+
 /**
  * Split a request into the CLI system prompt and one user prompt. A lone user
  * message is sent as is; a longer history becomes a labeled transcript, with
@@ -125,7 +130,7 @@ function promptOf(options: GenerateOptions): { readonly system: string; readonly
     const text = blockText(message, message.role !== 'system' && message.role !== 'developer')
     if (text.length === 0) continue
     if (message.role === 'system' || message.role === 'developer') system.push(text)
-    else if (message.role === 'user') rows.push(`USUÁRIO:\n${text}`)
+    else if (message.role === 'user') rows.push(asUser(text))
     else if (message.role === 'assistant') rows.push(`ASSISTENTE:\n${text}`)
     else rows.push(`FERRAMENTA:\n${text}`)
   }
@@ -140,7 +145,7 @@ function promptOf(options: GenerateOptions): { readonly system: string; readonly
   const kept = omitted === 0 ? rows : [`[${omitted} mensagens anteriores omitidas da transcrição]`, ...rows.slice(omitted)]
   const conversation = options.messages.filter(message => message.role === 'user' || message.role === 'assistant')
   const lone = conversation.length === 1 && conversation[0]?.role === 'user' ? conversation[0] : undefined
-  return { system: system.join('\n\n'), prompt: lone === undefined ? kept.join('\n\n') : blockText(lone) }
+  return { system: system.join('\n\n'), prompt: lone === undefined ? kept.join('\n\n') : asUser(blockText(lone)) }
 }
 
 /** Parent environment without credentials, harness variables, or Claude, Anthropic, and MCP overrides. */
@@ -359,12 +364,12 @@ class LiveQuery {
     return this.bridge !== undefined
   }
 
-  /** Start a CLI turn with a user message; text the CLI would run as its own `/` command goes under the transcript user label. */
+  /** Start a CLI turn with text the caller already labeled as the user's (see `asUser`). */
   push(text: string): void {
     this.awaiting = []
     this.early.clear()
     this.spent = tokenUsage({})
-    this.queued.push(text.trimStart().startsWith('/') ? `USUÁRIO:\n${text}` : text)
+    this.queued.push(text)
     this.wake()
   }
 
@@ -622,7 +627,7 @@ class ClaudeCodeAdapter extends LlmAdapter {
       live.interrupting = undefined
       clearTimeout(live.idle)
       if (answering) live.answer(results, contexts.map(message => blockText(message)).filter(value => value.length > 0).join('\n\n'))
-      else live.push(live === kept ? text : prompt)
+      else live.push(live === kept ? asUser(text) : prompt)
       if (aborted(signal)) onAbort()
       for await (const chunk of this.turnChunks(live, signal, stopped, turn)) {
         if (chunk.type === 'finish') finish = chunk.reason.kind

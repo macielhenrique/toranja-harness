@@ -69,7 +69,7 @@ kind: "package-reference"
 
 `stream()` 以流式输入调用官方 Agent SDK 的 `query()`：一个用户消息队列，在查询存活期间一直保持打开，因为 `interrupt()` 需要它。带有 `sessionId` 且没有 `purpose` 的请求属于一个以该 id 为键的对话；压缩、Session 标题以及没有 Session 的请求使用一次性查询，在结果之后关闭。
 
-对话查询以一组配置（工作目录、模型、推理等级、系统提示与工具定义的哈希）打开，并记住 CLI 已持有的对话条目。当配置不变、且请求历史等于这些条目后面只追加了新的用户消息时，下一轮复用它：把新的用户文本作为一条消息推入，并读取同一个查询直到该轮的 `result`。去掉开头空白后以 `/` 开头的文本，会以 `USUÁRIO:`、换行和该文本的形式发送，因为 CLI 会把这样的文本当作自己的斜杠命令执行。以 `USUÁRIO:`、`ASSISTENTE:`、`FERRAMENTA:`、`[resultado da chamada` 或 `[contexto adicional do Toranja Harness]` 开头的内容行会加上 `> ` 前缀，使消息文本和工具结果无法伪造对话记录中的轮次、结果标题或 harness 上下文。比较时把每条消息投影为其角色和文本，并略去 harness 可能丢弃的空文本块。其他任何历史或配置变化，都会关闭查询，并带着请求历史的对话记录打开新查询：
+对话查询以一组配置（工作目录、模型、推理等级、系统提示与工具定义的哈希）打开，并记住 CLI 已持有的对话条目。当配置不变、且请求历史等于这些条目后面只追加了新的用户消息时，下一轮复用它：把新的用户文本作为一条消息推入，并读取同一个查询直到该轮的 `result`。去掉开头空白后CLI 收到的每段用户文本，无论以什么开头，都会以 `USUÁRIO:`、换行和该文本的形式发送，因为 CLI 会把以 `/` 开头的文本当作自己的斜杠命令执行，而开头的不可见字符会让检测看不到斜杠。以 `USUÁRIO:`、`ASSISTENTE:`、`FERRAMENTA:`、`[resultado da chamada` 或 `[contexto adicional do Toranja Harness]` 开头的内容行会加上 `> ` 前缀，使消息文本和工具结果无法伪造对话记录中的轮次、结果标题或 harness 上下文。比较时把每条消息投影为其角色和文本，并略去 harness 可能丢弃的空文本块。其他任何历史或配置变化，都会关闭查询，并带着请求历史的对话记录打开新查询：
 
 - 新消息中出现压缩摘要（来源类型为 `compact-checkpoint` 的用户消息），或摘要替换了记住的条目时，总是重新打开，因此新查询持有压缩后的历史，而不是 harness 已丢弃的内容；
 - 离开该路由又回来的历史，在记住的条目之后带有其他提供方的助手消息，因此重新打开的对话记录包含这些消息；
@@ -94,7 +94,7 @@ CLI 进程通过 [`@deepseek-ai/dsh-subagent-claude-code`](../../subagent/subage
 
 ### 真实 CLI 测试
 
-`tests/real-claude.e2e.ts` 在 `vitest.e2e.config.ts` 下，以 `haiku` 针对 SDK 自带的 CLI 和本地登录运行该路由；除非该 CLI 的 `auth status` 报告 `loggedIn: true`，否则跳过。它检查：`init` 消息只列出 `mcp__toranja__*` 工具和 `toranja` 服务器，且 `apiKeySource: "none"`；文本轮次流式输出多个增量，并以 `usage` 和 `stop` 结束；含一个或两个工具调用的步骤在 CLI 发出 `stop_reason: "tool_use"` 的 `message_delta` 之后以 `tool-calls` 结束，且结果到达最终回复；后续轮次、被中止的轮次及其后的轮次都在同一个查询和同一个进程上运行；伪造的 `ANTHROPIC_*`、`CLAUDE_*` 和 `MCP_*` 变量从不到达子进程，而登录仍然有效；以 `/` 开头的文本到达模型；释放之后没有 CLI 进程残留。它还会记录（不作断言）`.claude/commands` 中的纯文本项目命令是否出现在 `init.slash_commands` 中，以及被询问时模型说出了哪些用户配置中的技能、代理或命令。一次运行大约消耗 0.03 美元的订阅用量。
+`tests/real-claude.e2e.ts` 在 `vitest.e2e.config.ts` 下，以 `haiku` 针对 SDK 自带的 CLI 和本地登录运行该路由；除非该 CLI 的 `auth status` 报告 `loggedIn: true`，否则跳过。它检查：`init` 消息只列出 `mcp__toranja__*` 工具和 `toranja` 服务器，且 `apiKeySource: "none"`；文本轮次流式输出多个增量，并以 `usage` 和 `stop` 结束；含一个或两个工具调用的步骤在 CLI 发出 `stop_reason: "tool_use"` 的 `message_delta` 之后以 `tool-calls` 结束，且结果到达最终回复；后续轮次、被中止的轮次及其后的轮次都在同一个查询和同一个进程上运行；伪造的 `ANTHROPIC_*`、`CLAUDE_*` 和 `MCP_*` 变量从不到达子进程，而登录仍然有效；以 `/` 开头的文本到达模型；释放之后没有 CLI 进程残留。它还断言 `.claude/commands` 中的纯文本项目命令不在 `init.slash_commands` 中，且被询问技能、代理和命令时，模型不会说出 `init` 所列的任何一个（按整词、不区分大小写比较，排除 Toranja 工具名、名称 `claude`，以及同时是内置命令名的普通词，如 `help` 和 `init`）。一次运行大约消耗 0.03 美元的订阅用量。
 
 </details>
 
@@ -145,4 +145,4 @@ Claude Code 收到的是一个自定义系统提示，由 `GenerateOptions.syste
 - **尚未被任何 bundle 挂载**——Toranja Harness bundle 与模型选择器的注册留待以后。
 - **登录预检读取的是宿主 `claude` 可执行文件**——编排器探测宿主 CLI，而 SDK 启动的是它自己的平台锁定运行时，因此 `not-installed` 可能拒绝一个本可启动的运行时。
 - **不支持自定义 `CLAUDE_CONFIG_DIR`**——环境过滤会移除它，存放在默认配置目录之外的登录信息不会被找到。
-- **`init` 消息列出用户配置中的技能、代理和命令**——尽管 `settingSources` 为空，Claude Code 2.1.263 仍列出用户配置中的技能、其内置代理以及 `/clear`、`/compact` 等斜杠命令。在真实 CLI 测试中，被询问时模型没有说出其中任何一个，`.claude/commands` 中的项目命令也没有被加载；以 `/` 开头的文本会加上标签，因此 CLI 不会把它当作命令执行。
+- **`init` 消息列出用户配置中的技能、代理和命令**——尽管 `settingSources` 为空，Claude Code 2.1.263 仍列出用户配置中的技能、其内置代理以及 `/clear`、`/compact` 等斜杠命令。领导者没有 `Skill` 或 `Agent` 工具（`tools: []`），所有用户文本都带标签到达，因此不会触发任何命令；真实 CLI 测试检查模型不会说出所列的任何一个，且 `.claude/commands` 中的项目命令没有被加载。`init` 不会因列出它们而被拒绝，因为 CLI 总是会列出；只有工具或桥之外的 MCP 服务器才会被拒绝。
