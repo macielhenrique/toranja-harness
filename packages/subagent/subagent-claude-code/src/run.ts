@@ -78,13 +78,19 @@ type ClaudeCodeFailureCategory =
   | 'process'
   | 'unknown'
 
-interface ClaudeCodeFailureFacts {
+/** Safe lifecycle facts that classify one Claude Code failure without product output. */
+export interface ClaudeCodeFailureFacts {
   readonly stage: ClaudeCodeFailureStage
   readonly category: ClaudeCodeFailureCategory
   readonly outcome?: SubprocessOutcome | undefined
 }
 
-function failureDiagnostic(facts: ClaudeCodeFailureFacts): string {
+/**
+ * Render failure facts as a fixed diagnostic free of stderr and product text.
+ * @param facts - lifecycle stage, failure category, and observed process outcome.
+ * @returns one line naming the product, stage, category, exit code, and signal.
+ */
+export function failureDiagnostic(facts: ClaudeCodeFailureFacts): string {
   const fields = [
     'product: Claude Code',
     `stage: ${facts.stage}`,

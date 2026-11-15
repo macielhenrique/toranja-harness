@@ -29,6 +29,16 @@ import {
   type ClaudeCodeRunSpec,
 } from './run.ts'
 
+export {
+  CLAUDE_CODE_EFFORTS,
+  DEFAULT_DISPOSE_GRACE_MS,
+  disposeClaudeCodeChild,
+  failureDiagnostic as claudeCodeFailureDiagnostic,
+  type ClaudeCodeEffort,
+  type ClaudeCodeFailureFacts,
+} from './run.ts'
+export { claudeSpawnSpec, ManagedClaudeCodeProcess } from './process.ts'
+
 export const name = 'subagent-claude-code'
 export const inject = ['subagents', 'subprocess']
 

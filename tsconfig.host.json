@@ -316,6 +316,7 @@
     { "path": "./packages/client/file-upload/tsconfig.host.json" },
     { "path": "./packages/llm/llm" },
     { "path": "./packages/llm/llm-antigravity-cli" },
+    { "path": "./packages/llm/llm-claude-code" },
     { "path": "./packages/llm/deepseek-llm-api-extensions" },
     { "path": "./packages/llm/token-meter" },
     { "path": "./packages/core/session" },

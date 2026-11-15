@@ -53,6 +53,7 @@ export const PRODUCT_PACKAGE_POLICY: Readonly<Record<string, ProductPackagePolic
   'packages/client/ui-toranja-control': { category: 'optional', reason: 'Conversation-header agent orchestration dashboard mounted by the Toranja Harness composition.' },
   'packages/credentials/credentials-codex-import': { category: 'optional', reason: 'Local Codex CLI credential importer mounted by the Toranja Harness composition.' },
   'packages/llm/llm-antigravity-cli': { category: 'optional', reason: 'Local Antigravity CLI model provider mounted by the Toranja Harness composition.' },
+  'packages/llm/llm-claude-code': { category: 'optional', reason: 'Text-only local Claude Code model provider for an explicit Toranja Harness composition.' },
   'packages/orchestration/toranja-orchestrator': { category: 'optional', reason: 'Multi-agent project lane and delegation orchestrator mounted by the Toranja Harness composition.' },
   'packages/subagent/subagent-antigravity': { category: 'optional', reason: 'Antigravity CLI subagent provider mounted by the Toranja Harness composition.' },
 }
