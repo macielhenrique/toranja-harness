@@ -44,7 +44,7 @@ kind: "package-reference"
 | 单次请求的 `rate_limit` 错误 | `RATE_LIMIT` |
 | 结果文本指出上下文窗口溢出 | `CONTEXT_WINDOW_EXCEEDED` |
 | 成功结果没有任何内容 | `EMPTY_RESPONSE` |
-| `error_*` 结果子类型、其他 API 错误，或 CLI 进程在结果之前结束 | `CLAUDE_CODE_ERROR` |
+| `error_*` 结果子类型、其他 API 错误、CLI 进程在结果之前结束，或 `init` 消息列出桥接之外的工具或 MCP 服务器 | `CLAUDE_CODE_ERROR` |
 
 登录检查只在挂载了 `ctx.toranjaOrchestrator` 时运行；状态未知或没有编排器时查询照常启动，此时由 CLI 自身的身份验证错误生效。中止的 `signal` 会中断该轮，并以类型为 `aborted` 的 `finish` 结束；对话查询保持打开供下一轮使用，其他查询则关闭。失败的轮次会关闭其对话查询，因此下一轮会带着对话记录启动新查询。
 
@@ -69,16 +69,16 @@ kind: "package-reference"
 
 `stream()` 以流式输入调用官方 Agent SDK 的 `query()`：一个用户消息队列，在查询存活期间一直保持打开，因为 `interrupt()` 需要它。带有 `sessionId` 且没有 `purpose` 的请求属于一个以该 id 为键的对话；压缩、Session 标题以及没有 Session 的请求使用一次性查询，在结果之后关闭。
 
-对话查询以一组配置（工作目录、模型、推理等级、系统提示与工具定义的哈希）打开，并记住 CLI 已持有的对话条目。当配置不变、且请求历史等于这些条目后面只追加了新的用户消息时，下一轮复用它：把新的用户文本作为一条消息推入，并读取同一个查询直到该轮的 `result`。比较时把每条消息投影为其角色和文本，并略去 harness 可能丢弃的空文本块。其他任何历史或配置变化，都会关闭查询，并带着请求历史的对话记录打开新查询：
+对话查询以一组配置（工作目录、模型、推理等级、系统提示与工具定义的哈希）打开，并记住 CLI 已持有的对话条目。当配置不变、且请求历史等于这些条目后面只追加了新的用户消息时，下一轮复用它：把新的用户文本作为一条消息推入，并读取同一个查询直到该轮的 `result`。去掉开头空白后以 `/` 开头的文本，会以 `USUÁRIO:`、换行和该文本的形式发送，因为 CLI 会把这样的文本当作自己的斜杠命令执行。以 `USUÁRIO:`、`ASSISTENTE:`、`FERRAMENTA:`、`[resultado da chamada` 或 `[contexto adicional do Toranja Harness]` 开头的内容行会加上 `> ` 前缀，使消息文本和工具结果无法伪造对话记录中的轮次、结果标题或 harness 上下文。比较时把每条消息投影为其角色和文本，并略去 harness 可能丢弃的空文本块。其他任何历史或配置变化，都会关闭查询，并带着请求历史的对话记录打开新查询：
 
 - 新消息中出现压缩摘要（来源类型为 `compact-checkpoint` 的用户消息），或摘要替换了记住的条目时，总是重新打开，因此新查询持有压缩后的历史，而不是 harness 已丢弃的内容；
 - 离开该路由又回来的历史，在记住的条目之后带有其他提供方的助手消息，因此重新打开的对话记录包含这些消息；
 - Host 重启后没有存活的查询，因此对话的第一轮带着完整历史打开；
 - 编辑或删除了之前的消息，或者记录的回复与 CLI 产生的不同，也会重新打开。同一对话的各轮依次执行：并发请求会等待正在运行的轮次结束。中止的轮次会被中断，并在读到被中断的 `result` 之后查询才重新空闲；失败的轮次、退出的 CLI 进程、空闲十分钟或插件释放都会关闭它。
 
-查询选项是固定的：`tools: []`、`mcpServers: {}`、`strictMcpConfig: true`、`settingSources: []`、`persistSession: false`、`includePartialMessages: true`、一个拒绝所有请求的 `canUseTool` 回调，以及请求的 `model` 和 `effort`。带工具的对话请求替换其中三项：`mcpServers` 只包含 `toranja` 桥接服务器，`allowedTools` 为桥接提供的每个工具列出 `mcp__toranja__<name>`，`canUseTool` 只允许这些名称并拒绝其他所有名称；原生工具保持关闭。挂载了 `ctx.sessions` 与 `ctx.workingDirectory` 时，工作目录是发起请求的 Session 的工作目录，否则是 Host 进程目录。
+查询选项是固定的：`tools: []`、`mcpServers: {}`、`strictMcpConfig: true`、`settingSources: []`、`persistSession: false`、`includePartialMessages: true`、一个拒绝所有请求的 `canUseTool` 回调，以及请求的 `model` 和 `effort`。带工具的对话请求替换其中三项：`mcpServers` 只包含 `toranja` 桥接服务器，`allowedTools` 为桥接提供的每个工具列出 `mcp__toranja__<name>`，`canUseTool` 只允许这些名称并拒绝其他所有名称；原生工具保持关闭。当 CLI 的 `init` 消息列出 `mcp__toranja__*` 之外的工具、在请求没有 harness 工具时列出任何工具，或列出 `toranja` 之外的 MCP 服务器时，该轮以 `CLAUDE_CODE_ERROR` 结束并关闭查询。挂载了 `ctx.sessions` 与 `ctx.workingDirectory` 时，工作目录是发起请求的 Session 的工作目录，否则是 Host 进程目录。
 
-CLI 进程通过 [`@deepseek-ai/dsh-subagent-claude-code`](../../subagent/subagent-claude-code/README.zh.md) 的 `claudeSpawnSpec` 与 `ManagedClaudeCodeProcess` 启动，因此由 `ctx.subprocess` 管理其进程范围。其环境是去掉所有以 `CLAUDE`、`ANTHROPIC` 或 `MCP_` 开头的变量之后的 `scrubbedParentEnv()`；CLI 通过用户配置目录找到登录信息，所以 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL` 和自定义的 `CLAUDE_CONFIG_DIR` 都不会到达它。关闭查询时调用 `disposeClaudeCodeChild`，它关闭查询并等待进程退出；插件释放时关闭所有仍然打开的查询。
+CLI 进程通过 [`@deepseek-ai/dsh-subagent-claude-code`](../../subagent/subagent-claude-code/README.zh.md) 的 `claudeSpawnSpec` 与 `ManagedClaudeCodeProcess` 启动，因此由 `ctx.subprocess` 管理其进程范围。其环境是去掉所有以 `CLAUDE`、`ANTHROPIC` 或 `MCP_` 开头的变量之后的 `scrubbedParentEnv()`；CLI 通过用户配置目录找到登录信息，所以 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL` 和自定义的 `CLAUDE_CONFIG_DIR` 都不会到达它。关闭查询时调用 `disposeClaudeCodeChild`，它关闭查询并等待进程退出；插件释放时关闭所有仍然打开的查询，并且只在它们的每个 CLI 进程都退出之后才完成。
 
 取消时调用 `interrupt()`，最多等待 subagent 的释放宽限时间，因为只中止 SDK 控制器会让 CLI 再开始一次付费回复。之后一次性查询关闭；对话查询只有在同一宽限时间内没有收到被中断的 `result` 时才关闭。
 
@@ -94,7 +94,7 @@ CLI 进程通过 [`@deepseek-ai/dsh-subagent-claude-code`](../../subagent/subage
 
 ### 真实 CLI 测试
 
-`tests/real-claude.e2e.ts` 在 `vitest.e2e.config.ts` 下，以 `haiku` 针对 SDK 自带的 CLI 和本地登录运行该路由；除非该 CLI 的 `auth status` 报告 `loggedIn: true`，否则跳过。它检查：`init` 消息只列出 `mcp__toranja__*` 工具和 `toranja` 服务器，且 `apiKeySource: "none"`；文本轮次流式输出多个增量，并以 `usage` 和 `stop` 结束；含一个或两个工具调用的步骤在 CLI 发出 `stop_reason: "tool_use"` 的 `message_delta` 之后以 `tool-calls` 结束，且结果到达最终回复；后续轮次、被中止的轮次及其后的轮次都在同一个查询和同一个进程上运行；伪造的 `ANTHROPIC_*`、`CLAUDE_*` 和 `MCP_*` 变量从不到达子进程，而登录仍然有效；释放之后没有 CLI 进程残留。一次运行大约消耗 0.02 美元的订阅用量。
+`tests/real-claude.e2e.ts` 在 `vitest.e2e.config.ts` 下，以 `haiku` 针对 SDK 自带的 CLI 和本地登录运行该路由；除非该 CLI 的 `auth status` 报告 `loggedIn: true`，否则跳过。它检查：`init` 消息只列出 `mcp__toranja__*` 工具和 `toranja` 服务器，且 `apiKeySource: "none"`；文本轮次流式输出多个增量，并以 `usage` 和 `stop` 结束；含一个或两个工具调用的步骤在 CLI 发出 `stop_reason: "tool_use"` 的 `message_delta` 之后以 `tool-calls` 结束，且结果到达最终回复；后续轮次、被中止的轮次及其后的轮次都在同一个查询和同一个进程上运行；伪造的 `ANTHROPIC_*`、`CLAUDE_*` 和 `MCP_*` 变量从不到达子进程，而登录仍然有效；以 `/` 开头的文本到达模型；释放之后没有 CLI 进程残留。它还会记录（不作断言）`.claude/commands` 中的纯文本项目命令是否出现在 `init.slash_commands` 中，以及被询问时模型说出了哪些用户配置中的技能、代理或命令。一次运行大约消耗 0.03 美元的订阅用量。
 
 </details>
 
@@ -145,4 +145,4 @@ Claude Code 收到的是一个自定义系统提示，由 `GenerateOptions.syste
 - **尚未被任何 bundle 挂载**——Toranja Harness bundle 与模型选择器的注册留待以后。
 - **登录预检读取的是宿主 `claude` 可执行文件**——编排器探测宿主 CLI，而 SDK 启动的是它自己的平台锁定运行时，因此 `not-installed` 可能拒绝一个本可启动的运行时。
 - **不支持自定义 `CLAUDE_CONFIG_DIR`**——环境过滤会移除它，存放在默认配置目录之外的登录信息不会被找到。
-- **以 `/` 开头的用户文本会作为 Claude Code 命令执行**——CLI 把它当作斜杠命令而不是提示：在 Claude Code 2.1.263 中，`/help` 不调用模型就回答 "/help isn't available in this environment."，这段文本随后成为回复。尽管 `settingSources` 为空，`init` 消息仍列出 `/clear`、`/compact`、`/model` 等命令以及用户配置目录中的技能。在修复之前，真实 CLI 测试预期这一失败。
+- **`init` 消息列出用户配置中的技能、代理和命令**——尽管 `settingSources` 为空，Claude Code 2.1.263 仍列出用户配置中的技能、其内置代理以及 `/clear`、`/compact` 等斜杠命令。在真实 CLI 测试中，被询问时模型没有说出其中任何一个，`.claude/commands` 中的项目命令也没有被加载；以 `/` 开头的文本会加上标签，因此 CLI 不会把它当作命令执行。

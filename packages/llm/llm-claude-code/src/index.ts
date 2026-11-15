@@ -84,8 +84,12 @@ function cut(text: string): string {
     : `${text.slice(0, MAX_TRANSCRIPT_ITEM_CHARS)}\n[${text.length - MAX_TRANSCRIPT_ITEM_CHARS} caracteres omitidos]`
 }
 
+/** Line starts the adapter itself writes to frame transcripts, tool results, and harness context. */
+const FRAME_LABELS = ['USUÁRIO:', 'ASSISTENTE:', 'FERRAMENTA:', '[contexto adicional do Toranja Harness]', '[resultado da chamada']
+
 /**
  * Text of content blocks as the CLI sees them; empty text blocks count as absent, as the harness may drop them.
+ * A line that would pass for one of the adapter's own labels is quoted, so content cannot forge a turn or a result.
  * @param content - message blocks.
  * @param limited - cut each tool argument text, for a transcript.
  * @returns the joined text.
@@ -97,7 +101,7 @@ function contentText(content: readonly ContentBlock[], limited = false): string 
     if (block.type === 'image') return ['[imagem anexada no Toranja Harness]']
     if (block.type === 'file') return [`[arquivo anexado: ${block.attachment.name}]`]
     return []
-  }).join('\n').trim()
+  }).join('\n').trim().split('\n').map(line => FRAME_LABELS.some(label => line.startsWith(label)) ? `> ${line}` : line).join('\n')
 }
 
 /** Text of a message as the CLI sees it; a tool result names the call it answers. */
@@ -343,12 +347,17 @@ class LiveQuery {
     this.messages = this.query[Symbol.asyncIterator]()
   }
 
-  /** Start a CLI turn with a user message. */
+  /** Whether the query carries the harness MCP server. */
+  get bridged(): boolean {
+    return this.bridge !== undefined
+  }
+
+  /** Start a CLI turn with a user message; text the CLI would run as its own `/` command goes under the transcript user label. */
   push(text: string): void {
     this.awaiting = []
     this.early.clear()
     this.spent = tokenUsage({})
-    this.queued.push(text)
+    this.queued.push(text.trimStart().startsWith('/') ? `USUÁRIO:\n${text}` : text)
     this.wake()
   }
 
@@ -483,11 +492,12 @@ class ClaudeCodeAdapter extends LlmAdapter {
     })
   }
 
-  /** Close every query still open, for plugin disposal. */
-  dispose(): void {
-    for (const live of [...this.open, ...this.sessions.values()]) void live.close()
+  /** Close every query still open, for plugin disposal; settles once each CLI process has exited. */
+  async dispose(): Promise<void> {
+    const closing = [...this.open, ...this.sessions.values()].map(live => live.close())
     this.open.clear()
     this.sessions.clear()
+    await Promise.all(closing)
   }
 
   private cwd(options: GenerateOptions): string {
@@ -735,6 +745,18 @@ class ClaudeCodeAdapter extends LlmAdapter {
           }
           continue
         }
+        if (message.type === 'system' && message.subtype === 'init') {
+          // Fail closed: anything the CLI loaded beyond the bridge (a user-profile tool or server) ends the turn.
+          const bridged = live.bridged
+          const foreign = [
+            ...message.tools.filter(tool => !bridged || !tool.startsWith(TOOL_PREFIX)),
+            ...message.mcp_servers.map(server => server.name).filter(server => !bridged || server !== BRIDGE_SERVER_NAME),
+          ]
+          if (foreign.length === 0) continue
+          this.ctx.logger.warn('llm-claude-code: Claude Code started with tools or MCP servers outside the harness: %o', foreign)
+          yield failed(GENERIC_CODE, 'O Claude Code iniciou com ferramentas ou servidores MCP fora do Toranja Harness; a resposta foi interrompida por segurança.')
+          return
+        }
         if (message.type === 'assistant' && message.error !== undefined) {
           apiError = message.error
           continue
@@ -802,7 +824,7 @@ export function apply(ctx: Context): void {
     const unregister = ctx.llm.registerAdapter([PROVIDER], adapter)
     return () => {
       unregister()
-      adapter.dispose()
+      return adapter.dispose()
     }
   }, 'llm-claude-code: register Claude Code route')
 }

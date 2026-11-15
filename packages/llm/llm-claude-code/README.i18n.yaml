@@ -18,8 +18,8 @@
   en: 2ddbeea3924674a7
   zh: c7733f785fd53d6a
 /deepseek-ai-dsh-llm-claude-code/use-this-package/failure-and-recovery:
-  en: bbb9947a1ab9013c
-  zh: 0901153a27b8504d
+  en: e4e898a7a92be1e5
+  zh: f7d97969f6b64415
 /deepseek-ai-dsh-llm-claude-code/understand-the-implementation:
   en: 42b15ac6321706aa
   zh: 7ae097f3abcc5d9c
@@ -27,14 +27,14 @@
   en: 4f17bcb077260ec2
   zh: 003097e8acadca85
 /deepseek-ai-dsh-llm-claude-code/understand-the-implementation/query-lifecycle:
-  en: 1d0edd99317e4a66
-  zh: 5aa6b1a096fbf3bf
+  en: 3032523e1c7f1221
+  zh: 7a09b580303916e1
 /deepseek-ai-dsh-llm-claude-code/understand-the-implementation/tool-steps:
   en: b7175f81db1121c1
   zh: 6a1d38203f38f6c4
 /deepseek-ai-dsh-llm-claude-code/understand-the-implementation/real-cli-test:
-  en: d1efc7c38201353e
-  zh: f81c009736520259
+  en: 420c8618a1b5a85a
+  zh: 79e2cafc77d0ffa2
 /deepseek-ai-dsh-llm-claude-code/model-experience:
   en: 215e7ba838619b7b
   zh: a311da3843709f90
@@ -63,5 +63,5 @@
   en: c502038367107956
   zh: 596f110535a1435f
 /deepseek-ai-dsh-llm-claude-code/known-limitations-and-deferred-work:
-  en: 568b708e9542ce09
-  zh: 35aba58f2e2df672
+  en: fbf2596423047555
+  zh: ea953803e51d0adc

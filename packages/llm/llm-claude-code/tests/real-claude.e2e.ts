@@ -1,7 +1,7 @@
 // Real Claude Code CLI over the local login: spends subscription quota, so it skips unless the
 // SDK-bundled CLI reports `loggedIn: true`. Run: pnpm exec vitest run --config vitest.e2e.config.ts <this file>
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -141,6 +141,9 @@ describe.skipIf(!signedIn())(`real Claude Code ${sdkVersion} as the claude-code-
 
   beforeAll(async () => {
     cwd = mkdtempSync(join(tmpdir(), 'dsh-l5-leader-'))
+    // A harmless project command (plain text, no shell line): case 1 records whether the CLI loads it.
+    mkdirSync(join(cwd, '.claude', 'commands'), { recursive: true })
+    writeFileSync(join(cwd, '.claude', 'commands', 'marcador.md'), 'Responda apenas: marcador do projeto.')
     baseline = bundledProcesses()
     for (const [name, value] of Object.entries(FAKE_ENV)) {
       saved.set(name, process.env[name])
@@ -192,6 +195,8 @@ describe.skipIf(!signedIn())(`real Claude Code ${sdkVersion} as the claude-code-
       slash_commands: init?.slash_commands,
       permissionMode: init?.permissionMode,
     }))
+    // Informational: settingSources is empty, so a project command should stay out of the CLI.
+    console.info('[L5] project command marcador in init.slash_commands:', init?.slash_commands.includes('marcador') === true)
     expect([...init?.tools ?? []].sort()).toEqual(['mcp__toranja__add', 'mcp__toranja__get_weather'])
     expect(init?.mcp_servers.map(server => server.name)).toEqual(['toranja'])
     expect(init?.apiKeySource).toBe('none')
@@ -302,9 +307,8 @@ describe.skipIf(!signedIn())(`real Claude Code ${sdkVersion} as the claude-code-
     expect(init?.apiKeySource).toBe('none')
   })
 
-  // Known defect: the CLI runs user text that starts with '/' as its own slash command ("/help isn't available
-  // in this environment.", num_turns 0, no model call) and the adapter relays that reply. Drop .fails once fixed.
-  it.fails('8. sends text starting with "/" to the model instead of running a built-in command', async () => {
+  // The CLI runs user text that starts with '/' as its own slash command; the adapter labels it so the model answers.
+  it('8. sends text starting with "/" to the model instead of running a built-in command', async () => {
     const start = observed.messages.length
     history.push(user('/help'))
     const chunks = await turn()
@@ -318,7 +322,21 @@ describe.skipIf(!signedIn())(`real Claude Code ${sdkVersion} as the claude-code-
     // A model reply streams message_start; a local slash command answers without calling the model.
     expect(seen.some(message => message.type === 'stream_event' && message.event.type === 'message_start')).toBe(true)
     expect(finishOf(chunks)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+    expect(textOf(chunks)).not.toContain("isn't available in this environment")
     expect(observed.queries).toBe(1)
+    history.push(reply(blocksOf(chunks)))
+  })
+
+  // Informational: whether the model sees the skills, agents, or commands the CLI lists from the user profile.
+  it('9. records which profile skills, agents, or commands the model says it has', async () => {
+    history.push(user('Sem usar ferramentas, liste os nomes exatos de todas as skills, agentes (subagents) e comandos de barra que você tem disponíveis nesta sessão. Se não tiver nenhum, responda apenas: nenhum.'))
+    const chunks = await turn()
+    expect(finishOf(chunks)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+    history.push(reply(blocksOf(chunks)))
+    const init = observed.messages.find((message): message is SDKSystemMessage => message.type === 'system' && message.subtype === 'init')
+    const text = textOf(chunks).toLowerCase()
+    const listed = [...init?.skills ?? [], ...init?.agents ?? [], 'dataviz', 'design-sync', 'code-review', 'simplify', 'loop', 'schedule']
+    console.info('[L5] model on its skills/agents/commands', JSON.stringify({ reply: textOf(chunks), named: [...new Set(listed.filter(name => text.includes(name.toLowerCase())))] }))
   })
 
   it('leaves no CLI process running after disposal', async () => {
