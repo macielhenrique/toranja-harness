@@ -73,10 +73,27 @@ const MODELS: readonly LlmModelInfo[] = ([
   inputModalities: ['text'] as const,
 }))
 
-function contentText(content: readonly ContentBlock[]): string {
+/** Largest tool argument or result text a reopening transcript carries; the excess is cut with a notice. */
+export const MAX_TRANSCRIPT_ITEM_CHARS = 20_000
+/** Largest reopening transcript; its oldest messages are left out first. */
+export const MAX_TRANSCRIPT_CHARS = 400_000
+
+function cut(text: string): string {
+  return text.length <= MAX_TRANSCRIPT_ITEM_CHARS
+    ? text
+    : `${text.slice(0, MAX_TRANSCRIPT_ITEM_CHARS)}\n[${text.length - MAX_TRANSCRIPT_ITEM_CHARS} caracteres omitidos]`
+}
+
+/**
+ * Text of content blocks as the CLI sees them; empty text blocks count as absent, as the harness may drop them.
+ * @param content - message blocks.
+ * @param limited - cut each tool argument text, for a transcript.
+ * @returns the joined text.
+ */
+function contentText(content: readonly ContentBlock[], limited = false): string {
   return content.flatMap((block) => {
-    if (block.type === 'text') return [block.text]
-    if (block.type === 'tool-call') return [`[chamada de ferramenta ${block.name} (${block.id}): ${block.arguments}]`]
+    if (block.type === 'text') return block.text.length === 0 ? [] : [block.text]
+    if (block.type === 'tool-call') return [`[chamada de ferramenta ${block.name} (${block.id}): ${limited ? cut(block.arguments) : block.arguments}]`]
     if (block.type === 'image') return ['[imagem anexada no Toranja Harness]']
     if (block.type === 'file') return [`[arquivo anexado: ${block.attachment.name}]`]
     return []
@@ -84,15 +101,16 @@ function contentText(content: readonly ContentBlock[]): string {
 }
 
 /** Text of a message as the CLI sees it; a tool result names the call it answers. */
-function blockText(message: RequestMessage): string {
-  const text = contentText(message.content)
+function blockText(message: RequestMessage, limited = false): string {
+  const text = contentText(message.content, limited)
   if (message.role !== 'tool') return text
-  return `[resultado da chamada ${message.toolCallId}${message.isError === true ? ', com erro' : ''}]\n${text}`.trim()
+  return `[resultado da chamada ${message.toolCallId}${message.isError === true ? ', com erro' : ''}]\n${limited ? cut(text) : text}`.trim()
 }
 
 /**
  * Split a request into the CLI system prompt and one user prompt. A lone user
- * message is sent as is; a longer history becomes a labeled transcript.
+ * message is sent as is; a longer history becomes a labeled transcript, with
+ * tool arguments and results cut and its oldest messages left out past its limit.
  * @param options - assembled model request.
  * @returns the system prompt text and the user prompt text.
  */
@@ -100,16 +118,21 @@ function promptOf(options: GenerateOptions): { readonly system: string; readonly
   const system = options.system === undefined ? [] : [options.system]
   const rows: string[] = []
   for (const message of options.messages) {
-    const text = blockText(message)
+    const text = blockText(message, message.role !== 'system' && message.role !== 'developer')
     if (text.length === 0) continue
     if (message.role === 'system' || message.role === 'developer') system.push(text)
     else if (message.role === 'user') rows.push(`USUÁRIO:\n${text}`)
     else if (message.role === 'assistant') rows.push(`ASSISTENTE:\n${text}`)
     else rows.push(`FERRAMENTA:\n${text}`)
   }
+  let omitted = 0
+  for (let size = rows.join('\n\n').length; size > MAX_TRANSCRIPT_CHARS && omitted < rows.length - 1; omitted++) {
+    size -= (rows[omitted]?.length ?? 0) + 2
+  }
+  const kept = omitted === 0 ? rows : [`[${omitted} mensagens anteriores omitidas da transcrição]`, ...rows.slice(omitted)]
   const conversation = options.messages.filter(message => message.role === 'user' || message.role === 'assistant')
   const lone = conversation.length === 1 && conversation[0]?.role === 'user' ? conversation[0] : undefined
-  return { system: system.join('\n\n'), prompt: lone === undefined ? rows.join('\n\n') : blockText(lone) }
+  return { system: system.join('\n\n'), prompt: lone === undefined ? kept.join('\n\n') : blockText(lone) }
 }
 
 /** Parent environment without credentials, harness variables, or Claude, Anthropic, and MCP overrides. */
@@ -218,17 +241,30 @@ interface Entry {
   readonly text: string
 }
 
+/** Producer kind of a message; a request-only user input has none. */
+function kindOf(message: RequestMessage): string | undefined {
+  return message.source?.kind
+}
+
+/** Context the harness itself adds as a user message, such as a tool's reminder; not a person's message nor a compaction summary. */
+function harnessContext(message: RequestMessage): boolean {
+  const kind = kindOf(message)
+  return message.role === 'user' && kind !== undefined && kind !== 'user' && kind !== 'compact-checkpoint'
+}
+
 /**
  * Messages a history appends to what the CLI already holds.
  * @param seen - entries the live query already received or produced.
  * @param history - entries of the new request, one per message of `said`.
  * @param said - conversation messages of the new request.
- * @returns the appended messages; none unless the history starts with `seen` and goes past it.
+ * @returns the appended messages; none unless the history starts with `seen` and goes past it without a compaction summary.
  */
 function appended(seen: readonly Entry[], history: readonly Entry[], said: readonly RequestMessage[]): readonly RequestMessage[] {
   if (history.length <= seen.length) return []
   if (JSON.stringify(history.slice(0, seen.length)) !== JSON.stringify(seen)) return []
-  return said.slice(seen.length)
+  const added = said.slice(seen.length)
+  // The CLI still holds what a compaction summary replaced, so a summary always reopens.
+  return added.some(message => kindOf(message) === 'compact-checkpoint') ? [] : added
 }
 
 /** What one turn produced, read by the settlement after the stream ends. */
@@ -319,8 +355,9 @@ class LiveQuery {
   /**
    * Hand the harness results to the waiting calls; a call the harness left without a result fails.
    * @param results - tool messages the harness appended after the step.
+   * @param context - text the harness added after the results, handed to the model with the last call's result.
    */
-  answer(results: readonly ToolResultMessage[]): void {
+  answer(results: readonly ToolResultMessage[], context: string): void {
     const given = new Map(results.map(message => [String(message.toolCallId), {
       content: contentText(message.content),
       ...message.isError === true ? { isError: true } : {},
@@ -328,8 +365,11 @@ class LiveQuery {
     for (const id of given.keys()) {
       if (!this.awaiting.includes(id)) this.ctx.logger.warn('llm-claude-code: ignoring a result for unknown tool call %s', id)
     }
+    const last = this.awaiting.at(-1)
     for (const id of this.awaiting) {
-      const result = given.get(id) ?? { content: 'Sem resultado do harness para esta chamada.', isError: true }
+      const base = given.get(id) ?? { content: 'Sem resultado do harness para esta chamada.', isError: true }
+      // shortcut: the bridge cuts a huge result from the end, losing the context appended to it; move the context ahead if that matters.
+      const result = id === last && context.length > 0 ? { ...base, content: `${base.content}\n\n[contexto adicional do Toranja Harness]\n${context}` } : base
       if (this.bridge?.resolve(id, result) !== true) this.early.set(id, result)
     }
     this.awaiting = []
@@ -548,10 +588,12 @@ class ClaudeCodeAdapter extends LlmAdapter {
       history = said.map(message => ({ role: message.role, text: blockText(message) }))
       const kept = key === undefined ? undefined : this.sessions.get(key)
       const added = kept?.config === config ? appended(kept.seen, history, said) : []
-      const text = added.every(message => message.role === 'user') ? added.map(blockText).filter(value => value.length > 0).join('\n\n') : ''
+      const text = added.every(message => message.role === 'user') ? added.map(message => blockText(message)).filter(value => value.length > 0).join('\n\n') : ''
       const results = added.filter((message): message is ToolResultMessage => message.role === 'tool')
-      // An idle query takes new user text; one stopped on tool calls takes only their results.
-      const answering = kept?.phase === 'awaiting-tools' && results.length > 0 && results.length === added.length
+      const contexts = added.slice(results.length)
+      // An idle query takes new user text; one stopped on tool calls takes their results and the context the harness adds after them.
+      const answering = kept?.phase === 'awaiting-tools' && results.length > 0
+        && added.slice(0, results.length).every(message => message.role === 'tool') && contexts.every(harnessContext)
       if (kept !== undefined && (answering || (kept.phase === 'idle' && text.length > 0))) {
         live = kept
       } else {
@@ -564,7 +606,7 @@ class ClaudeCodeAdapter extends LlmAdapter {
       live.phase = 'turn-running'
       live.interrupting = undefined
       clearTimeout(live.idle)
-      if (answering) live.answer(results)
+      if (answering) live.answer(results, contexts.map(message => blockText(message)).filter(value => value.length > 0).join('\n\n'))
       else live.push(live === kept ? text : prompt)
       if (aborted(signal)) onAbort()
       for await (const chunk of this.turnChunks(live, signal, stopped, turn)) {

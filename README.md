@@ -14,8 +14,9 @@ assinaturas e sem depender de uma assinatura DeepSeek.
   próprio login local e seus próprios limites;
 - conversa principal também pelo Claude Code (login oficial do CLI `claude`,
   sem chave de API), somente texto, sem ferramentas próprias nem MCPs/plugins
-  do usuário; em desenvolvimento: ferramentas do Toranja pelo líder Claude Code,
-  sessão contínua e histórico;
+  do usuário; mantém uma sessão contínua por conversa e a reabre com o histórico
+  quando ele muda (compactação, troca de provedor, reinício do app); em
+  desenvolvimento: ferramentas do Toranja pelo líder Claude Code;
 - delegação para Codex e Antigravity, isoladamente ou em equipe;
 - modos **Equipe**, **Só Codex** e **Só Antigravity**, persistidos entre
   reinicializações;

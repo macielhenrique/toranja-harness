@@ -30,8 +30,10 @@ The single chat currently uses:
   existing local authentication;
 - **Claude Code** as a lead option through the login of the installed `claude` CLI,
   with no API key. As lead it only answers in text: it has no tools of its own
-  and loads none of the user's MCP servers or plugins. Harness tools for the
-  Claude lead, a continuous session and history are in development;
+  and loads none of the user's MCP servers or plugins. It keeps one continuous
+  session per conversation and reopens it with the history when that changes
+  (compaction, a provider switch, an app restart). Harness tools for the Claude
+  lead are in development;
 - **Agent Teams** for parallel Codex teammates, direct messages, and a shared
   task board.
 

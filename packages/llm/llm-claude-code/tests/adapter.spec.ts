@@ -986,3 +986,120 @@ describe('ClaudeCodeAdapter under the agent loop', () => {
     }
   })
 })
+
+const checkpoint = (text: string) => ({ role: 'user', content: [{ type: 'text', text }], source: { kind: 'compact-checkpoint', compactionId: 'c1' } })
+/** Context a tool attaches after its result, as the agent loop stages it for the next step. */
+const toolContext = (text: string) => ({ role: 'user', content: [{ type: 'text', text }], source: { kind: 'repeat-tool-reminder' } })
+const from = (provider: string, text: string) => ({ role: 'assistant', content: [{ type: 'text', text }], source: { kind: 'model', provider, model: 'm' } })
+
+describe('ClaudeCodeAdapter history reconciliation', () => {
+  it('reopens with the compacted transcript when the harness replaces earlier messages with a summary', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('ok') }, { script: reply('certo') }])
+    await collect(adapter, conversation([user('oi')]))
+    const compacted = [checkpoint('<compacted-summary>resumo</compacted-summary>'), user('mais')]
+    await collect(adapter, conversation(compacted))
+
+    expect(fakes[0]?.close).toHaveBeenCalled()
+    expect(fakes[1]?.received).toEqual(['USUÁRIO:\n<compacted-summary>resumo</compacted-summary>\n\nUSUÁRIO:\nmais'])
+
+    await collect(adapter, conversation([...compacted, assistant('ok'), user('depois')]))
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[1]?.received.at(-1)).toBe('depois')
+  })
+
+  it('reopens when a compaction summary follows the remembered history', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('ok') }])
+    await collect(adapter, conversation([user('oi')]))
+    await collect(adapter, conversation([user('oi'), assistant('Olá'), checkpoint('resumo'), user('mais')]))
+
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[1]?.received[0]).toContain('USUÁRIO:\nresumo')
+  })
+
+  it('hands context the harness adds after the tool results to the model with the last result, on the same query', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([askOnce('ok')])
+    await collect(adapter, withTools([user('oi')]))
+    const history = [...answered, toolContext('Você repetiu esta chamada.')]
+    expect(await finishOf(adapter, withTools(history))).toEqual(STOP_FINISH)
+
+    expect(sdk.query).toHaveBeenCalledOnce()
+    expect(resultText(fakes[0], 'toolu_1')).toBe('feito\n\n[contexto adicional do Toranja Harness]\nVocê repetiu esta chamada.')
+
+    await collect(adapter, withTools([...history, assistant('ok'), user('valeu')]))
+    expect(sdk.query).toHaveBeenCalledOnce()
+    expect(fakes[0]?.received).toEqual(['oi', 'valeu'])
+  })
+
+  it('reopens when a user message steers after the tool results', async () => {
+    const { adapter } = harness()
+    sessionQuery([askOnce('velho'), { script: reply('novo') }])
+    await collect(adapter, withTools([user('oi')]))
+    await collect(adapter, withTools([...answered, { ...user('pare'), source: { kind: 'user' } }]))
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+  })
+
+  it('reopens with the other provider replies each time the conversation comes back from another provider', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('c2') }, { script: reply('c4') }])
+    const second = [user('q1'), from('openai-codex', 'r1'), user('q2')]
+    await collect(adapter, conversation(second))
+    expect(fakes[0]?.received).toEqual(['USUÁRIO:\nq1\n\nASSISTENTE:\nr1\n\nUSUÁRIO:\nq2'])
+
+    await collect(adapter, conversation([...second, from('claude-code-local', 'c2'), user('q3'), from('openai-codex', 'r3'), user('q4')]))
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[0]?.close).toHaveBeenCalled()
+    expect(fakes[1]?.received).toEqual(['USUÁRIO:\nq1\n\nASSISTENTE:\nr1\n\nUSUÁRIO:\nq2\n\nASSISTENTE:\nc2\n\nUSUÁRIO:\nq3\n\nASSISTENTE:\nr3\n\nUSUÁRIO:\nq4'])
+  })
+
+  it('opens with the transcript after the app restarts, when no query is alive', async () => {
+    const fakes = sessionQuery([{ script: reply('Olá') }, { script: reply('ok') }])
+    await collect(harness().adapter, conversation([user('oi')]))
+    await collect(harness().adapter, conversation([user('oi'), assistant('Olá'), user('mais')]))
+
+    expect(sdk.query).toHaveBeenCalledTimes(2)
+    expect(fakes[1]?.received).toEqual([transcriptOfSecondTurn])
+  })
+
+  it('cuts long tool arguments and results in a reopening transcript, with a notice', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('ok') }])
+    const limit = claudeCode.MAX_TRANSCRIPT_ITEM_CHARS
+    const args = JSON.stringify({ project: 'a'.repeat(limit) })
+    await collect(adapter, withTools([user('oi'), asks(call('toolu_1', args)), toolResult('toolu_1', 'b'.repeat(limit + 500)), user('e então?')]))
+
+    const sent = fakes[0]?.received[0] ?? ''
+    expect(sent).toContain(`[resultado da chamada toolu_1]\n${'b'.repeat(limit)}\n[500 caracteres omitidos]`)
+    expect(sent).toContain(`[chamada de ferramenta delegate_project_task (toolu_1): ${args.slice(0, limit)}\n[${args.length - limit} caracteres omitidos]]`)
+    expect(sent.endsWith('USUÁRIO:\ne então?')).toBe(true)
+  })
+
+  it('keeps the latest messages of a reopening transcript within its total limit', async () => {
+    const { adapter } = harness()
+    const fakes = sessionQuery([{ script: reply('ok') }])
+    const total = claudeCode.MAX_TRANSCRIPT_CHARS
+    const long = 'x'.repeat(Math.ceil(total / 3))
+    await collect(adapter, conversation([user(`velho ${long}`), assistant(`a1 ${long}`), user(`u2 ${long}`), assistant(`a2 ${long}`), user('agora')]))
+
+    const sent = fakes[0]?.received[0] ?? ''
+    expect(sent.length).toBeLessThanOrEqual(total + 200)
+    expect(sent.startsWith('[2 mensagens anteriores omitidas da transcrição]\n\nUSUÁRIO:\nu2 ')).toBe(true)
+    expect(sent).not.toContain('velho')
+    expect(sent).not.toContain('a1 ')
+    expect(sent.endsWith('USUÁRIO:\nagora')).toBe(true)
+  })
+
+  it('ignores an empty text block the harness leaves out when it compares the history', async () => {
+    const { adapter } = harness()
+    const emptyText = (index: number) => [
+      event({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } }),
+      event({ type: 'content_block_stop', index }),
+    ]
+    sessionQuery([{ script: [...textBlock(0, 'Vou delegar.'), ...emptyText(1), ...toolUse(2, 'toolu_1'), invoke('toolu_1'), asksTools, settle('toolu_1'), ...reply('ok')] }])
+    await collect(adapter, withTools([user('oi')]))
+    await collect(adapter, withTools([user('oi'), asks({ type: 'text', text: 'Vou delegar.' }, call('toolu_1')), toolResult('toolu_1', 'feito')]))
+    expect(sdk.query).toHaveBeenCalledOnce()
+  })
+})
