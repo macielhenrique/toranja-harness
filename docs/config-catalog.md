@@ -4364,7 +4364,7 @@ export type ToolPresentationMode = 'native' | 'ptc'
 ## `@deepseek-ai/dsh-toranja-orchestrator`
 
 - `inject`: `storageDomain` · `subagents` · `subprocess` · `systemPrompt` · `tools` · `workspaceRegistry`
-- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:141`](../packages/orchestration/toranja-orchestrator/src/index.ts)
+- `source`: [`packages/orchestration/toranja-orchestrator/src/index.ts:198`](../packages/orchestration/toranja-orchestrator/src/index.ts)
 
 ```ts config-catalog
 /** Product-owned orchestration settings. */
@@ -4438,6 +4438,26 @@ export interface Config {
    * `write` role; with this set, the working-tree check is the only safeguard.
    */
   openrouterUnenforcedAccess?: boolean
+  /**
+   * Rules that classify a task as simple, moderate, or complex from its text
+   * and write scope; a value left out keeps its default.
+   */
+  classification?: {
+    /** Most file entries a task may write and still be simple. */
+    maxDirectFiles?: number
+    /** Most file entries a task may write without becoming complex. */
+    maxInvestigatedFiles?: number
+    /** Terms that make a task complex when its text contains them. */
+    riskTerms?: string[]
+    /** Protected path patterns; a write scope that touches one makes the task complex. */
+    protectedPaths?: string[]
+  }
+  /**
+   * When a writing role needs an approved plan and a write scope, until the
+   * user changes it: `off` (default) checks nothing, `auto` asks the user only
+   * for a complex plan, and `always` asks for every plan.
+   */
+  approvalPolicy?: ToranjaApprovalPolicy
 }
 
 /** One stable product lane backed by a local project directory. */
@@ -4470,6 +4490,14 @@ export interface ProviderRoutingConfig {
   /** Model and reasoning effort per tier (`light`, `advanced`, `max`). */
   models?: Record<string, TierModelConfig>
 }
+
+/**
+ * When the Host asks before a writing role runs: `off` never (writes are not
+ * scoped), `auto` lets a simple task run and approves a moderate plan with
+ * evidence by itself while a complex plan goes to the user, and `always` puts
+ * every plan to the user.
+ */
+export type ToranjaApprovalPolicy = 'off' | 'auto' | 'always'
 
 /** Model and reasoning effort of one tier. */
 export interface TierModelConfig {

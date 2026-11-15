@@ -75,7 +75,8 @@
   line-height: 18px;
 }
 
-.providers {
+.providers,
+.plans {
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -84,7 +85,8 @@
   list-style: none;
 }
 
-.provider {
+.provider,
+.plan {
   display: flex;
   flex-direction: column;
   gap: 4px;

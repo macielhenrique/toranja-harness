@@ -146,6 +146,10 @@
         maxConcurrentPerProvider: 2
         maxTaskChars: 12000
         allowParallelImplementation: false
+        # An implementer needs a write scope, simple tasks run directly, and a
+        # complex plan waits for the user's approval; the Host checks what the
+        # implementer wrote against its scope after it runs.
+        approvalPolicy: auto
         # Default until the user changes it; the orchestrator then stores the
         # choice in its storage domain and restores it on restart.
         defaultMode: team

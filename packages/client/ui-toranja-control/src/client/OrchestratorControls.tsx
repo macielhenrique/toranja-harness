@@ -123,6 +123,41 @@ export function ModePicker({ status, busy, onChoose }: {
 }
 
 /**
+ * Change a whole number one step at a time between two limits.
+ * @param props.label - Accessible name of the group.
+ * @param props.decreaseLabel - Accessible name of the button that lowers the value.
+ * @param props.increaseLabel - Accessible name of the button that raises the value.
+ * @param props.value - Value in force.
+ * @param props.min - Lowest value the button can reach.
+ * @param props.max - Highest value the button can reach; unbounded when omitted.
+ * @param props.busy - Whether a request is in flight.
+ * @param props.onChange - Store another value.
+ * @returns The stepper.
+ */
+export function Stepper({ label, decreaseLabel, increaseLabel, value, min, max = Infinity, busy, onChange }: {
+  label: string
+  decreaseLabel: string
+  increaseLabel: string
+  value: number
+  min: number
+  max?: number
+  busy: boolean
+  onChange: (value: number) => void
+}) {
+  return (
+    <div className={css.stepper} role="group" aria-label={label}>
+      <button type="button" aria-label={decreaseLabel} disabled={busy || value <= min} onClick={() => { onChange(value - 1) }}>
+        −
+      </button>
+      <span className={css.count}>{value}</span>
+      <button type="button" aria-label={increaseLabel} disabled={busy || value >= max} onClick={() => { onChange(value + 1) }}>
+        +
+      </button>
+    </div>
+  )
+}
+
+/**
  * Change how many agents work in one project at once, one at a time, up to the deployment limit.
  * @param props.status - Snapshot naming the team size and its limit.
  * @param props.busy - Whether a request is in flight.
@@ -135,24 +170,15 @@ export function TeamSizeStepper({ status, busy, onChange }: {
   onChange: (teamSize: number) => void
 }) {
   return (
-    <div className={css.stepper} role="group" aria-label={ORCHESTRATOR_COPY.teamSizeHeading}>
-      <button
-        type="button"
-        aria-label={ORCHESTRATOR_COPY.decreaseTeam}
-        disabled={busy || status.teamSize <= 1}
-        onClick={() => { onChange(status.teamSize - 1) }}
-      >
-        −
-      </button>
-      <span className={css.count}>{status.teamSize}</span>
-      <button
-        type="button"
-        aria-label={ORCHESTRATOR_COPY.increaseTeam}
-        disabled={busy || status.teamSize >= status.limits.maxTeamSize}
-        onClick={() => { onChange(status.teamSize + 1) }}
-      >
-        +
-      </button>
-    </div>
+    <Stepper
+      label={ORCHESTRATOR_COPY.teamSizeHeading}
+      decreaseLabel={ORCHESTRATOR_COPY.decreaseTeam}
+      increaseLabel={ORCHESTRATOR_COPY.increaseTeam}
+      value={status.teamSize}
+      min={1}
+      max={status.limits.maxTeamSize}
+      busy={busy}
+      onChange={onChange}
+    />
   )
 }

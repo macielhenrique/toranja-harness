@@ -1,317 +1,14 @@
-import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { PassThrough } from 'node:stream'
-import { Context } from '@deepseek-ai/cordis'
-import Storage from '@deepseek-ai/dsh-storage'
-import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
+import { basename, dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { MemoryMediaPool, MemoryStorageBackend } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
+import { MemoryMediaPool } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
 import * as orchestrator from '../src/index.ts'
 import type { ToranjaOrchestrationStatus } from '../src/index.ts'
+import { ROUTING, cleanup, delegate, gitRepo, implement, installed, mount, repos, runGate, settled, type Harness } from './harness.ts'
 
-interface RegisteredProvider {
-  readonly name: string
-  start(request: Record<string, unknown>): Promise<{ result: Promise<unknown>; dispose(): Promise<void> }>
-}
-
-interface Tool {
-  readonly name: string
-  execute(args: Record<string, unknown>, exec: { agent: unknown; signal: AbortSignal }): Promise<string>
-}
-
-interface Harness {
-  readonly ctx: Context
-  readonly repo: string
-  readonly agyRuns: string[][]
-  /** Status commands sent to the simulated provider CLIs. */
-  readonly cliRuns: string[][]
-  readonly started: string[]
-  /** Prompt text of every started run, in start order. */
-  readonly prompts: string[]
-  readonly tool: (name: string) => Tool
-  readonly status: () => ToranjaOrchestrationStatus
-  readonly setMode: (request: Record<string, unknown>) => Promise<ToranjaOrchestrationStatus>
-  /** Change settings without naming the routing mode. */
-  readonly update: (request: Record<string, unknown>) => Promise<ToranjaOrchestrationStatus>
-  readonly adoptLegacyMode: (mode: string) => Promise<ToranjaOrchestrationStatus>
-  /** Side effect each simulated agent performs in the project directory. */
-  agentSideEffect: (cwd: string) => void
-  /** Text every simulated agent answers with. */
-  answer: string
-  /** When set, simulated non-Antigravity agents settle only after it resolves. */
-  hold: Promise<undefined> | undefined
-  /** Providers whose start is refused, with the error they report. */
-  readonly offline: Map<string, string>
-  /** Providers whose run settles as failed, with the diagnostic they report. */
-  readonly failing: Map<string, string>
-  /** Answers of the simulated provider CLIs to status commands, keyed by executable path. */
-  readonly cli: Map<string, { exitCode: number; stdout: string }>
-  readonly probe: () => Promise<ToranjaOrchestrationStatus>
-  readonly connect: (provider: string) => Promise<{ command: readonly string[] }>
-  /** Start requests received by the simulated subagent service, in order. */
-  readonly requests: { provider: string; agentOptions?: Record<string, unknown> }[]
-  /** Credential references the simulated credential store holds. */
-  readonly credentials: Set<string>
-  /** When set, the simulated credential store fails with this message. */
-  credentialFailure: string | undefined
-  /** Executables whose status command cannot be started. */
-  readonly brokenCli: Set<string>
-  /** When set, every Git command the orchestrator runs fails. */
-  gitBroken: boolean
-  /** How many of the next Git commands fail before Git works again. */
-  gitFailures: number
-  /** Arguments of every Git command the orchestrator ran. */
-  readonly gitRuns: string[][]
-}
-
-const repos: string[] = []
-const contexts: Context[] = []
-const mounted: Context[] = []
-
-function gitRepo(): string {
-  const repo = mkdtempSync(join(tmpdir(), 'toranja-lane-'))
-  repos.push(repo)
-  const git = (...args: string[]): void => {
-    execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', ...args], { cwd: repo, stdio: 'ignore' })
-  }
-  git('init', '-q')
-  writeFileSync(join(repo, '.gitignore'), '.env' + String.fromCharCode(10))
-  writeFileSync(join(repo, 'tracked.txt'), 'original\n')
-  git('add', '.')
-  git('commit', '-q', '-m', 'init')
-  return repo
-}
-
-/**
- * Mount the orchestrator over simulated providers. Passing the `disk` of an
- * earlier mount simulates an application restart over the same stored state.
- */
-async function mount(
-  config: orchestrator.Config = {},
-  registered = ['codex', 'antigravity'],
-  disk = new MemoryMediaPool(),
-): Promise<Harness> {
-  const ctx = new Context()
-  contexts.push(ctx)
-  await ctx.plugin(Storage)
-  ctx.storage.backend.register('memory', new MemoryStorageBackend(disk))
-  const facility = new DomainFacility(ctx, { backend: 'memory', routes: {} })
-  ctx.storage.mount('domain', facility)
-  ctx.provide('storageDomain', facility)
-  const repo = gitRepo()
-  const providers = new Map<string, RegisteredProvider>()
-  const tools = new Map<string, Tool>()
-  const harness: Harness = {
-    ctx,
-    repo,
-    agyRuns: [],
-    cliRuns: [],
-    started: [],
-    prompts: [],
-    tool: (name) => {
-      const tool = tools.get(name)
-      if (tool === undefined) throw new Error(`missing tool ${name}`)
-      return tool
-    },
-    status: () => ctx.toranjaOrchestrator.status(),
-    setMode: () => { throw new Error('controller not mounted') },
-    update: () => { throw new Error('controller not mounted') },
-    adoptLegacyMode: () => { throw new Error('controller not mounted') },
-    agentSideEffect: () => {},
-    answer: 'TORANJA_GATE: PASS\nall criteria inspected',
-    hold: undefined,
-    offline: new Map(),
-    failing: new Map(),
-    cli: new Map(),
-    probe: () => { throw new Error('controller not mounted') },
-    connect: () => { throw new Error('controller not mounted') },
-    requests: [],
-    credentials: new Set(),
-    credentialFailure: undefined,
-    brokenCli: new Set(),
-    gitBroken: false,
-    gitFailures: 0,
-    gitRuns: [],
-  }
-  ctx.provide('subprocess', {
-    spawn: (spec: { argv: readonly string[]; cwd: string }) => {
-      // The orchestrator runs Git by the absolute path it resolved from PATH.
-      if (/(?:^|[\\/])git(?:\.exe)?$/iu.test(spec.argv[0] ?? '')) {
-        harness.gitRuns.push(spec.argv.slice(1))
-        const failing = harness.gitBroken || harness.gitFailures-- > 0
-        const child = spawn('git', failing ? ['not-a-git-command'] : spec.argv.slice(1), { cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe'] })
-        const done = new Promise<{ exitCode: number | null }>((resolve) => {
-          child.on('close', (exitCode) => { resolve({ exitCode }) })
-        })
-        return { stdout: child.stdout, stderr: child.stderr, done, terminate: () => {}, waitForExit: () => done }
-      }
-      if (harness.brokenCli.has(spec.argv[0] ?? '')) throw new Error('spawn EPERM')
-      const scripted = harness.cli.get(spec.argv[0] ?? '')
-      if (scripted !== undefined && !spec.argv.includes('-p')) {
-        harness.cliRuns.push([...spec.argv])
-        const stdout = new PassThrough()
-        const stderr = new PassThrough()
-        stdout.end(scripted.stdout)
-        stderr.end()
-        const done = Promise.resolve({ exitCode: scripted.exitCode })
-        return { stdout, stderr, done, terminate: () => {}, waitForExit: () => done }
-      }
-      harness.agyRuns.push([...spec.argv])
-      harness.agentSideEffect(spec.cwd)
-      const stdout = new PassThrough()
-      const stderr = new PassThrough()
-      stdout.end(JSON.stringify({ status: 'SUCCESS', response: harness.answer }))
-      stderr.end()
-      const done = Promise.resolve({ exitCode: 0 })
-      return { stdout, stderr, done, terminate: () => {}, waitForExit: () => done }
-    },
-  } as never)
-  ctx.provide('subagents', {
-    list: () => [...registered, ...providers.keys()],
-    registerProvider: (provider: RegisteredProvider) => {
-      providers.set(provider.name, provider)
-      return () => { providers.delete(provider.name) }
-    },
-    startActivation: async (start: {
-      provider: string
-      request: { cwd: string; signal?: AbortSignal; prompt: { text: string }[]; agentOptions?: Record<string, unknown> }
-    }) => {
-      harness.requests.push({
-        provider: start.provider,
-        ...start.request.agentOptions === undefined ? {} : { agentOptions: start.request.agentOptions },
-      })
-      const family = start.provider.split('~')[0] ?? start.provider
-      const refusal = harness.offline.get(family)
-      if (refusal !== undefined) throw new Error(refusal)
-      harness.started.push(start.provider)
-      harness.prompts.push(start.request.prompt.map(block => block.text).join(''))
-      const diagnostic = harness.failing.get(family)
-      if (diagnostic !== undefined) {
-        harness.agentSideEffect(start.request.cwd)
-        return {
-          childId: `child-${harness.started.length}`,
-          result: Promise.resolve({ output: [], stopReason: 'error', diagnostic }),
-        }
-      }
-      const provider = providers.get(start.provider)
-      // Antigravity instances Toranja owns run through the simulated CLI;
-      // every other provider settles with the configured answer.
-      if (provider !== undefined && start.provider.startsWith('antigravity')) {
-        const run = await provider.start({ ...start.request, signal: new AbortController().signal })
-        void run.result.finally(() => { void run.dispose() })
-        return { childId: `child-${harness.started.length}`, result: run.result }
-      }
-      harness.agentSideEffect(start.request.cwd)
-      return {
-        childId: `child-${harness.started.length}`,
-        result: (harness.hold ?? Promise.resolve())
-          .then(() => ({ output: [{ type: 'text', text: harness.answer }], stopReason: 'completed' })),
-      }
-    },
-  } as never)
-  ctx.provide('credentials', {
-    describe: (ref: string) => harness.credentialFailure === undefined
-      ? Promise.resolve({ configured: harness.credentials.has(ref) })
-      : Promise.reject(new Error(harness.credentialFailure)),
-  } as never)
-  ctx.provide('tools', { register: (tool: Tool) => { tools.set(tool.name, tool); return () => {} } } as never)
-  ctx.provide('systemPrompt', { section: () => () => {}, getSectionOrder: () => 0 } as never)
-  ctx.provide('workspaceRegistry', {
-    list: () => [],
-    create: () => Promise.resolve({ title: 'Demo', setTitle: () => Promise.resolve() }),
-  } as never)
-
-  await ctx.plugin(orchestrator, orchestrator.Config(Object.assign({
-    projects: [{ id: 'demo', title: 'Demo', path: repo }],
-  }, config)))
-  mounted.push(ctx)
-  const controller = (ctx as Context & { toranjaOrchestrationController: orchestrator.ToranjaOrchestrationController })
-    .toranjaOrchestrationController
-  return Object.assign(harness, {
-    setMode: (request: Record<string, unknown>) => Promise.resolve(controller.setMode(request as never)),
-    update: (request: Record<string, unknown>) => Promise.resolve(controller.updateSettings(request as never)),
-    adoptLegacyMode: (mode: string) => controller.adoptLegacyMode({ mode: mode as never }),
-    probe: () => controller.probeProviders(),
-    connect: async (provider: string) => controller.connectProvider({ provider: provider as never }),
-  })
-}
-
-/** Create empty files standing in for installed provider CLIs and return their absolute paths. */
-function installed<Name extends string>(...names: Name[]): Record<Name, string> {
-  const bin = mkdtempSync(join(tmpdir(), 'toranja-bin-'))
-  repos.push(bin)
-  const paths = {} as Record<Name, string>
-  for (const name of names) {
-    paths[name] = join(bin, name)
-    writeFileSync(paths[name], '')
-  }
-  return paths
-}
-
-const ROUTING = {
-  codex: {
-    base: { env: { CODEX_HOME: '/codex' } },
-    models: {
-      light: { model: 'gpt-light', effort: 'low' },
-      advanced: { model: 'gpt-strong', effort: 'medium' },
-      max: { model: 'gpt-strong', effort: 'high' },
-    },
-  },
-  antigravity: {
-    base: { executable: 'agy', sandbox: true, autoApproveTools: true, mode: 'accept-edits' },
-    models: {
-      light: { model: 'gemini-flash-low' },
-      advanced: { model: 'gemini-argon-medium' },
-    },
-  },
-} as const
-
-async function settled(harness: Harness): Promise<ToranjaOrchestrationStatus['tasks']> {
-  await expect.poll(() => harness.status().active).toBe(0)
-  return harness.status().tasks
-}
-
-async function implement(harness: Harness): Promise<string> {
-  const result = await delegate(harness, { role: 'implementer' })
-  await settled(harness)
-  return (result.activations as { taskId: string }[])[0]?.taskId ?? ''
-}
-
-function delegate(harness: Harness, args: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return harness.tool('delegate_project_task').execute({
-    project: 'demo',
-    description: 'check the lane',
-    task: 'do the work',
-    ...args,
-  }, { agent: {}, signal: new AbortController().signal }).then(text => JSON.parse(text) as Record<string, unknown>)
-}
-
-interface GateOutcome {
-  readonly passed: boolean
-  readonly implementerProvider?: string
-  readonly independentReview?: boolean
-  readonly replan?: Record<string, unknown>
-  readonly results: Record<string, unknown>[]
-}
-
-function runGate(harness: Harness, args: Record<string, unknown> = {}): Promise<GateOutcome> {
-  return harness.tool('run_delivery_gate').execute({
-    project: 'demo',
-    implementationSummary: 'done',
-    acceptanceCriteria: 'tests pass',
-    ...args,
-  }, { agent: {}, signal: new AbortController().signal }).then(text => JSON.parse(text) as GateOutcome)
-}
-
-afterEach(async () => {
-  // A delegation's working-tree check outlives the tool call; let it finish
-  // before its Git processes lose their directory.
-  for (const ctx of mounted.splice(0)) await expect.poll(() => ctx.toranjaOrchestrator.status().active).toBe(0)
-  for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
-  for (const repo of repos.splice(0)) rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
-})
+afterEach(cleanup)
 
 describe('Toranja routed delegation', () => {
   it('starts a reader on the light model in the provider plan mode without auto-approval', async () => {
@@ -1072,8 +769,9 @@ describe('Toranja routed delegation', () => {
     await settled(harness)
     expect(harness.gitRuns.length).toBeGreaterThan(0)
     for (const args of harness.gitRuns) {
-      // A file-system monitor or hook named in the repository's own Git config would run on the Host.
-      expect(args.slice(0, 3)).toEqual(['--no-optional-locks', '-c', 'core.fsmonitor=false'])
+      // A file-system monitor or hook named in the repository's own Git config would run on the Host,
+      // and a replacement object would make one commit read as another.
+      expect(args.slice(0, 4)).toEqual(['--no-replace-objects', '--no-optional-locks', '-c', 'core.fsmonitor=false'])
       const hooks = args.find(arg => arg.startsWith('core.hooksPath='))?.slice('core.hooksPath='.length) ?? ''
       // Hooks are looked up in a directory the Host owns and keeps empty.
       expect(hooks.startsWith(harness.repo)).toBe(false)
@@ -1161,6 +859,58 @@ describe('Toranja routed delegation', () => {
     await delegate(harness, { role: 'tester' })
     const tasks = await settled(harness)
     expect(tasks[0]).toMatchObject({ state: 'failed', error: 'execute role changed Git state that hides file changes' })
+  })
+
+  it('does not read a large hidden file whole, and still catches it rewritten at the same size with its time put back', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await harness.setMode({ mode: 'codex' })
+    // Larger than the 5 MiB read by content.
+    const size = 5 * 1024 * 1024 + 1
+    writeFileSync(join(harness.repo, 'large.bin'), Buffer.alloc(size, 'a'))
+    gitIn(harness.repo, 'add', 'large.bin')
+    gitIn(harness.repo, 'commit', '-q', '-m', 'large')
+    gitIn(harness.repo, 'update-index', '--skip-worktree', 'large.bin')
+    // A whole second, which the platform puts back exactly; only the change time then tells the rewrite apart.
+    const time = 1_700_000_000
+    utimesSync(join(harness.repo, 'large.bin'), time, time)
+    const rewritten = Buffer.alloc(size, 'b')
+    harness.agentSideEffect = (cwd) => {
+      const file = join(cwd, 'large.bin')
+      writeFileSync(file, rewritten)
+      utimesSync(file, time, time)
+    }
+    const alloc = vi.spyOn(Buffer, 'alloc')
+    try {
+      await delegate(harness, { role: 'tester' })
+      const tasks = await settled(harness)
+      expect(tasks[0]).toMatchObject({ state: 'failed', error: 'execute role changed Git state that hides file changes' })
+      expect(alloc.mock.calls.filter(([length]) => length >= size)).toEqual([])
+    } finally {
+      alloc.mockRestore()
+    }
+  })
+
+  it('reads hidden files by content only up to the total budget of one fingerprint', async () => {
+    const harness = await mount({ routing: ROUTING })
+    await harness.setMode({ mode: 'codex' })
+    // Sixteen files of the 5 MiB read by content add up to more than the 64 MiB one fingerprint reads.
+    const size = 5 * 1024 * 1024
+    const names = Array.from({ length: 16 }, (_, index) => `hidden-${index}.bin`)
+    for (const name of names) writeFileSync(join(harness.repo, name), Buffer.alloc(size, 'a'))
+    gitIn(harness.repo, 'add', ...names)
+    gitIn(harness.repo, 'commit', '-q', '-m', 'hidden')
+    gitIn(harness.repo, 'update-index', '--skip-worktree', ...names)
+    const alloc = vi.spyOn(Buffer, 'alloc')
+    try {
+      await delegate(harness, { role: 'tester' })
+      expect((await settled(harness))[0]).toMatchObject({ state: 'completed' })
+      // One fingerprint before the run and one after it.
+      const read = alloc.mock.calls.filter(([length]) => length >= size).length
+      expect(read).toBeGreaterThan(0)
+      expect(read * size).toBeLessThanOrEqual(2 * 64 * 1024 * 1024)
+    } finally {
+      alloc.mockRestore()
+    }
   })
 
   it('catches a file Git ignores rewritten at the same size with its time put back', async () => {
@@ -1469,6 +1219,55 @@ describe('Toranja routed delegation', () => {
         expect(toranjaBranches()).toEqual([left[0]?.branch])
       })
 
+      it('reports only the branch, with no worktree, when the directory is gone but Git cannot delete the branch', async () => {
+        const { harness, left } = await restarted([deadPid()], (worktree) => {
+          // A leftover lock makes Git refuse to delete the ref.
+          const common = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: worktree }).toString().trim()
+          writeFileSync(join(resolve(worktree, common), 'refs', 'heads', 'toranja', `${basename(worktree)}.lock`), '')
+        })
+        expect(await swept(harness)).toEqual([{ project: 'demo', branch: left[0]?.branch }])
+        expect(existsSync(left[0]?.worktree ?? '')).toBe(false)
+      })
+
+      it('keeps reporting a branch Git could not delete after the orchestrator restarts, and never deletes it', async () => {
+        const { harness, repo, worktreeRoot, left, toranjaBranches } = await restarted([deadPid()], (worktree) => {
+          const common = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: worktree }).toString().trim()
+          writeFileSync(join(resolve(worktree, common), 'refs', 'heads', 'toranja', `${basename(worktree)}.lock`), '')
+        })
+        expect(await swept(harness)).toEqual([{ project: 'demo', branch: left[0]?.branch }])
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        expect(await swept(again)).toEqual([{ project: 'demo', branch: left[0]?.branch }])
+        expect(toranjaBranches()).toEqual([left[0]?.branch])
+      })
+
+      it('reports a toranja branch with no worktree only when its name is one this plugin gives, and a live worktree once', async () => {
+        const { repo, worktreeRoot, left } = await restarted([process.pid])
+        for (const name of ['toranja/Bad_Name', 'toranja/three-part-name', 'toranja/nodash', 'toranja/ok-name']) {
+          execFileSync('git', ['branch', name, 'HEAD'], { cwd: repo, stdio: 'ignore' })
+        }
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        expect(await swept(again)).toEqual([{ ...left[0], inUse: true }, { project: 'demo', branch: 'toranja/ok-name' }])
+      })
+
+      it('still reports the branch of a registered worktree whose directory was removed by hand, and keeps it', async () => {
+        const { repo, worktreeRoot, left, toranjaBranches } = await restarted([undefined])
+        // Removed without `git worktree prune`: the registration stays in .git/worktrees.
+        rmSync(left[0]?.worktree ?? '', { recursive: true, force: true })
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        expect(await swept(again)).toEqual([{ project: 'demo', branch: left[0]?.branch }])
+        expect(toranjaBranches()).toEqual([left[0]?.branch])
+      })
+
+      it('does not list the branch of a valid worktree that lives outside this deployment\'s root', async () => {
+        const { repo, worktreeRoot } = await restarted([process.pid])
+        const outside = join(mkdtempSync(join(tmpdir(), 'toranja-outside-')), 'tree')
+        execFileSync('git', ['worktree', 'add', '-b', 'toranja/other-tree', outside, 'HEAD'], { cwd: repo, stdio: 'ignore' })
+        const again = await mount({ routing: ROUTING, implementerWorktrees: true, worktreeRoot, projects: [{ id: 'demo', title: 'Demo', path: repo }] })
+        const branches = (await swept(again) ?? []).map(left => left.branch)
+        expect(branches).not.toContain('toranja/other-tree')
+        expect(existsSync(outside)).toBe(true)
+      })
+
       it('leaves alone a worktree whose owner is still running', async () => {
         const { harness, left, toranjaBranches } = await restarted([process.pid])
         // In use by a running Toranja: never removed, and reported as such so nothing stays out of sight.
@@ -1647,5 +1446,126 @@ describe('Toranja routed delegation', () => {
       .rejects.toThrow('routing.codex.models requires routing.codex.base')
     await expect(mount({ roleProviders: { janitor: 'codex' } })).rejects.toThrow('unknown role "janitor"')
     await expect(mount({ routing: { antigravity: { base: {}, models: { light: { effort: 'turbo' } } } } })).rejects.toThrow()
+  })
+})
+
+describe('Toranja task classification', () => {
+  const classify = (harness: Harness, args: Record<string, unknown>): Promise<Record<string, unknown>> =>
+    harness.tool('classify_project_task').execute({
+      project: 'demo',
+      task: 'fix a typo',
+      writeScope: ['src/a.ts'],
+      ...args,
+    }, { agent: {}, signal: new AbortController().signal }).then(text => JSON.parse(text) as Record<string, unknown>)
+  const limits = { maxDirectFiles: 3, maxInvestigatedFiles: 10 }
+
+  it('classifies a simple task and reports the normalized scope', async () => {
+    const harness = await mount()
+    expect(await classify(harness, { writeScope: ['src\\a.ts', './src/a.ts'] })).toEqual({
+      project: 'demo',
+      level: 'simple',
+      path: 'direct',
+      reasons: [],
+      writeScope: ['src/a.ts'],
+      limits,
+    })
+  })
+
+  it('classifies a directory entry as complex', async () => {
+    const harness = await mount()
+    expect(await classify(harness, { writeScope: ['src/app/**'] })).toEqual({
+      project: 'demo',
+      level: 'complex',
+      path: 'approve',
+      reasons: ['directory scope src/app/ needs approval'],
+      writeScope: ['src/app/'],
+      limits,
+    })
+  })
+
+  it('classifies a moderate task from the file count', async () => {
+    const harness = await mount()
+    expect(await classify(harness, { writeScope: ['a.ts', 'b.ts', 'c.ts', 'd.ts'] })).toMatchObject({
+      level: 'moderate',
+      path: 'investigate',
+      reasons: ['4 files exceed the direct limit of 3'],
+    })
+  })
+
+  it('classifies a complex task from a risk term and lets the caller raise the level', async () => {
+    const harness = await mount()
+    expect(await classify(harness, { task: 'add a migration' })).toMatchObject({
+      level: 'complex',
+      path: 'approve',
+      reasons: ['risk term "migra"'],
+    })
+    expect(await classify(harness, { level: 'complex' })).toMatchObject({
+      level: 'complex',
+      reasons: ['raised to complex by the caller'],
+    })
+  })
+
+  it('rejects an unknown lane and an invalid scope', async () => {
+    const harness = await mount()
+    await expect(classify(harness, { project: 'nowhere' })).rejects.toThrow('unknown Toranja project lane "nowhere"')
+    await expect(classify(harness, { writeScope: [] })).rejects.toThrow('at least one entry')
+    await expect(classify(harness, { writeScope: ['../outside'] })).rejects.toThrow('".."')
+  })
+
+  it('follows the configured classification', async () => {
+    const harness = await mount({
+      classification: { maxDirectFiles: 1, maxInvestigatedFiles: 2, riskTerms: ['shipit'], protectedPaths: ['docs/'] },
+    })
+    const result = await classify(harness, { task: 'shipit now', writeScope: ['a.ts', 'b.ts'] })
+    expect(result).toMatchObject({
+      level: 'complex',
+      reasons: ['risk term "shipit"', '2 files exceed the direct limit of 1'],
+      limits: { maxDirectFiles: 1, maxInvestigatedFiles: 2 },
+    })
+    expect(await classify(harness, { writeScope: ['docs/a.md'] })).toMatchObject({ reasons: ['protected path docs/a.md'] })
+    expect(await classify(harness, { task: 'add a migration' })).toMatchObject({ level: 'simple' })
+  })
+
+  it('keeps the default of a classification field the configuration leaves out', async () => {
+    const harness = await mount({ classification: { maxDirectFiles: 1 } })
+    expect(await classify(harness, { writeScope: ['a.ts', 'b.ts'] })).toMatchObject({
+      level: 'moderate',
+      limits: { maxDirectFiles: 1, maxInvestigatedFiles: 10 },
+    })
+    expect(await classify(harness, { task: 'add a migration' })).toMatchObject({ level: 'complex' })
+  })
+
+  it.each([
+    [{ maxDirectFiles: 0 }, 'classification.maxDirectFiles must be a positive safe integer'],
+    [{ maxInvestigatedFiles: 1.5 }, 'classification.maxInvestigatedFiles must be a positive safe integer'],
+    [{ maxDirectFiles: 5, maxInvestigatedFiles: 4 }, 'maxInvestigatedFiles must not be below maxDirectFiles'],
+    [{ riskTerms: ['ok', ' '] }, 'classification.riskTerms must not contain an empty term'],
+    [{ protectedPaths: [''] }, 'classification.protectedPaths entry ""'],
+    [{ protectedPaths: ['/etc/'] }, 'classification.protectedPaths entry "/etc/"'],
+    [{ protectedPaths: ['a/../b'] }, 'classification.protectedPaths entry "a/../b"'],
+    [{ protectedPaths: ['src/*.ts'] }, 'classification.protectedPaths entry "src/*.ts"'],
+    [{ protectedPaths: ['.github\\'] }, 'classification.protectedPaths entry ".github\\\\" is invalid: write it as ".github/"'],
+    [{ protectedPaths: ['./.github/'] }, 'classification.protectedPaths entry "./.github/" is invalid: write it as ".github/"'],
+    [{ protectedPaths: [' .env*'] }, 'classification.protectedPaths entry " .env*" is invalid: write it as ".env*"'],
+    [{ protectedPaths: ['**/a\\b/'] }, 'is invalid: write it as "**/a/b/"'],
+    [{ protectedPaths: ['a/./b/'] }, 'classification.protectedPaths entry "a/./b/"'],
+    [{ protectedPaths: ['GITHUB~1/'] }, 'classification.protectedPaths entry "GITHUB~1/"'],
+    [{ riskTerms: null as never }, 'toranja-orchestrator: classification.riskTerms must be a list'],
+    [{ protectedPaths: null as never }, 'toranja-orchestrator: classification.protectedPaths must be a list'],
+  ])('rejects the invalid classification %j', async (classification, message) => {
+    await expect(mount({ classification })).rejects.toThrow(message)
+  })
+
+  it('takes an explicit empty list as the operator decision', async () => {
+    const harness = await mount({ classification: { riskTerms: [], protectedPaths: [] } })
+    expect(await classify(harness, { task: 'add a migration', writeScope: ['.github/ci.yml'] })).toMatchObject({ level: 'simple', reasons: [] })
+  })
+
+  it('keeps the default limit the configuration leaves out, whichever it is', async () => {
+    const harness = await mount({ classification: { maxInvestigatedFiles: 5 } })
+    expect(await classify(harness, { writeScope: ['a.ts', 'b.ts', 'c.ts', 'd.ts'] })).toMatchObject({
+      level: 'moderate',
+      limits: { maxDirectFiles: 3, maxInvestigatedFiles: 5 },
+    })
   })
 })

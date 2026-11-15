@@ -17,6 +17,7 @@ it through the controller, never starting an agent:
   set on the Models page, so it has no button; a missing CLI has none either.
 - **Modo de trabalho**: Team or one provider (`setMode`), the team size up to
   `limits.maxTeamSize`, and the cost and quality profile.
+- **Aprovação**: the approval policy (**Desligada**, **Automática**, **Sempre perguntar**), the two file limits of the classification while it is on (`maxDirectFiles`, `maxInvestigatedFiles`, never below one nor out of order), and the recent plans, read-only; all through `updateSettings`.
 - **Papéis**: the preferred provider per role, offered only among providers that
   may take the role, with the route in use (provider, model, effort) and, for
   read-only roles, how that provider keeps the task from writing.
